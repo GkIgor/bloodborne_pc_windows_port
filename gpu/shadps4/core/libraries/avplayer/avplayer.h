@@ -144,10 +144,10 @@ struct AvPlayerFrameInfoEx {
     AvPlayerStreamDetailsEx details;
 };
 
-using AvPlayerAllocate = void* PS4_SYSV_ABI (*)(void* p, u32 align, u32 size);
-using AvPlayerDeallocate = void PS4_SYSV_ABI (*)(void* p, void* mem);
-using AvPlayerAllocateTexture = void* PS4_SYSV_ABI (*)(void* p, u32 align, u32 size);
-using AvPlayerDeallocateTexture = void PS4_SYSV_ABI (*)(void* p, void* mem);
+using AvPlayerAllocate = void* PS4_SYSV_ABI_PTR (*)(void* p, u32 align, u32 size);
+using AvPlayerDeallocate = void PS4_SYSV_ABI_PTR (*)(void* p, void* mem);
+using AvPlayerAllocateTexture = void* PS4_SYSV_ABI_PTR (*)(void* p, u32 align, u32 size);
+using AvPlayerDeallocateTexture = void PS4_SYSV_ABI_PTR (*)(void* p, void* mem);
 
 struct AvPlayerMemAllocator {
     void* object_ptr;
@@ -157,10 +157,10 @@ struct AvPlayerMemAllocator {
     AvPlayerDeallocateTexture deallocate_texture;
 };
 
-using AvPlayerOpenFile = s32 PS4_SYSV_ABI (*)(void* p, const char* name);
-using AvPlayerCloseFile = s32 PS4_SYSV_ABI (*)(void* p);
-using AvPlayerReadOffsetFile = s32 PS4_SYSV_ABI (*)(void* p, u8* buf, u64 pos, u32 len);
-using AvPlayerSizeFile = u64 PS4_SYSV_ABI (*)(void* p);
+using AvPlayerOpenFile = s32 PS4_SYSV_ABI_PTR (*)(void* p, const char* name);
+using AvPlayerCloseFile = s32 PS4_SYSV_ABI_PTR (*)(void* p);
+using AvPlayerReadOffsetFile = s32 PS4_SYSV_ABI_PTR (*)(void* p, u8* buf, u64 pos, u32 len);
+using AvPlayerSizeFile = u64 PS4_SYSV_ABI_PTR (*)(void* p);
 
 struct AvPlayerFileReplacement {
     void* object_ptr;
@@ -182,7 +182,7 @@ enum class AvPlayerEvents {
     DrmError = 0x40,
 };
 
-using AvPlayerEventCallback = void PS4_SYSV_ABI (*)(void* p, AvPlayerEvents event, s32 src_id,
+using AvPlayerEventCallback = void PS4_SYSV_ABI_PTR (*)(void* p, AvPlayerEvents event, s32 src_id,
                                                     void* data);
 
 struct AvPlayerEventReplacement {
@@ -288,7 +288,7 @@ enum class AvPlayerAvSyncMode {
     None,
 };
 
-using AvPlayerLogCallback = int PS4_SYSV_ABI (*)(void* p, const char* format, va_list args);
+using AvPlayerLogCallback = int PS4_SYSV_ABI_PTR (*)(void* p, const char* format, va_list args);
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 

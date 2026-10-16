@@ -58,11 +58,45 @@ This repository adapts the original Linux codebase specifically for Windows syst
 *(Note: Release archives include a pre-configured `python-embed/` runtime; manual Python installation is not required for release users).*
 
 ### Build Dependencies (Only if compiling from source)
-- MinGW-w64 GCC (via [w64devkit](https://github.com/skeeto/w64devkit) or MSYS2 MinGW64).
-- CMake 3.25+.
-- Ninja build tool.
-- SDL3 development libraries.
-- Vulkan SDK or Vulkan-Headers.
+- **Compiler**: MinGW-w64 GCC 14.x, 15.x, or 16.x (tested on GCC 15.1 and GCC 16.2 via [w64devkit](https://github.com/skeeto/w64devkit) or MSYS2 MinGW64).
+- **Build Tools**: CMake 3.25+, Ninja build tool, `glslangValidator` (from Vulkan SDK or glslang package).
+- **Libraries & Headers**:
+  - `SDL3` (development libraries)
+  - `Vulkan-Headers` / Vulkan SDK
+  - `fmt`
+  - `Boost` (headers / Asio)
+  - `Zydis`
+  - `FFmpeg` (`libavcodec`, `libavformat`, `libavutil`, `libswresample`, `libswscale`)
+  - `xxHash` (`libxxhash`)
+  - `VulkanMemoryAllocator` (VMA)
+  - `xbyak`
+  - `miniz`
+  - `magic_enum`
+  - `robin-map` (`tsl-robin-map`)
+
+#### Installing Dependencies on MSYS2 MinGW64:
+If building with MSYS2, install all required build tools and libraries with a single command:
+```bash
+pacman -S --needed \
+  mingw-w64-x86_64-gcc \
+  mingw-w64-x86_64-cmake \
+  mingw-w64-x86_64-ninja \
+  mingw-w64-x86_64-glslang \
+  mingw-w64-x86_64-vulkan-headers \
+  mingw-w64-x86_64-vulkan-loader \
+  mingw-w64-x86_64-sdl3 \
+  mingw-w64-x86_64-fmt \
+  mingw-w64-x86_64-boost \
+  mingw-w64-x86_64-zydis \
+  mingw-w64-x86_64-ffmpeg \
+  mingw-w64-x86_64-xxhash \
+  mingw-w64-x86_64-vulkan-memory-allocator \
+  mingw-w64-x86_64-xbyak \
+  mingw-w64-x86_64-miniz \
+  mingw-w64-x86_64-magic_enum \
+  mingw-w64-x86_64-robin-map
+```
+*(If using standalone w64devkit, ensure the dependency headers and libraries are located in your prefix or pass `-DCMAKE_PREFIX_PATH="C:/msys64/mingw64;..."` or set `SDL3_DIR` / `VULKAN_SDK` in `build.bat`)*.
 
 ---
 

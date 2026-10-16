@@ -213,6 +213,12 @@ target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_pa
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 if (WIN32)
     target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+    # In GCC 15/16 on MinGW-w64, -O2 causes an ICE in choose_baseaddr or runs out of memory on gnmdriver.cpp.
+    # Compile gnmdriver.cpp with -O1 to avoid this compiler bug.
+    set_source_files_properties(
+        shadps4/core/libraries/gnmdriver/gnmdriver.cpp
+        PROPERTIES COMPILE_OPTIONS "-O1"
+    )
 endif()
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 if (NOT WIN32)
