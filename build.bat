@@ -82,10 +82,21 @@ if errorlevel 1 (
 )
 :submodules_ok
 
-rem Build LibAtrac9 static archive once (skip already-compiled .o files and archive directly)
-if exist "out\libatrac9.a" goto atrac9_done
+rem Build LibAtrac9 static archive (rebuild if missing or lacking Atrac9 symbols)
+if not exist "third_party\LibAtrac9\C\src\libatrac9.c" (
+    echo LibAtrac9 sources missing. Run: git submodule update --init --recursive
+    exit /b 1
+)
+if not exist "out\libatrac9.a" goto atrac9_build
+nm out\libatrac9.a 2>nul | findstr /c:"Atrac9Decode" >nul
+if not errorlevel 1 goto atrac9_done
+echo out\libatrac9.a is stale or incomplete - rebuilding...
+del /f /q out\libatrac9.a 2>nul
+del /f /q out\atrac9\*.o 2>nul
+:atrac9_build
 echo Building LibAtrac9...
 if not exist "out\atrac9" mkdir out\atrac9
+set "AT9_OBJS="
 for %%f in (third_party\LibAtrac9\C\src\*.c) do (
     if not exist "out\atrac9\%%~nf.o" (
         gcc -std=c99 -O2 -g -w -c "%%f" -o "out\atrac9\%%~nf.o"
@@ -94,13 +105,10 @@ for %%f in (third_party\LibAtrac9\C\src\*.c) do (
             exit /b 1
         )
     )
+    call set "AT9_OBJS=%%AT9_OBJS%% out\atrac9\%%~nf.o"
 )
-pushd out\atrac9
-del /f /q ..\libatrac9.a 2>nul
-ar rcs ..\libatrac9.a *.o
-set "AR_ERR=%ERRORLEVEL%"
-popd
-if not "%AR_ERR%"=="0" (
+ar rcs out\libatrac9.a %AT9_OBJS%
+if errorlevel 1 (
     echo Failed to create out\libatrac9.a
     exit /b 1
 )
