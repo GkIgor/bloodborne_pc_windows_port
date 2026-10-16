@@ -42,6 +42,11 @@ void bbgpu_dump_host_threads_hang(void *file_handle);
 void bbgpu_get_frametime_percentiles(double *avg_fps, double *p95_ms, double *p99_ms);
 /* Dumps GPU breadcrumbs state to log/crash files. */
 void bbgpu_dump_breadcrumbs(void *file_handle);
+/* Retrieves GPU device name, driver version, and Vulkan API version. */
+void bbgpu_get_device_info(char *vendor_buf, size_t vendor_sz,
+                           char *model_buf, size_t model_sz,
+                           char *driver_buf, size_t driver_sz,
+                           char *api_buf, size_t api_sz);
 /* Consumes accumulated mouse motion delta (pixels) since last call. */
 void bbgpu_consume_mouse_delta(float *dx, float *dy);
 /* Returns 1 if mouse look is actively capturing the cursor in relative mode. */

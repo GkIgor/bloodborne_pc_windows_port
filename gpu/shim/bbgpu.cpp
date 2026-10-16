@@ -331,6 +331,23 @@ extern "C" void bbgpu_dump_breadcrumbs(void* file_handle) {
     std::fflush(f);
 }
 
+namespace Vulkan {
+extern char g_gpu_vendor_name[128];
+extern char g_gpu_model_name[256];
+extern char g_gpu_driver_name[128];
+extern char g_gpu_api_version[64];
+}
+
+extern "C" void bbgpu_get_device_info(char *vendor_buf, size_t vendor_sz,
+                                      char *model_buf, size_t model_sz,
+                                      char *driver_buf, size_t driver_sz,
+                                      char *api_buf, size_t api_sz) {
+    if (vendor_buf && vendor_sz) std::snprintf(vendor_buf, vendor_sz, "%s", Vulkan::g_gpu_vendor_name);
+    if (model_buf && model_sz) std::snprintf(model_buf, model_sz, "%s", Vulkan::g_gpu_model_name);
+    if (driver_buf && driver_sz) std::snprintf(driver_buf, driver_sz, "%s", Vulkan::g_gpu_driver_name);
+    if (api_buf && api_sz) std::snprintf(api_buf, api_sz, "%s", Vulkan::g_gpu_api_version);
+}
+
 // Kernel service thread: runs boost::asio timers for equeue timer events.
 namespace Libraries::Kernel {
 boost::asio::io_context io_context;

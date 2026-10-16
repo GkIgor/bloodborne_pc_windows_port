@@ -18,6 +18,11 @@
 
 namespace Vulkan {
 
+char g_gpu_vendor_name[128] = "Unknown Vendor";
+char g_gpu_model_name[256] = "Unknown GPU";
+char g_gpu_driver_name[128] = "Unknown Driver";
+char g_gpu_api_version[64] = "Unknown API";
+
 namespace {
 
 /// bbport BB_VRAM_LIMIT_MB=N (tests): the driver's VRAM budget taken as at most N MiB, at startup
@@ -730,6 +735,13 @@ void Instance::CollectDeviceParameters() {
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Driver: {}", driver_name);
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Version: {}", api_version);
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Extensions: {}", extensions);
+
+    std::snprintf(g_gpu_vendor_name, sizeof(g_gpu_vendor_name), "%s", vendor_name.c_str());
+    std::snprintf(g_gpu_model_name, sizeof(g_gpu_model_name), "%s", model_name.c_str());
+    std::snprintf(g_gpu_driver_name, sizeof(g_gpu_driver_name), "%s", driver_name.c_str());
+    std::snprintf(g_gpu_api_version, sizeof(g_gpu_api_version), "%s", api_version.c_str());
+    std::printf("GPU: Model='%s', Driver='%s', Vulkan='%s'\n", g_gpu_model_name, g_gpu_driver_name, g_gpu_api_version);
+    std::fflush(stdout);
 }
 
 void Instance::CollectPhysicalMemoryInfo() {

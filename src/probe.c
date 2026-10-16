@@ -12,6 +12,7 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h>
 #include <mmsystem.h>
 #include "win32_compat.h"
 #include "win32_exception.h"
@@ -935,6 +936,53 @@ static void start_crash_reaper(void) {
     }
 }
 
+#ifdef _WIN32
+static void resolve_host_address(uintptr_t addr, char *out_buf, size_t out_buf_sz) {
+    if (!addr) {
+        snprintf(out_buf, out_buf_sz, "NULL");
+        return;
+    }
+    HMODULE hMod = NULL;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &hMod) && hMod) {
+        char mod_path[MAX_PATH] = {0};
+        if (GetModuleFileNameA(hMod, mod_path, sizeof(mod_path))) {
+            const char *base = strrchr(mod_path, '\\');
+            if (!base) base = strrchr(mod_path, '/');
+            base = base ? (base + 1) : mod_path;
+            uintptr_t offset = addr - (uintptr_t)hMod;
+            snprintf(out_buf, out_buf_sz, "%s +0x%" PRIxPTR " [base %p]", base, offset, (void *)hMod);
+            return;
+        }
+    }
+    snprintf(out_buf, out_buf_sz, "host %p", (void *)addr);
+}
+
+static void dump_loaded_modules(FILE *f) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return;
+    MODULEENTRY32 me;
+    me.dwSize = sizeof(me);
+    fprintf(f, "\n--- LOADED MODULES ---\n");
+    if (Module32First(snap, &me)) {
+        do {
+            uintptr_t base = (uintptr_t)me.modBaseAddr;
+            uintptr_t end = base + me.modBaseSize;
+            fprintf(f, "  [0x%016llx - 0x%016llx] %-28s (size: 0x%08x, path: %s)\n",
+                    (unsigned long long)base, (unsigned long long)end,
+                    me.szModule, (unsigned int)me.modBaseSize, me.szExePath);
+        } while (Module32Next(snap, &me));
+    }
+    CloseHandle(snap);
+}
+#else
+static void resolve_host_address(uintptr_t addr, char *out_buf, size_t out_buf_sz) {
+    snprintf(out_buf, out_buf_sz, "host %p", (void *)addr);
+}
+static void dump_loaded_modules(FILE *f) { (void)f; }
+#endif
+
 static void write_crash_dump(EXCEPTION_POINTERS *ep, void *fault_addr, uintptr_t rip, DWORD code) {
     char crash_path[MAX_PATH];
     SYSTEMTIME st;
@@ -952,9 +1000,26 @@ static void write_crash_dump(EXCEPTION_POINTERS *ep, void *fault_addr, uintptr_t
     fprintf(f, "=== BLOODBORNE CRASH DUMP ===\n");
     fprintf(f, "================================================================================\n\n");
     fprintf(f, "Exception Code: 0x%08lx\n", code);
+#ifdef _WIN32
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord && ep->ExceptionRecord->NumberParameters >= 2) {
+        ULONG_PTR access_type = ep->ExceptionRecord->ExceptionInformation[0];
+        const char *type_str = (access_type == 0) ? "READ" : (access_type == 1) ? "WRITE" : (access_type == 8) ? "EXECUTE (DEP)" : "UNKNOWN";
+        fprintf(f, "Fault Address:  %p (%s violation)\n", fault_addr, type_str);
+    } else {
+        fprintf(f, "Fault Address:  %p\n", fault_addr);
+    }
+#else
     fprintf(f, "Fault Address:  %p\n", fault_addr);
-    if (off) fprintf(f, "Faulting RIP:   %p (guest eboot.bin offset 0x%" PRIxPTR ")\n\n", (void *)rip, off);
-    else fprintf(f, "Faulting RIP:   %p (host address)\n\n", (void *)rip);
+#endif
+
+    char rip_resolved[512];
+    if (off) {
+        snprintf(rip_resolved, sizeof(rip_resolved), "guest eboot.bin offset 0x%" PRIxPTR, off);
+        fprintf(f, "Faulting RIP:   %p (%s)\n\n", (void *)rip, rip_resolved);
+    } else {
+        resolve_host_address(rip, rip_resolved, sizeof(rip_resolved));
+        fprintf(f, "Faulting RIP:   %p (%s)\n\n", (void *)rip, rip_resolved);
+    }
 
     CONTEXT *c = ep->ContextRecord;
     fprintf(f, "--- REGISTERS ---\n");
@@ -990,7 +1055,7 @@ static void write_crash_dump(EXCEPTION_POINTERS *ep, void *fault_addr, uintptr_t
                     }
                     if (!found_mod) snprintf(loc, sizeof(loc), "guest eboot.bin +0x%" PRIxPTR, val_off);
                 } else {
-                    snprintf(loc, sizeof(loc), "host / stack data");
+                    resolve_host_address(val, loc, sizeof(loc));
                 }
                 fprintf(f, "  [frame +0x%02x] %016llx (%s)\n", i * 8, (unsigned long long)val, loc);
             }
@@ -1010,7 +1075,7 @@ static void write_crash_dump(EXCEPTION_POINTERS *ep, void *fault_addr, uintptr_t
             uintptr_t val_off = ret_addr - (uintptr_t)image;
             snprintf(loc, sizeof(loc), "guest eboot.bin +0x%" PRIxPTR, val_off);
         } else {
-            snprintf(loc, sizeof(loc), "host %p", (void *)ret_addr);
+            resolve_host_address(ret_addr, loc, sizeof(loc));
         }
         fprintf(f, "  [rbp frame %2d] ret=%016llx (%s)\n", frame, (unsigned long long)ret_addr, loc);
         if (next_rbp <= rbp) break;
@@ -1035,6 +1100,29 @@ static void write_crash_dump(EXCEPTION_POINTERS *ep, void *fault_addr, uintptr_t
 
     runtime_memory_dump_recent_ops(f);
     if (gpu_enabled) bbgpu_dump_breadcrumbs(f);
+
+    char gpu_vendor[128] = "Unknown Vendor";
+    char gpu_model[256] = "Unknown GPU";
+    char gpu_driver[128] = "Unknown Driver";
+    char gpu_api[64] = "Unknown API";
+    if (gpu_enabled) {
+        bbgpu_get_device_info(gpu_vendor, sizeof(gpu_vendor),
+                              gpu_model, sizeof(gpu_model),
+                              gpu_driver, sizeof(gpu_driver),
+                              gpu_api, sizeof(gpu_api));
+    }
+    fprintf(f, "\n--- GPU & DRIVER TELEMETRY ---\n");
+    if (gpu_enabled && strcmp(gpu_model, "Unknown GPU") != 0) {
+        fprintf(f, "GPU Model:     %s\n", gpu_model);
+        fprintf(f, "GPU Vendor:    %s\n", gpu_vendor);
+        fprintf(f, "Driver:        %s\n", gpu_driver);
+        fprintf(f, "Vulkan API:    %s\n", gpu_api);
+    } else {
+        fprintf(f, "GPU State:     Not initialized / Headless\n");
+    }
+
+    dump_loaded_modules(f);
+
     fflush(f);
     fclose(f);
     char note[256];
@@ -1043,24 +1131,330 @@ static void write_crash_dump(EXCEPTION_POINTERS *ep, void *fault_addr, uintptr_t
 }
 
 #ifdef _WIN32
+typedef struct {
+    uintptr_t addr;
+    uint8_t len;
+    uint8_t orig[10];
+} LzcntPatchSite;
+
+#define MAX_LZCNT_SITES 2048
+static LzcntPatchSite s_lzcnt_sites[MAX_LZCNT_SITES];
+static uint32_t s_num_lzcnt_sites = 0;
+
+static int compare_lzcnt_sites(const void *a, const void *b) {
+    uintptr_t addr_a = ((const LzcntPatchSite *)a)->addr;
+    uintptr_t addr_b = ((const LzcntPatchSite *)b)->addr;
+    if (addr_a < addr_b) return -1;
+    if (addr_a > addr_b) return 1;
+    return 0;
+}
+
+static const unsigned char NOP_PATTERNS[10][10] = {
+    {0},
+    {0x90},
+    {0x66, 0x90},
+    {0x0F, 0x1F, 0x00},
+    {0x0F, 0x1F, 0x40, 0x00},
+    {0x0F, 0x1F, 0x44, 0x00, 0x00},
+    {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00},
+    {0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00},
+    {0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},
+    {0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00}
+};
+
+static void fill_nops(unsigned char *dst, size_t count) {
+    while (count > 0) {
+        size_t take = count > 9 ? 9 : count;
+        memcpy(dst, NOP_PATTERNS[take], take);
+        dst += take;
+        count -= take;
+    }
+}
+
+static int emulate_lzcnt_site(CONTEXT *ctx, uintptr_t rip) {
+    if (s_num_lzcnt_sites == 0) return 0;
+    LzcntPatchSite key;
+    key.addr = rip;
+    LzcntPatchSite *site = (LzcntPatchSite *)bsearch(&key, s_lzcnt_sites, s_num_lzcnt_sites, sizeof(LzcntPatchSite), compare_lzcnt_sites);
+    if (!site) return 0;
+
+    DWORD64 *regs[16] = {
+        &ctx->Rax, &ctx->Rcx, &ctx->Rdx, &ctx->Rbx,
+        &ctx->Rsp, &ctx->Rbp, &ctx->Rsi, &ctx->Rdi,
+        &ctx->R8,  &ctx->R9,  &ctx->R10, &ctx->R11,
+        &ctx->R12, &ctx->R13, &ctx->R14, &ctx->R15
+    };
+
+    const unsigned char *b = site->orig;
+    int idx = 1;
+    int rex = 0;
+    if ((b[idx] & 0xF0) == 0x40) rex = b[idx++];
+    idx += 2; // skip 0x0F, 0xBD
+    unsigned char modrm = b[idx++];
+    int w = (rex >> 3) & 1;
+    int r_bit = rex ? ((rex >> 2) & 1) : 0;
+    int x_bit = rex ? ((rex >> 1) & 1) : 0;
+    int b_bit = rex ? (rex & 1) : 0;
+    int dest_idx = ((modrm >> 3) & 7) | (r_bit << 3);
+    int mod = modrm >> 6;
+    int rm = modrm & 7;
+    int src_idx = rm | (b_bit << 3);
+
+    uint64_t src_val = 0;
+    if (mod == 3) {
+        src_val = *regs[src_idx];
+    } else {
+        uintptr_t ea = 0;
+        const unsigned char *cur = b + idx;
+        int next_len = site->len;
+        if (rm == 4) {
+            unsigned char sib = *cur++;
+            int scale = 1 << (sib >> 6);
+            int index_reg = ((sib >> 3) & 7) | (x_bit << 3);
+            int sib_base = (sib & 7) | (b_bit << 3);
+            uint64_t base_val = 0;
+            if (mod == 0 && (sib & 7) == 5) {
+                int32_t disp = *(const int32_t *)cur;
+                cur += 4;
+                base_val = (uint64_t)(int64_t)disp;
+            } else {
+                base_val = *regs[sib_base];
+            }
+            uint64_t idx_val = (index_reg != 4) ? *regs[index_reg] : 0;
+            ea = base_val + idx_val * scale;
+        } else if (mod == 0 && rm == 5) {
+            int32_t disp = *(const int32_t *)cur;
+            cur += 4;
+            ea = (rip + next_len) + disp;
+        } else {
+            ea = *regs[src_idx];
+        }
+        if (mod == 1) {
+            int8_t disp = *(const int8_t *)cur++;
+            ea += disp;
+        } else if (mod == 2) {
+            int32_t disp = *(const int32_t *)cur;
+            cur += 4;
+            ea += disp;
+        }
+        if (IsBadReadPtr((const void *)ea, w ? 8 : 4)) return 0;
+        src_val = w ? *(const uint64_t *)ea : *(const uint32_t *)ea;
+    }
+
+    if (w) {
+        uint64_t res = 0;
+        if (src_val == 0) {
+            res = 64;
+            ctx->EFlags |= 0x01; // CF = 1
+            ctx->EFlags &= ~0x40; // ZF = 0
+        } else {
+            unsigned long bit_idx = 0;
+            _BitScanReverse64(&bit_idx, src_val);
+            res = 63 - bit_idx;
+            ctx->EFlags &= ~(0x01 | 0x40);
+        }
+        *regs[dest_idx] = res;
+    } else {
+        uint32_t val32 = (uint32_t)src_val;
+        uint32_t res = 0;
+        if (val32 == 0) {
+            res = 32;
+            ctx->EFlags |= 0x01;
+            ctx->EFlags &= ~0x40;
+        } else {
+            unsigned long bit_idx = 0;
+            _BitScanReverse(&bit_idx, val32);
+            res = 31 - bit_idx;
+            ctx->EFlags &= ~(0x01 | 0x40);
+        }
+        *regs[dest_idx] = (uint64_t)res;
+    }
+    ctx->Rip += site->len;
+    return 1;
+}
+
+static void patch_non_bmi1(unsigned char *img, uint64_t total_size, Segment *segs, uint64_t num_segs) {
+    uint32_t bsr_patched = 0;
+    uint32_t ud2_patched = 0;
+
+    for (uint64_t s = 0; s < num_segs; ++s) {
+        if (!(segs[s].flags & 1)) continue; // only executable segments
+        uint64_t seg_start = segs[s].address;
+        uint64_t seg_end = seg_start + segs[s].size;
+        if (seg_end > total_size) seg_end = total_size;
+        if (seg_end < 16) continue;
+
+        uint64_t idx = seg_start;
+        while (idx + 15 < seg_end) {
+            if (img[idx] == 0xF3) {
+                int rex = 0;
+                int lzcnt_len = 0;
+                unsigned char b1 = img[idx + 1];
+                unsigned char b2 = img[idx + 2];
+                unsigned char modrm = 0;
+                if (b1 == 0x0F && b2 == 0xBD) {
+                    rex = 0;
+                    modrm = img[idx + 3];
+                    lzcnt_len = 4;
+                } else if ((b1 & 0xF0) == 0x40 && b2 == 0x0F && img[idx + 3] == 0xBD) {
+                    rex = b1;
+                    modrm = img[idx + 4];
+                    lzcnt_len = 5;
+                }
+
+                if (lzcnt_len > 0) {
+                    int mod = modrm >> 6;
+                    int rm = modrm & 7;
+                    int reg = (modrm >> 3) & 7;
+                    int r_bit = rex ? ((rex >> 2) & 1) : 0;
+                    int b_bit = rex ? (rex & 1) : 0;
+                    int tmp_reg = reg | (r_bit << 3);
+                    int src_reg = rm | (b_bit << 3);
+                    uint64_t cur = idx + lzcnt_len;
+                    if (mod != 3) {
+                        if (rm == 4) {
+                            unsigned char sib = img[cur++];
+                            lzcnt_len++;
+                            if (mod == 0 && (sib & 7) == 5) { cur += 4; lzcnt_len += 4; }
+                        } else if (mod == 0 && rm == 5) {
+                            cur += 4;
+                            lzcnt_len += 4;
+                        }
+                        if (mod == 1) { cur += 1; lzcnt_len += 1; }
+                        else if (mod == 2) { cur += 4; lzcnt_len += 4; }
+                    }
+
+                    // Check for Allocator pattern: lzcnt tmp, src; mov dest, 0x3f/0x1f; sub dest, tmp
+                    int is_pattern = 0;
+                    uint64_t p1 = idx + lzcnt_len;
+                    int mov_len = 0;
+                    uint32_t mov_val = 0;
+                    int mov_reg = 0;
+                    int mrex = 0;
+                    if (p1 + 8 < seg_end) {
+                        if (img[p1] >= 0xB8 && img[p1] <= 0xBF) {
+                            mov_reg = img[p1] - 0xB8;
+                            memcpy(&mov_val, &img[p1 + 1], 4);
+                            mov_len = 5;
+                        } else if ((img[p1] & 0xF0) == 0x40 && img[p1 + 1] >= 0xB8 && img[p1 + 1] <= 0xBF) {
+                            mrex = img[p1];
+                            mov_reg = (img[p1 + 1] - 0xB8) | ((mrex & 1) << 3);
+                            memcpy(&mov_val, &img[p1 + 2], 4);
+                            mov_len = 6;
+                        }
+
+                        if (mov_len > 0 && (mov_val == 0x3F || mov_val == 0x1F) && mod == 3) {
+                            uint64_t p2 = p1 + mov_len;
+                            int srex = 0;
+                            int sub_len = 0;
+                            unsigned char sub_modrm = 0;
+                            unsigned char opcode = 0;
+                            if ((img[p2] & 0xF0) == 0x40 && (img[p2 + 1] == 0x29 || img[p2 + 1] == 0x2B)) {
+                                srex = img[p2];
+                                opcode = img[p2 + 1];
+                                sub_modrm = img[p2 + 2];
+                                sub_len = 3;
+                            } else if (img[p2] == 0x29 || img[p2] == 0x2B) {
+                                opcode = img[p2];
+                                sub_modrm = img[p2 + 1];
+                                sub_len = 2;
+                            }
+
+                            if (sub_len > 0 && (sub_modrm >> 6) == 3) {
+                                int s_r = ((sub_modrm >> 3) & 7) | (srex ? (((srex >> 2) & 1) << 3) : 0);
+                                int s_b = (sub_modrm & 7) | (srex ? ((srex & 1) << 3) : 0);
+                                if (opcode == 0x29 && s_b == mov_reg && s_r == tmp_reg) {
+                                    is_pattern = 1;
+                                } else if (opcode == 0x2B && s_r == mov_reg && s_b == tmp_reg) {
+                                    is_pattern = 1;
+                                }
+                            }
+
+                            if (is_pattern) {
+                                int is_64 = (mov_val == 0x3F);
+                                int dest_reg = mov_reg;
+                                uint64_t total_len = lzcnt_len + mov_len + sub_len;
+                                int bsr_len = 0;
+                                unsigned char bsr_bytes[4];
+                                int d_bit = (dest_reg >= 8) ? 1 : 0;
+                                int s_bit = (src_reg >= 8) ? 1 : 0;
+                                if (is_64) {
+                                    bsr_bytes[0] = 0x48 | (d_bit << 2) | s_bit;
+                                    bsr_bytes[1] = 0x0F;
+                                    bsr_bytes[2] = 0xBD;
+                                    bsr_bytes[3] = 0xC0 | ((dest_reg & 7) << 3) | (src_reg & 7);
+                                    bsr_len = 4;
+                                } else if (d_bit || s_bit) {
+                                    bsr_bytes[0] = 0x40 | (d_bit << 2) | s_bit;
+                                    bsr_bytes[1] = 0x0F;
+                                    bsr_bytes[2] = 0xBD;
+                                    bsr_bytes[3] = 0xC0 | ((dest_reg & 7) << 3) | (src_reg & 7);
+                                    bsr_len = 4;
+                                } else {
+                                    bsr_bytes[0] = 0x0F;
+                                    bsr_bytes[1] = 0xBD;
+                                    bsr_bytes[2] = 0xC0 | ((dest_reg & 7) << 3) | (src_reg & 7);
+                                    bsr_len = 3;
+                                }
+                                memcpy(img + idx, bsr_bytes, bsr_len);
+                                fill_nops(img + idx + bsr_len, total_len - bsr_len);
+                                bsr_patched++;
+                                idx += total_len;
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Standalone LZCNT -> replace first 2 bytes with UD2 (0x0F 0x0B)
+                    if (s_num_lzcnt_sites < MAX_LZCNT_SITES && lzcnt_len <= 10) {
+                        LzcntPatchSite *site = &s_lzcnt_sites[s_num_lzcnt_sites++];
+                        site->addr = (uintptr_t)(img + idx);
+                        site->len = (uint8_t)lzcnt_len;
+                        memcpy(site->orig, img + idx, lzcnt_len);
+                        img[idx] = 0x0F;
+                        img[idx + 1] = 0x0B;
+                        ud2_patched++;
+                    }
+                    idx += lzcnt_len;
+                    continue;
+                }
+            }
+            idx++;
+        }
+    }
+
+    if (s_num_lzcnt_sites > 1) {
+        qsort(s_lzcnt_sites, s_num_lzcnt_sites, sizeof(LzcntPatchSite), compare_lzcnt_sites);
+    }
+
+    printf("Non-BMI1 CPU optimizations applied: %u allocator BSR patches, %u standalone LZCNT UD2 traps\n",
+           bsr_patched, ud2_patched);
+}
+
 static int emulate_bmi1(CONTEXT *ctx) {
     uintptr_t rip = ctx->Rip;
     if (rip < 0x10000 || IsBadReadPtr((const void *)rip, 8)) return 0;
     const unsigned char *p = (const unsigned char *)rip;
+
+    if (p[0] == 0x0F && p[1] == 0x0B) {
+        if (emulate_lzcnt_site(ctx, rip)) return 1;
+    }
+
     if (p[0] != 0xC4) return 0; // 3-byte VEX prefix
     unsigned char b1 = p[1];
     unsigned char b2 = p[2];
     if ((b1 & 0x1F) != 0x02) return 0; // map 2 (0F 38)
     unsigned char opcode = p[3];
     unsigned char modrm = p[4];
-    if ((modrm >> 6) != 3) return 0; // register operands
 
     int r_inv = (b1 >> 7) & 1;
+    int x_inv = (b1 >> 6) & 1;
     int b_inv = (b1 >> 5) & 1;
     int w = (b2 >> 7) & 1;
     int vvvv = (b2 >> 3) & 0xF;
 
     int reg = (modrm >> 3) & 7;
+    int mod = modrm >> 6;
     int rm = modrm & 7;
 
     int dest_idx = reg | ((1 - r_inv) << 3);
@@ -1074,30 +1468,79 @@ static int emulate_bmi1(CONTEXT *ctx) {
         &ctx->R12, &ctx->R13, &ctx->R14, &ctx->R15
     };
 
+    int insn_len = 5;
+    uintptr_t mem_ea = 0;
+    if (mod != 3) {
+        const unsigned char *cur = p + 5;
+        if (rm == 4) {
+            unsigned char sib = *cur++;
+            insn_len++;
+            int scale = 1 << (sib >> 6);
+            int index_reg = ((sib >> 3) & 7) | ((1 - x_inv) << 3);
+            int sib_base = (sib & 7) | ((1 - b_inv) << 3);
+            uint64_t base_val = 0;
+            if (mod == 0 && (sib & 7) == 5) {
+                int32_t disp = *(const int32_t *)cur;
+                cur += 4;
+                insn_len += 4;
+                base_val = (uint64_t)(int64_t)disp;
+            } else {
+                base_val = *regs[sib_base];
+            }
+            uint64_t idx_val = (index_reg != 4) ? *regs[index_reg] : 0;
+            mem_ea = base_val + idx_val * scale;
+        } else if (mod == 0 && rm == 5) {
+            int32_t disp = *(const int32_t *)cur;
+            cur += 4;
+            insn_len += 4;
+            mem_ea = (ctx->Rip + insn_len) + disp;
+        } else {
+            mem_ea = *regs[src2_idx];
+        }
+        if (mod == 1) {
+            int8_t disp = *(const int8_t *)cur++;
+            insn_len += 1;
+            mem_ea += disp;
+        } else if (mod == 2) {
+            int32_t disp = *(const int32_t *)cur;
+            cur += 4;
+            insn_len += 4;
+            mem_ea += disp;
+        }
+    }
+
+    uint64_t src2_val = 0;
+    if (mod == 3) {
+        src2_val = *regs[src2_idx];
+    } else {
+        if (IsBadReadPtr((const void *)mem_ea, w ? 8 : 4)) return 0;
+        src2_val = w ? *(const uint64_t *)mem_ea : *(const uint32_t *)mem_ea;
+    }
+
     if (opcode == 0xF2) { // ANDN: dest = (~src1) & src2
         if (w) {
             uint64_t s1 = *regs[src1_idx];
-            uint64_t s2 = *regs[src2_idx];
+            uint64_t s2 = src2_val;
             uint64_t res = (~s1) & s2;
             *regs[dest_idx] = res;
-            ctx->EFlags &= ~(0x800 | 0x80 | 0x40 | 0x10 | 0x04 | 0x01); // clear OF, SF, ZF, AF, PF, CF
-            if (res == 0) ctx->EFlags |= 0x40; // ZF
-            if ((int64_t)res < 0) ctx->EFlags |= 0x80; // SF
+            ctx->EFlags &= ~(0x800 | 0x80 | 0x40 | 0x10 | 0x04 | 0x01);
+            if (res == 0) ctx->EFlags |= 0x40;
+            if ((int64_t)res < 0) ctx->EFlags |= 0x80;
         } else {
             uint32_t s1 = (uint32_t)*regs[src1_idx];
-            uint32_t s2 = (uint32_t)*regs[src2_idx];
+            uint32_t s2 = (uint32_t)src2_val;
             uint32_t res = (~s1) & s2;
             *regs[dest_idx] = (uint64_t)res;
             ctx->EFlags &= ~(0x800 | 0x80 | 0x40 | 0x10 | 0x04 | 0x01);
             if (res == 0) ctx->EFlags |= 0x40;
             if ((int32_t)res < 0) ctx->EFlags |= 0x80;
         }
-        ctx->Rip += 5;
+        ctx->Rip += insn_len;
         return 1;
     } else if (opcode == 0xF3) { // BLSI, BLSMSK, BLSR
         int subop = reg;
         if (w) {
-            uint64_t src = *regs[src2_idx];
+            uint64_t src = src2_val;
             uint64_t res = 0;
             if (subop == 3) res = (-src) & src; // BLSI
             else if (subop == 2) res = (src - 1) ^ src; // BLSMSK
@@ -1105,15 +1548,15 @@ static int emulate_bmi1(CONTEXT *ctx) {
             else return 0;
             *regs[dest_idx] = res;
             ctx->EFlags &= ~(0x800 | 0x80 | 0x40 | 0x10 | 0x04 | 0x01);
-            if (res == 0) ctx->EFlags |= 0x40; // ZF
-            if ((int64_t)res < 0) ctx->EFlags |= 0x80; // SF
-            if (src != 0) ctx->EFlags |= 0x01; // CF
+            if (res == 0) ctx->EFlags |= 0x40;
+            if ((int64_t)res < 0) ctx->EFlags |= 0x80;
+            if (src != 0) ctx->EFlags |= 0x01;
         } else {
-            uint32_t src = (uint32_t)*regs[src2_idx];
+            uint32_t src = (uint32_t)src2_val;
             uint32_t res = 0;
-            if (subop == 3) res = (-src) & src; // BLSI
-            else if (subop == 2) res = (src - 1) ^ src; // BLSMSK
-            else if (subop == 1) res = (src - 1) & src; // BLSR
+            if (subop == 3) res = (-src) & src;
+            else if (subop == 2) res = (src - 1) ^ src;
+            else if (subop == 1) res = (src - 1) & src;
             else return 0;
             *regs[dest_idx] = (uint64_t)res;
             ctx->EFlags &= ~(0x800 | 0x80 | 0x40 | 0x10 | 0x04 | 0x01);
@@ -1121,7 +1564,36 @@ static int emulate_bmi1(CONTEXT *ctx) {
             if ((int32_t)res < 0) ctx->EFlags |= 0x80;
             if (src != 0) ctx->EFlags |= 0x01;
         }
-        ctx->Rip += 5;
+        ctx->Rip += insn_len;
+        return 1;
+    } else if (opcode == 0xF7) { // BEXTR: dest = (src2 >> control[7:0]) & ((1 << control[15:8]) - 1)
+        uint64_t control = *regs[src1_idx];
+        uint32_t start = (uint32_t)(control & 0xFF);
+        uint32_t len = (uint32_t)((control >> 8) & 0xFF);
+        if (w) {
+            uint64_t src = src2_val;
+            uint64_t res = 0;
+            if (start < 64) {
+                src >>= start;
+                uint64_t mask = (len >= 64) ? ~0ULL : ((1ULL << len) - 1ULL);
+                res = src & mask;
+            }
+            *regs[dest_idx] = res;
+            ctx->EFlags &= ~(0x800 | 0x80 | 0x40 | 0x10 | 0x04 | 0x01);
+            if (res == 0) ctx->EFlags |= 0x40;
+        } else {
+            uint32_t src = (uint32_t)src2_val;
+            uint32_t res = 0;
+            if (start < 32) {
+                src >>= start;
+                uint32_t mask = (len >= 32) ? ~0U : ((1U << len) - 1U);
+                res = src & mask;
+            }
+            *regs[dest_idx] = (uint64_t)res;
+            ctx->EFlags &= ~(0x800 | 0x80 | 0x40 | 0x10 | 0x04 | 0x01);
+            if (res == 0) ctx->EFlags |= 0x40;
+        }
+        ctx->Rip += insn_len;
         return 1;
     }
     return 0;
@@ -1841,6 +2313,7 @@ int main(int argc, char **argv) {
                 break;
             }
         }
+        patch_non_bmi1(image, size, segments, ns);
     }
 #endif
     protect(thunks, round_page((import_count + 1) * 32), 5);
