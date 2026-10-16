@@ -187,6 +187,9 @@ bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const
 }
 
 void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
+    if (width == 0 || height == 0) {
+        return;
+    }
     const vk::Device device = instance.GetDevice();
     if (frame->image_view) {
         device.destroyImageView(frame->image_view);
@@ -540,13 +543,22 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     };
 
+    // If the window is minimized (0x0 pixels), skip presentation without crashing Vulkan
+    const s32 win_w = window.GetWidth();
+    const s32 win_h = window.GetHeight();
+    if (win_w <= 0 || win_h <= 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        free_frame();
+        return;
+    }
+
     // Recreate the swapchain if the window was resized.
-    if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    if (win_w != swapchain.GetWidth() || win_h != swapchain.GetHeight()) {
+        swapchain.Recreate(win_w, win_h);
     }
 
     if (!swapchain.AcquireNextImage()) {
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        swapchain.Recreate(win_w, win_h);
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
             LOG_WARNING(Render_Vulkan, "Skipping frame!");
@@ -734,6 +746,9 @@ Frame* Presenter::GetRenderFrame() {
 }
 
 void Presenter::SetExpectedGameSize(s32 width, s32 height) {
+    if (width <= 0 || height <= 0) {
+        return;
+    }
     const float ratio = (float)width / (float)height;
 
     expected_frame_height = height;

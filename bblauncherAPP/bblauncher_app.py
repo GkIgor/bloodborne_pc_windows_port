@@ -137,7 +137,6 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "feat_overlay": self.chk_overlay.isChecked(),
                 "feat_hud": self.chk_hud.isChecked(),
                 "feat_fps_patch": self.chk_fps_patch.isChecked(),
-                "feat_res_scaling": self.chk_res_scale.isChecked(),
                 "window_mode": win_mode,
                 "fullscreen": win_mode == "Fullscreen",
                 "enabled_patches": sorted(list(self.enabled_patches)),
@@ -173,7 +172,15 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if not getattr(self, "_settings_built", False):
             return
         ini_path = APP_DIR / "bbport.ini"
+        res_raw = self.cmb_res.currentText()
+        output_res_val = "1920x1080"
+        for candidate in ("1280x720", "1920x1080", "2560x1440", "3840x2160"):
+            if candidate in res_raw:
+                output_res_val = candidate
+                break
+
         keys_to_update = {
+            "output_res": output_res_val,
             "mk_enabled": "1" if self.chk_mk_enabled.isChecked() else "0",
             "mk_sens_x": f"{self.sl_sens_x.value() / 100:.2f}",
             "mk_sens_y": f"{self.sl_sens_y.value() / 100:.2f}",
@@ -498,10 +505,16 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             env.pop("BB_FPS_PATCH", None)
 
         env.pop("BB_RENDER_RES", None)
+        env.pop("BB_OUTPUT_RES", None)
         res_choice = cfg["res"]
-        if cfg["feat_res_scaling"]:
-            if res_choice not in ("1920x1080 (Native)", "Default (1080p)", "1920x1080"):
-                env["BB_RENDER_RES"] = res_choice
+        output_res_str = "1920x1080"
+        for candidate in ("1280x720", "1920x1080", "2560x1440", "3840x2160"):
+            if candidate in res_choice:
+                output_res_str = candidate
+                break
+        env["BB_OUTPUT_RES"] = output_res_str
+        if output_res_str != "1920x1080":
+            env["BB_RENDER_RES"] = output_res_str
 
         win_mode_val = cfg["window_mode"].lower()
         env["BB_WINDOW_MODE"] = win_mode_val

@@ -53,7 +53,6 @@ DEFAULT_SETTINGS = {
     "feat_overlay": True,
     "feat_hud": False,
     "feat_fps_patch": True,
-    "feat_res_scaling": True,
     "window_mode": "Borderless",
     "fullscreen": False,
     "enabled_patches": ["Skip Intro"],

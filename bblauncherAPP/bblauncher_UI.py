@@ -866,6 +866,7 @@ class LauncherUI:
         self.cmb_res = QComboBox()
         self.cmb_res.addItems(RES_CHOICES)
         self.cmb_res.setCurrentText(self.settings.get("res", RES_CHOICES[0]))
+        self.cmb_res.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
         grid_disp.addWidget(self.cmb_res, 0, 3)
 
         grid_disp.addWidget(QLabel("Window Mode:"), 1, 0)
@@ -895,23 +896,17 @@ class LauncherUI:
         self.chk_fps_patch.setChecked(self.settings.get("feat_fps_patch", True))
         row_flags.addWidget(self.chk_fps_patch, 0, 1)
 
-        self.chk_res_scale = QCheckBox("Resolution Scaling Engine")
-        self.chk_res_scale.setChecked(self.settings.get("feat_res_scaling", True))
-        self.chk_res_scale.toggled.connect(self.cmb_res.setEnabled)
-        self.cmb_res.setEnabled(self.chk_res_scale.isChecked())
-        row_flags.addWidget(self.chk_res_scale, 1, 0)
-
         self.chk_mods = QCheckBox("Load mods/ Directory Assets")
         self.chk_mods.setChecked(self.settings.get("mods", False))
-        row_flags.addWidget(self.chk_mods, 1, 1)
+        row_flags.addWidget(self.chk_mods, 1, 0)
 
         self.chk_overlay = QCheckBox("In-Game Overlay Configuration Menu")
         self.chk_overlay.setChecked(self.settings.get("feat_overlay", True))
-        row_flags.addWidget(self.chk_overlay, 2, 0)
+        row_flags.addWidget(self.chk_overlay, 1, 1)
 
         self.chk_hud = QCheckBox("Display Internal HUD Frame Diagnostics")
         self.chk_hud.setChecked(self.settings.get("feat_hud", False))
-        row_flags.addWidget(self.chk_hud, 2, 1)
+        row_flags.addWidget(self.chk_hud, 2, 0)
 
         l_disp.addLayout(row_flags)
         c_layout.addWidget(card_disp)

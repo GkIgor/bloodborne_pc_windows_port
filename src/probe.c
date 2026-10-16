@@ -1042,6 +1042,92 @@ static void write_crash_dump(EXCEPTION_POINTERS *ep, void *fault_addr, uintptr_t
     veh_write(note);
 }
 
+#ifdef _WIN32
+static int emulate_bmi1(CONTEXT *ctx) {
+    uintptr_t rip = ctx->Rip;
+    if (rip < 0x10000 || IsBadReadPtr((const void *)rip, 8)) return 0;
+    const unsigned char *p = (const unsigned char *)rip;
+    if (p[0] != 0xC4) return 0; // 3-byte VEX prefix
+    unsigned char b1 = p[1];
+    unsigned char b2 = p[2];
+    if ((b1 & 0x1F) != 0x02) return 0; // map 2 (0F 38)
+    unsigned char opcode = p[3];
+    unsigned char modrm = p[4];
+    if ((modrm >> 6) != 3) return 0; // register operands
+
+    int r_inv = (b1 >> 7) & 1;
+    int b_inv = (b1 >> 5) & 1;
+    int w = (b2 >> 7) & 1;
+    int vvvv = (b2 >> 3) & 0xF;
+
+    int reg = (modrm >> 3) & 7;
+    int rm = modrm & 7;
+
+    int dest_idx = reg | ((1 - r_inv) << 3);
+    int src1_idx = (15 - vvvv);
+    int src2_idx = rm | ((1 - b_inv) << 3);
+
+    DWORD64 *regs[16] = {
+        &ctx->Rax, &ctx->Rcx, &ctx->Rdx, &ctx->Rbx,
+        &ctx->Rsp, &ctx->Rbp, &ctx->Rsi, &ctx->Rdi,
+        &ctx->R8,  &ctx->R9,  &ctx->R10, &ctx->R11,
+        &ctx->R12, &ctx->R13, &ctx->R14, &ctx->R15
+    };
+
+    if (opcode == 0xF2) { // ANDN: dest = (~src1) & src2
+        if (w) {
+            uint64_t s1 = *regs[src1_idx];
+            uint64_t s2 = *regs[src2_idx];
+            uint64_t res = (~s1) & s2;
+            *regs[dest_idx] = res;
+            ctx->EFlags &= ~(0x800 | 0x80 | 0x40 | 0x10 | 0x04 | 0x01); // clear OF, SF, ZF, AF, PF, CF
+            if (res == 0) ctx->EFlags |= 0x40; // ZF
+            if ((int64_t)res < 0) ctx->EFlags |= 0x80; // SF
+        } else {
+            uint32_t s1 = (uint32_t)*regs[src1_idx];
+            uint32_t s2 = (uint32_t)*regs[src2_idx];
+            uint32_t res = (~s1) & s2;
+            *regs[dest_idx] = (uint64_t)res;
+            ctx->EFlags &= ~(0x800 | 0x80 | 0x40 | 0x10 | 0x04 | 0x01);
+            if (res == 0) ctx->EFlags |= 0x40;
+            if ((int32_t)res < 0) ctx->EFlags |= 0x80;
+        }
+        ctx->Rip += 5;
+        return 1;
+    } else if (opcode == 0xF3) { // BLSI, BLSMSK, BLSR
+        int subop = reg;
+        if (w) {
+            uint64_t src = *regs[src2_idx];
+            uint64_t res = 0;
+            if (subop == 3) res = (-src) & src; // BLSI
+            else if (subop == 2) res = (src - 1) ^ src; // BLSMSK
+            else if (subop == 1) res = (src - 1) & src; // BLSR
+            else return 0;
+            *regs[dest_idx] = res;
+            ctx->EFlags &= ~(0x800 | 0x80 | 0x40 | 0x10 | 0x04 | 0x01);
+            if (res == 0) ctx->EFlags |= 0x40; // ZF
+            if ((int64_t)res < 0) ctx->EFlags |= 0x80; // SF
+            if (src != 0) ctx->EFlags |= 0x01; // CF
+        } else {
+            uint32_t src = (uint32_t)*regs[src2_idx];
+            uint32_t res = 0;
+            if (subop == 3) res = (-src) & src; // BLSI
+            else if (subop == 2) res = (src - 1) ^ src; // BLSMSK
+            else if (subop == 1) res = (src - 1) & src; // BLSR
+            else return 0;
+            *regs[dest_idx] = (uint64_t)res;
+            ctx->EFlags &= ~(0x800 | 0x80 | 0x40 | 0x10 | 0x04 | 0x01);
+            if (res == 0) ctx->EFlags |= 0x40;
+            if ((int32_t)res < 0) ctx->EFlags |= 0x80;
+            if (src != 0) ctx->EFlags |= 0x01;
+        }
+        ctx->Rip += 5;
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code == EXCEPTION_ACCESS_VIOLATION) {
@@ -1126,8 +1212,23 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
         if (gpu_enabled) bbgpu_dump_guest_writes(ep);
         if (g_crash_test_hang) Sleep(INFINITE);
         TerminateProcess(GetCurrentProcess(), 128 + 11);
-    } else if (code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION ||
-               code == EXCEPTION_INT_DIVIDE_BY_ZERO || code == EXCEPTION_STACK_OVERFLOW ||
+    } else if (code == EXCEPTION_ILLEGAL_INSTRUCTION) {
+        if (!runtime_win_has_bmi1() && emulate_bmi1(ep->ContextRecord)) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        uintptr_t rip = ep->ContextRecord->Rip;
+        crash_begin();
+        write_crash_dump(ep, (void *)rip, rip, code);
+        char line[512];
+        if (rip - (uintptr_t)image < 0x10000000)
+            snprintf(line, sizeof(line), "Fatal exception 0x%08lx at guest offset 0x%llx, address %p\n",
+                     (unsigned long)code, (unsigned long long)(rip - (uintptr_t)image), (void *)rip);
+        else
+            snprintf(line, sizeof(line), "Fatal exception 0x%08lx at RIP %p, address %p\n", (unsigned long)code, (void *)rip, (void *)rip);
+        veh_write(line);
+        TerminateProcess(GetCurrentProcess(), 128 + 4);
+    } else if (code == EXCEPTION_PRIV_INSTRUCTION || code == EXCEPTION_INT_DIVIDE_BY_ZERO ||
+               code == EXCEPTION_STACK_OVERFLOW ||
                code == 0xC0000409 /* STATUS_STACK_BUFFER_OVERRUN */ ||
                code == 0xC0000374 /* STATUS_HEAP_CORRUPTION */) {
         uintptr_t rip = ep->ContextRecord->Rip;
@@ -1620,6 +1721,32 @@ int main(int argc, char **argv) {
         memcpy(image + relocs[i].target, &value, 8);
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
+#ifdef _WIN32
+    if (!runtime_win_has_bmi1()) {
+        for (uint64_t i = 0; i < import_count; ++i) {
+            if (!strcmp(names[i], "j4ViWNHEgww#q#q") && bindings[i]) {
+                uint64_t addr = bindings[i];
+                // Scalar strlen replacement:
+                // 48 89 f8             mov %rdi, %rax
+                // 80 38 00             1: cmpb $0, (%rax)
+                // 74 05                je 2f
+                // 48 ff c0             inc %rax
+                // eb f6                jmp 1b
+                // 48 29 f8             2: sub %rdi, %rax
+                // c3                   ret
+                static const unsigned char scalar_strlen[17] = {
+                    0x48, 0x89, 0xf8, 0x80, 0x38, 0x00, 0x74, 0x05,
+                    0x48, 0xff, 0xc0, 0xeb, 0xf6, 0x48, 0x29, 0xf8, 0xc3
+                };
+                if (addr + sizeof(scalar_strlen) <= size) {
+                    memcpy(image + addr, scalar_strlen, sizeof(scalar_strlen));
+                    printf("Applied scalar strlen patch at guest offset 0x%" PRIx64 " for non-BMI1 CPU\n", addr);
+                }
+                break;
+            }
+        }
+    }
+#endif
     protect(thunks, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;

@@ -160,6 +160,16 @@ int runtime_win_has_fsgsbase(void) {
     return has_fsgsbase;
 }
 
+int runtime_win_has_bmi1(void) {
+    static int has_bmi1 = -1;
+    if (has_bmi1 < 0) {
+        int cpuinfo[4] = {0};
+        __cpuid_count(7, 0, cpuinfo[0], cpuinfo[1], cpuinfo[2], cpuinfo[3]);
+        has_bmi1 = (cpuinfo[1] & (1 << 3)) ? 1 : 0;
+    }
+    return has_bmi1;
+}
+
 void *runtime_win_read_fsbase(void) {
     if (runtime_win_has_fsgsbase()) {
         void *base = NULL;
