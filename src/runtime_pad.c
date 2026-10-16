@@ -212,11 +212,13 @@ static void sample_host(PadData *d) {
         if (is_action_down(binds[BB_ACTION_DPAD_LEFT], k, lmb, rmb, mmb, x1, x2, lshift) || (k && k[SDL_SCANCODE_LEFT])) d->buttons |= BTN_LEFT;
         if (is_action_down(binds[BB_ACTION_DPAD_RIGHT], k, lmb, rmb, mmb, x1, x2, lshift) || (k && k[SDL_SCANCODE_RIGHT])) d->buttons |= BTN_RIGHT;
 
-        // Movement (Left Stick)
-        if (is_action_down(binds[BB_ACTION_MOVE_LEFT], k, lmb, rmb, mmb, x1, x2, lshift)) d->left_x = 0;
-        else if (is_action_down(binds[BB_ACTION_MOVE_RIGHT], k, lmb, rmb, mmb, x1, x2, lshift)) d->left_x = 255;
-        if (is_action_down(binds[BB_ACTION_MOVE_FORWARD], k, lmb, rmb, mmb, x1, x2, lshift)) d->left_y = 0;
-        else if (is_action_down(binds[BB_ACTION_MOVE_BACKWARD], k, lmb, rmb, mmb, x1, x2, lshift)) d->left_y = 255;
+        // Movement (Left Stick); the walk key holds the stick under the engine's run threshold
+        const int walk = is_action_down(binds[BB_ACTION_WALK], k, lmb, rmb, mmb, x1, x2, lshift);
+        const uint8_t stick_lo = walk ? 128 - 48 : 0, stick_hi = walk ? 128 + 48 : 255;
+        if (is_action_down(binds[BB_ACTION_MOVE_LEFT], k, lmb, rmb, mmb, x1, x2, lshift)) d->left_x = stick_lo;
+        else if (is_action_down(binds[BB_ACTION_MOVE_RIGHT], k, lmb, rmb, mmb, x1, x2, lshift)) d->left_x = stick_hi;
+        if (is_action_down(binds[BB_ACTION_MOVE_FORWARD], k, lmb, rmb, mmb, x1, x2, lshift)) d->left_y = stick_lo;
+        else if (is_action_down(binds[BB_ACTION_MOVE_BACKWARD], k, lmb, rmb, mmb, x1, x2, lshift)) d->left_y = stick_hi;
 
         // Camera Look: impulse & exponential decay model (LOOK_TAU_US = 60ms)
         // Deflection follows mouse speed over LOOK_TAU_US smoothly without per-frame stutter.

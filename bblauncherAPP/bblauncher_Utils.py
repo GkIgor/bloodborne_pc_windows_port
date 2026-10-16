@@ -79,6 +79,7 @@ DEFAULT_KEYBINDS = [
     ("key.gestures", "Gestures Menu (Touchpad L)", "G"),
     ("key.personal_effects", "Personal Effects (Touchpad R)", "Backspace"),
     ("key.menu", "System Menu (Options)", "Escape"),
+    ("key.walk", "Walk (hold)", "Left Alt"),
 ]
 
 KEYBINDINGS = [(k, desc) for _, desc, k in DEFAULT_KEYBINDS]

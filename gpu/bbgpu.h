@@ -83,6 +83,7 @@ enum BbAction {
     BB_ACTION_GESTURES,           /* Touchpad Left (Gestures Menu) */
     BB_ACTION_PERSONAL_EFFECTS,   /* Touchpad Right (Personal Effects) */
     BB_ACTION_MENU,               /* Options (System Menu) */
+    BB_ACTION_WALK,               /* Hold: partial left stick deflection */
     BB_ACTION_COUNT
 };
 

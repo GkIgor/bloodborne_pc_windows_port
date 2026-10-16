@@ -106,7 +106,7 @@ class KeybindButton(QPushButton):
         key = event.key()
         modifiers = event.modifiers()
 
-        if key in (Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt, Qt.Key_Meta):
+        if key in (Qt.Key_Shift, Qt.Key_Meta):
             return
 
         if key == Qt.Key_Escape:
@@ -172,6 +172,8 @@ class KeybindButton(QPushButton):
             Qt.Key_Print: "PrintScreen",
             Qt.Key_ScrollLock: "ScrollLock",
             Qt.Key_Pause: "Pause",
+            Qt.Key_Alt: "Left Alt",
+            Qt.Key_Control: "Left Ctrl",
         }
         if key in key_map:
             return key_map[key]

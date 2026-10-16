@@ -32,6 +32,7 @@ static const ActionInfo s_action_infos[BB_ACTION_COUNT] = {
     {BB_ACTION_GESTURES, "key.gestures", "Gestures Menu (Touchpad L)", "Меню жестов (Touchpad L)", SDL_SCANCODE_G},
     {BB_ACTION_PERSONAL_EFFECTS, "key.personal_effects", "Personal Effects (Touchpad R)", "Личные вещи (Touchpad R)", SDL_SCANCODE_BACKSPACE},
     {BB_ACTION_MENU, "key.menu", "System Menu (Options)", "Меню игры (Options)", SDL_SCANCODE_ESCAPE},
+    {BB_ACTION_WALK, "key.walk", "Walk (hold)", "Шаг (удерживать)", SDL_SCANCODE_LALT},
 };
 
 const ActionInfo* GetActionInfos() {

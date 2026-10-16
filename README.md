@@ -116,6 +116,7 @@ Save files and shader caches are stored in `user/`. Settings are saved to `bbpor
   - **Weapon Transform (L1)**: Tab
   - **Lock-On / Reset Camera (R3)**: Mouse Middle
   - **Move**: W / A / S / D
+  - **Walk (hold while moving)**: Left Alt
   - **Dodge / Roll / Sprint**: Space (hold to sprint, tap while sprinting to jump)
   - **Interact / Talk**: E (or Enter)
   - **Use Item**: R
