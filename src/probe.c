@@ -1128,21 +1128,51 @@ static int emulate_bmi1(CONTEXT *ctx) {
 }
 #endif
 
+static void log_redzone_guard_hit(uintptr_t off, uintptr_t rip, uintptr_t rsp, GuestThread *cur) {
+    static volatile LONG s_hit_count = 0;
+    static ULONGLONG s_last_tick = 0;
+    LONG hit = InterlockedIncrement(&s_hit_count);
+    ULONGLONG now = GetTickCount64();
+    if (hit <= 10 || (now - s_last_tick) >= 1000) {
+        s_last_tick = now;
+        char buf[2048];
+        int pos = snprintf(buf, sizeof(buf),
+            "\n[REDZONE GUARD HIT #%ld] Thread '%s' (TID %lu) at guest offset 0x%" PRIxPTR " (RIP %p)\n"
+            "  Exceptions previously handled on this thread: %u\n"
+            "  RSP: %p\n"
+            "  128 bytes below RSP [RSP-128 .. RSP]:\n",
+            hit, cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId(),
+            off, (void *)rip,
+            cur ? cur->exception_count : 0,
+            (void *)rsp);
+
+        if (rsp >= 128 && rsp < (1ULL << 46) && !IsBadReadPtr((const void *)(rsp - 128), 128)) {
+            unsigned char *p = (unsigned char *)(rsp - 128);
+            for (int i = 0; i < 128; i += 16) {
+                pos += snprintf(buf + pos, sizeof(buf) - pos, "    -%02x: ", 128 - i);
+                for (int j = 0; j < 16 && pos < (int)sizeof(buf) - 16; j++) {
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, "%02x ", p[i + j]);
+                }
+                pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
+            }
+            uint64_t val_60 = *(uint64_t *)(rsp - 0x60);
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  Stream pointer at [RSP - 0x60]: 0x%016llx\n",
+                           (unsigned long long)val_60);
+        } else {
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "    (RSP invalid or unreadable)\n");
+        }
+        veh_write(buf);
+        fprintf(stderr, "%s", buf);
+        fflush(stderr);
+    }
+}
+
 static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code == EXCEPTION_ACCESS_VIOLATION) {
         void *fault_addr = (void *)ep->ExceptionRecord->ExceptionInformation[1];
         uintptr_t rip = ep->ContextRecord->Rip;
-        // Save the 128-byte System V AMD64 Red Zone [RSP-128 .. RSP] before any handler runs.
-        // Windows kernel exception dispatch (KiUserExceptionDispatch) pushes its frame below RSP,
-        // which clobbers variables (like -0x60(%rsp)) used by PS4 guest functions.
-        char red_zone_backup[128];
-        uintptr_t red_zone_rsp = ep->ContextRecord->Rsp;
-        int has_red_zone = 0;
-        if (red_zone_rsp >= 128 && red_zone_rsp < (1ULL << 46)) {
-            memcpy(red_zone_backup, (void *)(red_zone_rsp - 128), 128);
-            has_red_zone = 1;
-        }
+        GuestThread *cur = runtime_thread_current();
 
         unsigned char *ip = (unsigned char *)rip;
         if (rip >= 0x10000 && !IsBadReadPtr((const void *)rip, 1) && ip[0] == 0x64) {
@@ -1156,30 +1186,66 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
                     ep->ContextRecord->Rax = *(DWORD64 *)tcb;
                     ep->ContextRecord->Rip += 9;
                 }
-                if (has_red_zone) memcpy((void *)(red_zone_rsp - 128), red_zone_backup, 128);
+                if (cur) cur->exception_count++;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
         if (gpu_enabled && bbgpu_handle_fault(ep, fault_addr)) {
-            if (has_red_zone) memcpy((void *)(red_zone_rsp - 128), red_zone_backup, 128);
+            if (cur) cur->exception_count++;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if (rip >= (uintptr_t)image && rip < (uintptr_t)image + (image_size ? image_size : 0x20000000)) {
             uintptr_t off = rip - (uintptr_t)image;
-            // Function 0x28ce7b0 is the particle/blood stream vertex generator.
-            // On Windows, if VRAM pressure or page-tracking clobbers its System V Red Zone (-0x60(%rsp)),
-            // or if vertex stream pointers are uninitialized, safely unroll the frame and return to caller.
-            if (off >= 0x28ce7ba && off < 0x28ceeb8) {
+            // Functions 0x28ce7b0 .. 0x28d015e are the particle, blood splatter, and cloth
+            // vertex stream generators executed by GXWorker threads.
+            // On x86-64 System V ABI, these routines store temporary vertex and stream pointers
+            // in the 128-byte Red Zone below RSP (-0x8(%rsp) .. -0x68(%rsp)) and write to dynamic
+            // host/guest buffers. When KiUserExceptionDispatch handles GPU write-tracking faults,
+            // Windows kernel writes CONTEXT below RSP, clobbering red zone temporaries (-0x60(%rsp) becomes 0).
+            if (off >= 0x28ce7ba && off < 0x28d015e) {
                 uintptr_t rsp = ep->ContextRecord->Rsp;
-                ep->ContextRecord->Rbx = *(DWORD64 *)(rsp + 0x30);
-                ep->ContextRecord->R12 = *(DWORD64 *)(rsp + 0x38);
-                ep->ContextRecord->R13 = *(DWORD64 *)(rsp + 0x40);
-                ep->ContextRecord->R14 = *(DWORD64 *)(rsp + 0x48);
-                ep->ContextRecord->R15 = *(DWORD64 *)(rsp + 0x50);
-                ep->ContextRecord->Rbp = *(DWORD64 *)(rsp + 0x58);
-                ep->ContextRecord->Rip = *(DWORD64 *)(rsp + 0x60);
-                ep->ContextRecord->Rsp = rsp + 0x68;
-                return EXCEPTION_CONTINUE_EXECUTION;
+                log_redzone_guard_hit(off, rip, rsp, cur);
+                if (off >= 0x28ce7ba && off < 0x28ceeb8) { // 0x28ce7b0 (sub $0x30, %rsp)
+                    ep->ContextRecord->Rbx = *(DWORD64 *)(rsp + 0x30);
+                    ep->ContextRecord->R12 = *(DWORD64 *)(rsp + 0x38);
+                    ep->ContextRecord->R13 = *(DWORD64 *)(rsp + 0x40);
+                    ep->ContextRecord->R14 = *(DWORD64 *)(rsp + 0x48);
+                    ep->ContextRecord->R15 = *(DWORD64 *)(rsp + 0x50);
+                    ep->ContextRecord->Rbp = *(DWORD64 *)(rsp + 0x58);
+                    ep->ContextRecord->Rip = *(DWORD64 *)(rsp + 0x60);
+                    ep->ContextRecord->Rsp = rsp + 0x68;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                } else if (off >= 0x28ceeca && off < 0x28cf572) { // 0x28ceec0 (sub $0x20, %rsp)
+                    ep->ContextRecord->Rbx = *(DWORD64 *)(rsp + 0x20);
+                    ep->ContextRecord->R12 = *(DWORD64 *)(rsp + 0x28);
+                    ep->ContextRecord->R13 = *(DWORD64 *)(rsp + 0x30);
+                    ep->ContextRecord->R14 = *(DWORD64 *)(rsp + 0x38);
+                    ep->ContextRecord->R15 = *(DWORD64 *)(rsp + 0x40);
+                    ep->ContextRecord->Rbp = *(DWORD64 *)(rsp + 0x48);
+                    ep->ContextRecord->Rip = *(DWORD64 *)(rsp + 0x50);
+                    ep->ContextRecord->Rsp = rsp + 0x58;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                } else if (off >= 0x28cf58a && off < 0x28cfb95) { // 0x28cf580 (push %rax = 8 bytes)
+                    ep->ContextRecord->Rbx = *(DWORD64 *)(rsp + 0x08);
+                    ep->ContextRecord->R12 = *(DWORD64 *)(rsp + 0x10);
+                    ep->ContextRecord->R13 = *(DWORD64 *)(rsp + 0x18);
+                    ep->ContextRecord->R14 = *(DWORD64 *)(rsp + 0x20);
+                    ep->ContextRecord->R15 = *(DWORD64 *)(rsp + 0x28);
+                    ep->ContextRecord->Rbp = *(DWORD64 *)(rsp + 0x30);
+                    ep->ContextRecord->Rip = *(DWORD64 *)(rsp + 0x38);
+                    ep->ContextRecord->Rsp = rsp + 0x40;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                } else if (off >= 0x28cfbaa && off < 0x28d015e) { // 0x28cfba0 (sub $0x18, %rsp)
+                    ep->ContextRecord->Rbx = *(DWORD64 *)(rsp + 0x18);
+                    ep->ContextRecord->R12 = *(DWORD64 *)(rsp + 0x20);
+                    ep->ContextRecord->R13 = *(DWORD64 *)(rsp + 0x28);
+                    ep->ContextRecord->R14 = *(DWORD64 *)(rsp + 0x30);
+                    ep->ContextRecord->R15 = *(DWORD64 *)(rsp + 0x38);
+                    ep->ContextRecord->Rbp = *(DWORD64 *)(rsp + 0x40);
+                    ep->ContextRecord->Rip = *(DWORD64 *)(rsp + 0x48);
+                    ep->ContextRecord->Rsp = rsp + 0x50;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
             }
         }
         if (runtime_fault_recover) {
@@ -1214,6 +1280,8 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
         TerminateProcess(GetCurrentProcess(), 128 + 11);
     } else if (code == EXCEPTION_ILLEGAL_INSTRUCTION) {
         if (!runtime_win_has_bmi1() && emulate_bmi1(ep->ContextRecord)) {
+            GuestThread *cur = runtime_thread_current();
+            if (cur) cur->exception_count++;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         uintptr_t rip = ep->ContextRecord->Rip;

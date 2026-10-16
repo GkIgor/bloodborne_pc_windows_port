@@ -149,6 +149,7 @@ typedef struct GuestThread {
     uint64_t blocked_tick;
     uint32_t recent_imports[32];
     uint32_t recent_import_count;
+    uint32_t exception_count;
     struct GuestThread *next;
 } GuestThread;
 
