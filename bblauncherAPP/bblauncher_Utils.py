@@ -39,6 +39,7 @@ ANISO_CHOICES = [
     ("2x", "2", "2x anisotropic filtering"),
     ("Off", "0", "Game's default anisotropic filtering (no override)"),
 ]
+AA_CHOICES = ["Native FXAA (PS4 Default)", "Disable AA (No FXAA)", "TAA (Temporal Anti-Aliasing)"]
 VK_NOISE = "<Warning> vk_instance.cpp"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -47,6 +48,7 @@ DEFAULT_SETTINGS = {
     "fps": "60",
     "res": RES_CHOICES[0],
     "aniso": "16x",
+    "anti_aliasing": AA_CHOICES[0],
     "mods": False,
     "hide_vk": True,
     "feat_upscaler": False,
@@ -264,7 +266,75 @@ def verify_prelaunch(game_dir: Path) -> tuple[bool, str, list[str]]:
     except OSError:
         details.append("[WARN] vulkan-1.dll not detected in system path")
 
+    # CPU instruction check: AVX 1.0 support
+    avx_ok, avx_msg = check_cpu_avx_support()
+    if not avx_ok:
+        return False, f"Hardware Incompatibility (Unsupported CPU):\n\n{avx_msg}", details
+    details.append("[OK] CPU Architecture: AVX 1.0+ vector extensions verified")
+
     return True, "", details
+
+
+def check_cpu_avx_support() -> tuple[bool, str]:
+    if os.name != "nt":
+        return True, ""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.VirtualAlloc.restype = ctypes.c_void_p
+        kernel32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]
+        kernel32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
+
+        shellcode = bytes([
+            0x53,                               # push rbx
+            0xB8, 0x01, 0x00, 0x00, 0x00,       # mov eax, 1
+            0x31, 0xC9,                         # xor ecx, ecx
+            0x0F, 0xA2,                         # cpuid
+            0xF7, 0xC1, 0x00, 0x00, 0x00, 0x10, # test ecx, 10000000h (bit 28 - AVX)
+            0x74, 0x1A,                         # jz no_avx
+            0xF7, 0xC1, 0x00, 0x00, 0x00, 0x08, # test ecx, 08000000h (bit 27 - OSXSAVE)
+            0x74, 0x18,                         # jz no_osxsave
+            0x31, 0xC9,                         # xor ecx, ecx
+            0x0F, 0x01, 0xD0,                   # xgetbv (eax:edx = XCR0)
+            0x83, 0xE0, 0x06,                   # and eax, 6 (bit 1=XMM, bit 2=YMM)
+            0x83, 0xF8, 0x06,                   # cmp eax, 6
+            0x75, 0x0B,                         # jne no_osxsave
+            0xB8, 0x01, 0x00, 0x00, 0x00,       # mov eax, 1 (AVX OK)
+            0x5B,                               # pop rbx
+            0xC3,                               # ret
+            # no_osxsave:
+            0xB8, 0xFF, 0xFF, 0xFF, 0xFF,       # mov eax, -1
+            0x5B,                               # pop rbx
+            0xC3,                               # ret
+            # no_avx:
+            0x31, 0xC0,                         # xor eax, eax
+            0x5B,                               # pop rbx
+            0xC3                                # ret
+        ])
+        ptr = kernel32.VirtualAlloc(None, len(shellcode), 0x3000, 0x40)
+        if not ptr:
+            return True, ""
+        ctypes.memmove(ptr, shellcode, len(shellcode))
+        fn = ctypes.CFUNCTYPE(ctypes.c_int32)(ptr)
+        status = fn()
+        kernel32.VirtualFree(ptr, 0, 0x8000)
+
+        if status == 0:
+            return False, (
+                "Your CPU lacks support for AVX (Advanced Vector Extensions 1.0).\n\n"
+                "Bloodborne and native PS4 system libraries are built with -mavx and "
+                "require AVX hardware instructions to run.\n\n"
+                "Older processors without AVX (such as Intel Core 2 Quad, Nehalem/Westmere "
+                "Xeon X56xx, or first-gen Core i7) cannot execute these binaries."
+            )
+        elif status == -1:
+            return False, (
+                "Your CPU supports AVX, but AVX state saving (OSXSAVE / XCR0 YMM) is disabled "
+                "or masked by the operating system / hypervisor.\n\n"
+                "If running inside a virtual machine or hypervisor, please enable AVX/XSAVE passthrough."
+            )
+        return True, ""
+    except Exception:
+        return True, ""
 
 
 class ProcessWorker(QThread):

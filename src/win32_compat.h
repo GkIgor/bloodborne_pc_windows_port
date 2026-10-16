@@ -60,6 +60,7 @@ void runtime_win_set_tcb(void *tcb);
 void runtime_win_set_thread_name(const char *name);
 int runtime_win_has_fsgsbase(void);
 int runtime_win_has_bmi1(void);
+int runtime_win_check_avx(void);
 void *runtime_win_read_fsbase(void);
 
 /* Networking helpers without winsock headers. */

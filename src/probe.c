@@ -1514,6 +1514,34 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
 #ifdef _WIN32
     runtime_memory_reserve_space();
+    int avx_status = runtime_win_check_avx();
+    if (avx_status != 1) {
+        if (avx_status == 0) {
+            fprintf(stderr, "\n================================================================================\n"
+                            "ERROR: Host CPU lacks AVX (Advanced Vector Extensions) instruction support!\n"
+                            "Bloodborne and PS4 system libraries are compiled with -mavx and strictly require\n"
+                            "AVX 1.0 support. Your processor (e.g. pre-Sandy Bridge / Nehalem) cannot run this title.\n"
+                            "================================================================================\n\n");
+            MessageBoxA(NULL,
+                        "Your processor does not support AVX (Advanced Vector Extensions 1.0).\n\n"
+                        "Bloodborne and PS4 system binaries natively require AVX support. Pre-Sandy Bridge\n"
+                        "CPUs (such as Intel Core 2 Quad or Nehalem/Westmere Xeon X56xx) cannot execute these instructions.\n\n"
+                        "The application cannot start.",
+                        "Bloodborne PC - Unsupported CPU (No AVX)", MB_OK | MB_ICONERROR);
+        } else {
+            fprintf(stderr, "\n================================================================================\n"
+                            "ERROR: AVX instructions are supported by CPU but disabled by OS / Hypervisor (OSXSAVE/XCR0)!\n"
+                            "Please ensure Windows XSAVE / YMM state support and virtualization settings allow AVX.\n"
+                            "================================================================================\n\n");
+            MessageBoxA(NULL,
+                        "Your processor supports AVX, but the operating system or hypervisor has disabled\n"
+                        "AVX state saving (OSXSAVE / XCR0 YMM state).\n\n"
+                        "If you are running in a virtual machine or hypervisor, enable AVX/XSAVE passthrough.\n\n"
+                        "The application cannot start.",
+                        "Bloodborne PC - AVX Disabled by OS", MB_OK | MB_ICONERROR);
+        }
+        return 132;
+    }
 #endif
     time_t t_now = time(NULL);
     struct tm tm_buf;

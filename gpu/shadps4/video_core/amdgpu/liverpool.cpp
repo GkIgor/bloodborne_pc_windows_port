@@ -774,21 +774,29 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             UNREACHABLE_MSG("Wrong PM4 type {}", type);
             break;
         case 0: {
-            // A zero dword is often trailing padding at the end of a command chunk.
-            // If all remaining dwords in the chunk are zero, treat them as padding and finish.
-            bool all_zero = true;
-            for (u32 w : dcb) {
-                if (w != 0) {
-                    all_zero = false;
-                    break;
+            // A zero dword is often padding (alignment or trailing) in command chunks.
+            if (header->raw == 0) {
+                // If all remaining dwords in the chunk are zero, finish chunk.
+                bool all_zero = true;
+                for (u32 w : dcb) {
+                    if (w != 0) {
+                        all_zero = false;
+                        break;
+                    }
                 }
-            }
-            if (all_zero) {
-                dcb = {};
+                if (all_zero) {
+                    dcb = {};
+                    continue;
+                }
+                // Isolated zero DWORD used as alignment/padding between packets.
+                dcb = NextPacket(dcb, 1);
                 continue;
             }
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
+            // Non-zero Type-0 packet: skip the packet body safely.
+            const u32 num_words = header->type0.NumWords();
+            LOG_WARNING(Render_Vulkan, "Skipping unhandled PM4 Type-0 packet: base reg 0x{:x}, count {}",
+                        header->type0.base.Value(), num_words);
+            dcb = NextPacket(dcb, 1 + num_words);
             break;
         }
         case 2:

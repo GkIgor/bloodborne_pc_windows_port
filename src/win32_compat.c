@@ -170,6 +170,42 @@ int runtime_win_has_bmi1(void) {
     return has_bmi1;
 }
 
+int runtime_win_check_avx(void) {
+    /* Returns:
+     *  1 = AVX 1.0+ supported and enabled by OS
+     *  0 = CPU lacks AVX feature
+     * -1 = CPU has AVX but OSXSAVE or XCR0 state saving is disabled/masked
+     */
+    static int avx_status = -999;
+    if (avx_status != -999) return avx_status;
+
+    int cpuinfo[4] = {0};
+    __cpuid(1, cpuinfo[0], cpuinfo[1], cpuinfo[2], cpuinfo[3]);
+    int ecx = cpuinfo[2];
+
+    /* Bit 28: AVX support */
+    if (!(ecx & (1 << 28))) {
+        avx_status = 0;
+        return avx_status;
+    }
+    /* Bit 27: OSXSAVE (OS supports XSAVE and XGETBV) */
+    if (!(ecx & (1 << 27))) {
+        avx_status = -1;
+        return avx_status;
+    }
+
+    /* Read XCR0 via XGETBV (ECX = 0) */
+    uint32_t xcr0_lo = 0, xcr0_hi = 0;
+    __asm__ __volatile__("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+    /* Bits 1 and 2 must both be set (bit 1 = XMM state, bit 2 = YMM state) */
+    if ((xcr0_lo & 0x6) == 0x6) {
+        avx_status = 1;
+    } else {
+        avx_status = -1;
+    }
+    return avx_status;
+}
+
 void *runtime_win_read_fsbase(void) {
     if (runtime_win_has_fsgsbase()) {
         void *base = NULL;

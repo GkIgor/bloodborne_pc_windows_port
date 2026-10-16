@@ -52,7 +52,10 @@ This repository adapts the original Linux codebase specifically for Windows syst
   - NVIDIA GeForce GTX 10-series or newer.
   - AMD Radeon RX 400-series or newer.
   - Intel Arc A-series or newer.
-- **Processor**: x86-64 processor supporting AVX, SSE4.2, and BMI1 (AVX2 no longer mandatory; non-FSGSBASE CPUs gracefully fall back to Windows TLS).
+- **Processor**: 64-bit x86-64 processor supporting **AVX 1.0** and SSE4.2 (Intel Sandy Bridge / AMD Bulldozer or newer).
+  - *Note on AVX vs AVX2*: **AVX2 is NOT required.** However, **AVX 1.0 is an architectural requirement** because PlayStation 4 native binaries and libraries are compiled with `-mavx` (using VEX-encoded vector instructions like `vxorps`). Legacy processors without AVX (such as Intel Core 2 Quad or Nehalem/Westmere Xeon X56xx) cannot execute these instructions and will fail pre-launch validation.
+  - *OSXSAVE / Virtualization*: Windows must have OSXSAVE enabled (`XCR0` YMM state saving). When running inside hypervisors or VMs, ensure AVX and XSAVE passthrough are enabled.
+  - *FSGSBASE*: Non-FSGSBASE CPUs are fully supported and gracefully fall back to Windows TLS slots.
 - **Game Files**: Decrypted `CUSA03173` directory containing `eboot.bin` (version 1.09).
 
 *(Note: Release archives include a pre-configured `python-embed/` runtime; manual Python installation is not required for release users).*

@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from bblauncher_Utils import (
+    AA_CHOICES,
     ANISO_CHOICES,
     DEFAULT_GAME,
     DEFAULT_KEYBINDS,
@@ -883,6 +884,13 @@ class LauncherUI:
             self.cmb_aniso.addItem(label)
         self.cmb_aniso.setCurrentText(self.settings.get("aniso", "16x"))
         grid_disp.addWidget(self.cmb_aniso, 1, 3)
+
+        grid_disp.addWidget(QLabel("Anti-Aliasing:"), 2, 0)
+        self.cmb_aa = QComboBox()
+        self.cmb_aa.addItems(AA_CHOICES)
+        self.cmb_aa.setCurrentText(self.settings.get("anti_aliasing", AA_CHOICES[0]))
+        self.cmb_aa.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+        grid_disp.addWidget(self.cmb_aa, 2, 1)
 
         l_disp.addLayout(grid_disp)
 

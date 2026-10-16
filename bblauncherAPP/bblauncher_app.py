@@ -131,6 +131,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "fps": self.cmb_fps.currentText(),
                 "res": self.cmb_res.currentText(),
                 "aniso": self.cmb_aniso.currentText(),
+                "anti_aliasing": self.cmb_aa.currentText(),
                 "mods": self.chk_mods.isChecked(),
                 "hide_vk": self.chk_vk_noise.isChecked(),
                 "feat_upscaler": self.chk_fsr.isChecked(),
@@ -179,8 +180,12 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 output_res_val = candidate
                 break
 
+        aa_choice = self.cmb_aa.currentText()
+        effect_game_aa = "0" if "Disable" in aa_choice or "TAA" in aa_choice else "1"
+
         keys_to_update = {
             "output_res": output_res_val,
+            "effect_game_aa": effect_game_aa,
             "mk_enabled": "1" if self.chk_mk_enabled.isChecked() else "0",
             "mk_sens_x": f"{self.sl_sens_x.value() / 100:.2f}",
             "mk_sens_y": f"{self.sl_sens_y.value() / 100:.2f}",
@@ -484,7 +489,10 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         env["BB_FPS"] = cfg["fps"]
         env["BB_MODS_ENABLED"] = "1" if cfg["mods"] else "0"
 
-        if not cfg["feat_upscaler"]:
+        aa_mode = cfg.get("anti_aliasing", "Native FXAA (PS4 Default)")
+        if "TAA" in aa_mode:
+            env["BB_UPSCALER"] = "taa"
+        elif not cfg["feat_upscaler"]:
             env["BB_UPSCALER"] = "off"
         else:
             env.pop("BB_UPSCALER", None)
@@ -524,7 +532,10 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         aniso_mapping = {c[0]: c[1] for c in ANISO_CHOICES}
         env["BB_ANISO"] = aniso_mapping.get(cfg["aniso"], "16")
 
-        active_patches = cfg["enabled_patches"]
+        active_patches = list(cfg["enabled_patches"])
+        if ("Disable" in aa_mode or "TAA" in aa_mode) and "Disable AA" not in active_patches:
+            active_patches.append("Disable AA")
+
         if active_patches:
             env["BB_PATCHES"] = ";".join(active_patches)
         else:
