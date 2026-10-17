@@ -110,15 +110,18 @@ static inline uint8_t calc_look_axis(float val, uint8_t stick_curr, int hw_deadz
     return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
 }
 
-static inline bool is_action_down(int code, const bool *k, bool lmb, bool rmb, bool mmb, bool x1, bool x2, bool lshift) {
+enum { CHORD_LMB = 1, CHORD_RMB = 2 };
+
+/* lmb/rmb are the bare buttons: false while a bound Shift chord on that button is held. */
+static inline bool is_action_down(int code, const bool *k, bool lmb, bool rmb, bool mmb, bool x1, bool x2, unsigned chords) {
     if (code <= 0) return false;
     if (code == BB_KEY_MOUSE_LEFT) return lmb;
     if (code == BB_KEY_MOUSE_RIGHT) return rmb;
     if (code == BB_KEY_MOUSE_MIDDLE) return mmb;
     if (code == BB_KEY_MOUSE_X1) return x1;
     if (code == BB_KEY_MOUSE_X2) return x2;
-    if (code == BB_KEY_CHORD_SHIFT_LMB) return lshift && lmb;
-    if (code == BB_KEY_CHORD_SHIFT_RMB) return lshift && rmb;
+    if (code == BB_KEY_CHORD_SHIFT_LMB) return (chords & CHORD_LMB) != 0;
+    if (code == BB_KEY_CHORD_SHIFT_RMB) return (chords & CHORD_RMB) != 0;
     if (code < SDL_SCANCODE_COUNT && k) return k[code];
     return false;
 }
@@ -177,8 +180,8 @@ static void sample_host(PadData *d) {
     const int mouse_is_captured = bbgpu_mouse_captured();
     float mouse_x_pos = 0.0f, mouse_y_pos = 0.0f;
     const SDL_MouseButtonFlags mouse_buttons = mouse_is_captured ? SDL_GetMouseState(&mouse_x_pos, &mouse_y_pos) : 0;
-    const bool lmb = (mouse_buttons & SDL_BUTTON_LMASK) != 0;
-    const bool rmb = (mouse_buttons & SDL_BUTTON_RMASK) != 0;
+    const bool lmb_raw = (mouse_buttons & SDL_BUTTON_LMASK) != 0;
+    const bool rmb_raw = (mouse_buttons & SDL_BUTTON_RMASK) != 0;
     const bool mmb = (mouse_buttons & SDL_BUTTON_MMASK) != 0;
     const bool x1 = (mouse_buttons & SDL_BUTTON_X1MASK) != 0;
     const bool x2 = (mouse_buttons & SDL_BUTTON_X2MASK) != 0;
@@ -188,37 +191,46 @@ static void sample_host(PadData *d) {
     int binds[BB_ACTION_COUNT];
     bbgpu_get_all_action_bindings(binds, BB_ACTION_COUNT);
 
+    // A held Shift chord owns its mouse button so the bare-button action doesn't fire with it.
+    unsigned chords = 0;
+    for (int i = 0; i < BB_ACTION_COUNT; ++i) {
+        if (binds[i] == BB_KEY_CHORD_SHIFT_LMB && lshift && lmb_raw) chords |= CHORD_LMB;
+        if (binds[i] == BB_KEY_CHORD_SHIFT_RMB && lshift && rmb_raw) chords |= CHORD_RMB;
+    }
+    const bool lmb = lmb_raw && !(chords & CHORD_LMB);
+    const bool rmb = rmb_raw && !(chords & CHORD_RMB);
+
     if (mk_enabled) {
         // Combat actions
-        if (is_action_down(binds[BB_ACTION_ATTACK], k, lmb, rmb, mmb, x1, x2, lshift)) d->buttons |= BTN_R1;
-        if (is_action_down(binds[BB_ACTION_HEAVY_ATTACK], k, lmb, rmb, mmb, x1, x2, lshift)) d->buttons |= BTN_R2;
-        if (is_action_down(binds[BB_ACTION_FIREARM], k, lmb, rmb, mmb, x1, x2, lshift)) d->buttons |= BTN_L2;
-        if (is_action_down(binds[BB_ACTION_TRANSFORM], k, lmb, rmb, mmb, x1, x2, lshift)) d->buttons |= BTN_L1;
-        if (is_action_down(binds[BB_ACTION_LOCK_ON], k, lmb, rmb, mmb, x1, x2, lshift)) d->buttons |= BTN_R3;
+        if (is_action_down(binds[BB_ACTION_ATTACK], k, lmb, rmb, mmb, x1, x2, chords)) d->buttons |= BTN_R1;
+        if (is_action_down(binds[BB_ACTION_HEAVY_ATTACK], k, lmb, rmb, mmb, x1, x2, chords)) d->buttons |= BTN_R2;
+        if (is_action_down(binds[BB_ACTION_FIREARM], k, lmb, rmb, mmb, x1, x2, chords)) d->buttons |= BTN_L2;
+        if (is_action_down(binds[BB_ACTION_TRANSFORM], k, lmb, rmb, mmb, x1, x2, chords)) d->buttons |= BTN_L1;
+        if (is_action_down(binds[BB_ACTION_LOCK_ON], k, lmb, rmb, mmb, x1, x2, chords)) d->buttons |= BTN_R3;
 
         // Interaction & quick item actions
-        if (is_action_down(binds[BB_ACTION_DODGE], k, lmb, rmb, mmb, x1, x2, lshift)) d->buttons |= BTN_CIRCLE;
-        if (is_action_down(binds[BB_ACTION_INTERACT], k, lmb, rmb, mmb, x1, x2, lshift) ||
+        if (is_action_down(binds[BB_ACTION_DODGE], k, lmb, rmb, mmb, x1, x2, chords)) d->buttons |= BTN_CIRCLE;
+        if (is_action_down(binds[BB_ACTION_INTERACT], k, lmb, rmb, mmb, x1, x2, chords) ||
             (k && (k[SDL_SCANCODE_RETURN] || k[SDL_SCANCODE_KP_ENTER]))) d->buttons |= BTN_CROSS;
-        if (is_action_down(binds[BB_ACTION_USE_ITEM], k, lmb, rmb, mmb, x1, x2, lshift)) d->buttons |= BTN_SQUARE;
-        if (is_action_down(binds[BB_ACTION_HEAL], k, lmb, rmb, mmb, x1, x2, lshift)) d->buttons |= BTN_TRIANGLE;
-        if (is_action_down(binds[BB_ACTION_GESTURES], k, lmb, rmb, mmb, x1, x2, lshift)) touch_click(d, 0);
-        if (is_action_down(binds[BB_ACTION_PERSONAL_EFFECTS], k, lmb, rmb, mmb, x1, x2, lshift)) touch_click(d, 1);
-        if (is_action_down(binds[BB_ACTION_MENU], k, lmb, rmb, mmb, x1, x2, lshift)) d->buttons |= BTN_OPTIONS;
+        if (is_action_down(binds[BB_ACTION_USE_ITEM], k, lmb, rmb, mmb, x1, x2, chords)) d->buttons |= BTN_SQUARE;
+        if (is_action_down(binds[BB_ACTION_HEAL], k, lmb, rmb, mmb, x1, x2, chords)) d->buttons |= BTN_TRIANGLE;
+        if (is_action_down(binds[BB_ACTION_GESTURES], k, lmb, rmb, mmb, x1, x2, chords)) touch_click(d, 0);
+        if (is_action_down(binds[BB_ACTION_PERSONAL_EFFECTS], k, lmb, rmb, mmb, x1, x2, chords)) touch_click(d, 1);
+        if (is_action_down(binds[BB_ACTION_MENU], k, lmb, rmb, mmb, x1, x2, chords)) d->buttons |= BTN_OPTIONS;
 
         // D-Pad Quick Selection (with arrow keys fallback)
-        if (is_action_down(binds[BB_ACTION_DPAD_UP], k, lmb, rmb, mmb, x1, x2, lshift) || (k && k[SDL_SCANCODE_UP])) d->buttons |= BTN_UP;
-        if (is_action_down(binds[BB_ACTION_DPAD_DOWN], k, lmb, rmb, mmb, x1, x2, lshift) || (k && k[SDL_SCANCODE_DOWN])) d->buttons |= BTN_DOWN;
-        if (is_action_down(binds[BB_ACTION_DPAD_LEFT], k, lmb, rmb, mmb, x1, x2, lshift) || (k && k[SDL_SCANCODE_LEFT])) d->buttons |= BTN_LEFT;
-        if (is_action_down(binds[BB_ACTION_DPAD_RIGHT], k, lmb, rmb, mmb, x1, x2, lshift) || (k && k[SDL_SCANCODE_RIGHT])) d->buttons |= BTN_RIGHT;
+        if (is_action_down(binds[BB_ACTION_DPAD_UP], k, lmb, rmb, mmb, x1, x2, chords) || (k && k[SDL_SCANCODE_UP])) d->buttons |= BTN_UP;
+        if (is_action_down(binds[BB_ACTION_DPAD_DOWN], k, lmb, rmb, mmb, x1, x2, chords) || (k && k[SDL_SCANCODE_DOWN])) d->buttons |= BTN_DOWN;
+        if (is_action_down(binds[BB_ACTION_DPAD_LEFT], k, lmb, rmb, mmb, x1, x2, chords) || (k && k[SDL_SCANCODE_LEFT])) d->buttons |= BTN_LEFT;
+        if (is_action_down(binds[BB_ACTION_DPAD_RIGHT], k, lmb, rmb, mmb, x1, x2, chords) || (k && k[SDL_SCANCODE_RIGHT])) d->buttons |= BTN_RIGHT;
 
         // Movement (Left Stick); the walk key holds the stick under the engine's run threshold
-        const int walk = is_action_down(binds[BB_ACTION_WALK], k, lmb, rmb, mmb, x1, x2, lshift);
+        const int walk = is_action_down(binds[BB_ACTION_WALK], k, lmb, rmb, mmb, x1, x2, chords);
         const uint8_t stick_lo = walk ? 128 - 48 : 0, stick_hi = walk ? 128 + 48 : 255;
-        if (is_action_down(binds[BB_ACTION_MOVE_LEFT], k, lmb, rmb, mmb, x1, x2, lshift)) d->left_x = stick_lo;
-        else if (is_action_down(binds[BB_ACTION_MOVE_RIGHT], k, lmb, rmb, mmb, x1, x2, lshift)) d->left_x = stick_hi;
-        if (is_action_down(binds[BB_ACTION_MOVE_FORWARD], k, lmb, rmb, mmb, x1, x2, lshift)) d->left_y = stick_lo;
-        else if (is_action_down(binds[BB_ACTION_MOVE_BACKWARD], k, lmb, rmb, mmb, x1, x2, lshift)) d->left_y = stick_hi;
+        if (is_action_down(binds[BB_ACTION_MOVE_LEFT], k, lmb, rmb, mmb, x1, x2, chords)) d->left_x = stick_lo;
+        else if (is_action_down(binds[BB_ACTION_MOVE_RIGHT], k, lmb, rmb, mmb, x1, x2, chords)) d->left_x = stick_hi;
+        if (is_action_down(binds[BB_ACTION_MOVE_FORWARD], k, lmb, rmb, mmb, x1, x2, chords)) d->left_y = stick_lo;
+        else if (is_action_down(binds[BB_ACTION_MOVE_BACKWARD], k, lmb, rmb, mmb, x1, x2, chords)) d->left_y = stick_hi;
 
         // Camera Look: impulse & exponential decay model (LOOK_TAU_US = 60ms)
         // Deflection follows mouse speed over LOOK_TAU_US smoothly without per-frame stutter.
