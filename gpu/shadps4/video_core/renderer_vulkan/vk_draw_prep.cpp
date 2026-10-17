@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "bbport_settings.h"
 #include "bbport_threads.h"
 #include "bbport_toggles.h"
 #include "common/thread.h"
@@ -50,6 +51,10 @@ void ForEachPacket(std::span<const u32> commands, Func&& func) {
 u32 DefaultWorkerCount() {
     if (const char* env = std::getenv("BB_PREP_WORKERS")) {
         return static_cast<u32>(std::clamp(std::atoi(env), 0, 16));
+    }
+    const int cfg_workers = BbSettings::Get().prep_workers.load();
+    if (cfg_workers >= 0) {
+        return static_cast<u32>(std::clamp(cfg_workers, 0, 16));
     }
     // Workers are SCHED_IDLE and claim whole buffers, so more of them only use more idle
     // cores: half the hardware threads (Steam Deck 4, 16-thread desktop 8).

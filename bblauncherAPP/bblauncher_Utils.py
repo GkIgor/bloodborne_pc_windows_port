@@ -40,6 +40,16 @@ ANISO_CHOICES = [
     ("Off", "0", "Game's default anisotropic filtering (no override)"),
 ]
 AA_CHOICES = ["Native FXAA (PS4 Default)", "Disable AA (No FXAA)", "TAA (Temporal Anti-Aliasing)"]
+PREP_WORKER_CHOICES = [
+    ("Auto (dynamic threads)", "auto"),
+    ("Off (single-threaded)", "0"),
+    ("1 (recommended for 4-threaded CPUs)", "1"),
+    ("2 (recommended for 6-threaded CPUs)", "2"),
+    ("3 (recommended for 8-threaded CPUs)", "3"),
+    ("4 (recommended for 10-12 threaded CPUs)", "4"),
+    ("6 (recommended for 16-threaded CPUs)", "6"),
+    ("8 (recommended for 24+ threaded CPUs)", "8"),
+]
 VK_NOISE = "<Warning> vk_instance.cpp"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -48,6 +58,7 @@ DEFAULT_SETTINGS = {
     "fps": "60",
     "res": RES_CHOICES[0],
     "aniso": "16x",
+    "prep_workers": PREP_WORKER_CHOICES[0][0],
     "anti_aliasing": AA_CHOICES[0],
     "mods": False,
     "hide_vk": True,

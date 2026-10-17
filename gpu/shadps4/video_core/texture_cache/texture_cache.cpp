@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <cstring>
+#include <unordered_set>
+#include <boost/container_hash/hash.hpp>
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
@@ -11,6 +15,7 @@
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "video_core/amdgpu/tiling.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -73,43 +78,207 @@ void TextureCache::ProcessDownloadImages() {
     download_images.clear();
 }
 
+static bool CanTileImage(const Image& image) {
+    const auto& info = image.info;
+    if (!info.props.is_tiled) {
+        return true;
+    }
+    if (!image.backing ||
+        !IsVulkanFormatCompatible(info.pixel_format, image.backing->image.image_ci.format)) {
+        return false;
+    }
+    if (info.num_samples != 1 || info.props.has_stencil) {
+        return false;
+    }
+    if (info.resources.levels > 16) {
+        return false;
+    }
+    switch (info.num_bits) {
+    case 8:
+    case 16:
+    case 32:
+    case 64:
+    case 96:
+    case 128:
+        break;
+    default:
+        return false;
+    }
+    const u32 bytes_per_pixel = info.num_bits / 8;
+    if (bytes_per_pixel == 0) {
+        return false;
+    }
+    const u64 dim_x = (info.guest_size / bytes_per_pixel) / 64;
+    if (dim_x == 0) {
+        return false;
+    }
+    if (AmdGpu::IsMacroTiled(info.array_mode)) {
+        const auto micro_tile_mode = AmdGpu::GetMicroTileMode(info.tile_mode);
+        const u32 tile_thickness = AmdGpu::GetMicroTileThickness(info.array_mode);
+        const u32 tile_bytes_1x = info.num_bits * 8 * 8 * tile_thickness / 8;
+        const u32 tile_split = AmdGpu::CalculateTileSplit(info.tile_mode, info.array_mode,
+                                                          micro_tile_mode, info.num_bits);
+        const u32 tile_bytes = std::min(tile_split, info.num_samples * tile_bytes_1x);
+        if (tile_bytes < 64) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void LogUnsupportedTiledImageOnce(const Image& image) {
+    struct UnsupportedKey {
+        AmdGpu::TileMode tile_mode;
+        vk::Format format;
+        u32 num_bits;
+        u32 num_samples;
+        u32 levels;
+
+        bool operator==(const UnsupportedKey& o) const = default;
+    };
+    struct KeyHash {
+        size_t operator()(const UnsupportedKey& k) const noexcept {
+            size_t h = 0;
+            boost::hash_combine(h, static_cast<u32>(k.tile_mode));
+            boost::hash_combine(h, static_cast<u32>(k.format));
+            boost::hash_combine(h, k.num_bits);
+            boost::hash_combine(h, k.num_samples);
+            boost::hash_combine(h, k.levels);
+            return h;
+        }
+    };
+    static std::unordered_set<UnsupportedKey, KeyHash> logged;
+    static std::mutex logged_mutex;
+    const UnsupportedKey key{
+        .tile_mode = image.info.tile_mode,
+        .format = image.backing ? image.backing->image.image_ci.format : vk::Format::eUndefined,
+        .num_bits = image.info.num_bits,
+        .num_samples = image.info.num_samples,
+        .levels = image.info.resources.levels,
+    };
+    std::scoped_lock lock{logged_mutex};
+    if (logged.insert(key).second) {
+        LOG_WARNING(Render_Vulkan,
+                    "Garbage collector: keeping unsupported tiled image: addr={:#x}, size={:#x}, "
+                    "tile_mode={} ({}), format={}, bpp={}, samples={}, levels={}, slices={}",
+                    image.info.guest_address, image.info.guest_size,
+                    static_cast<u32>(image.info.tile_mode),
+                    AmdGpu::NameOf(image.info.tile_mode),
+                    vk::to_string(image.info.pixel_format),
+                    image.info.num_bits, image.info.num_samples,
+                    image.info.resources.levels, image.info.resources.layers);
+    }
+}
+
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
-    const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
-                              image.info.resources.layers * (image.info.num_bits / 8);
-    ASSERT(download_size <= image.info.guest_size);
+    const auto image_addr = image.info.guest_address;
+    const auto image_mips = image.info.resources.levels;
+    u32 copy_size = 0;
+    boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
+    for (u32 mip = 0; mip < image_mips; ++mip) {
+        const u32 width = std::max(image.info.size.width >> mip, 1u);
+        const u32 height = std::max(image.info.size.height >> mip, 1u);
+        const u32 depth =
+            image.info.props.is_volume ? std::max(image.info.size.depth >> mip, 1u) : 1u;
+        const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[mip];
+        const u32 extent_width = mip_pitch ? std::min<u32>(mip_pitch, width) : width;
+        const u32 extent_height = mip_height ? std::min<u32>(mip_height, height) : height;
+        buffer_copies.push_back(vk::BufferImageCopy{
+            .bufferOffset = mip_offset,
+            .bufferRowLength = mip_pitch,
+            .bufferImageHeight = mip_height,
+            .imageSubresource =
+                {
+                    .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                    .mipLevel = mip,
+                    .baseArrayLayer = 0,
+                    .layerCount = image.info.resources.layers,
+                },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {extent_width, extent_height, depth},
+        });
+        copy_size += mip_size;
+    }
+    if (buffer_copies.empty()) {
+        return;
+    }
+    ASSERT(copy_size <= image.info.guest_size);
+
+    const u32 request_size = image.info.props.is_tiled
+                                 ? std::max(copy_size, static_cast<u32>(image.info.guest_size))
+                                 : copy_size;
     const auto download =
-        runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, !sync);
-    const vk::BufferImageCopy image_download = {
-        .bufferOffset = download.offset,
-        .bufferRowLength = image.info.pitch,
-        .bufferImageHeight = image.info.size.height,
-        .imageSubresource =
-            {
-                .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
-                                                        : vk::ImageAspectFlagBits::eColor,
-                .mipLevel = 0,
-                .baseArrayLayer = 0,
-                .layerCount = image.info.resources.layers,
-            },
-        .imageOffset = {0, 0, 0},
-        .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
-    };
-    runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
+        runtime.GetStagingPool().Request(request_size, MemoryType::HostCached, 16, !sync);
+
+    auto copies_for_tile = buffer_copies;
+    tile_manager.TileImage(image, copies_for_tile, download.buffer, download.offset);
+
+    static const bool verify_tiled_download = []() {
+        const char* env = std::getenv("BB_TILED_DOWNLOAD_VERIFY");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+
+    if (verify_tiled_download && image.info.props.is_tiled) {
+        // Detile the result and compare it with the linear original.
+        const auto orig_linear =
+            runtime.GetStagingPool().Request(copy_size, MemoryType::HostCached, 16, false);
+        auto linear_copies = buffer_copies;
+        for (auto& copy : linear_copies) {
+            copy.bufferOffset += orig_linear.offset;
+        }
+        runtime.DownloadImage(&image, orig_linear.buffer, linear_copies);
+
+        const auto [detiled_buf, detiled_offset] =
+            tile_manager.DetileImage(download.buffer, download.offset, image.info);
+
+        const auto detiled_host =
+            runtime.GetStagingPool().Request(copy_size, MemoryType::HostCached, 16, false);
+        const vk::BufferCopy copy_op{
+            .srcOffset = detiled_offset,
+            .dstOffset = detiled_host.offset,
+            .size = copy_size,
+        };
+        runtime.CopyBuffer(detiled_buf, detiled_host.buffer, std::span{&copy_op, 1});
+
+        scheduler.Finish();
+        orig_linear.Invalidate();
+        detiled_host.Invalidate();
+
+        if (std::memcmp(orig_linear.mapped, detiled_host.mapped, copy_size) != 0) {
+            LOG_ERROR(Render_Vulkan,
+                      "BB_TILED_DOWNLOAD_VERIFY mismatch: addr={:#x}, size={:#x}, tile_mode={} ({}), format={}",
+                      image_addr, copy_size,
+                      static_cast<u32>(image.info.tile_mode),
+                      AmdGpu::NameOf(image.info.tile_mode),
+                      vk::to_string(image.info.pixel_format));
+        } else {
+            LOG_INFO(Render_Vulkan,
+                     "BB_TILED_DOWNLOAD_VERIFY match: addr={:#x}, size={:#x}, tile_mode={} ({}), format={}",
+                     image_addr, copy_size,
+                     static_cast<u32>(image.info.tile_mode),
+                     AmdGpu::NameOf(image.info.tile_mode),
+                     vk::to_string(image.info.pixel_format));
+        }
+
+        runtime.GetStagingPool().FreeDeferred(orig_linear);
+        runtime.GetStagingPool().FreeDeferred(detiled_host);
+    }
+
     if (sync) {
         scheduler.Finish();
         download.Invalidate();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download.mapped, download_size);
+        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr),
+                                                  download.mapped, copy_size);
     } else {
         scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
+            [this, device_addr = image_addr, download, copy_size] {
                 download.Invalidate();
                 Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
-                                                          download.mapped, download_size);
+                                                          download.mapped, copy_size);
                 runtime.GetStagingPool().FreeDeferred(download);
             });
     }
@@ -642,10 +811,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     ImageIds image_ids;
-    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
-        if (image.info.guest_address != address) {
-            return;
-        }
+    ForEachImageWithAddress(address, [&](ImageId image_id, Image& image) {
         if (ensure_valid && !image.SafeToDownload()) {
             return;
         }
@@ -1132,12 +1298,11 @@ void TextureCache::GarbageCollectImages() {
             return false;
         }
 
-        // bbport: images that cannot go now (GPU-written: their contents exist only here, and
-        // tiled ones cannot be written back at all) neither use up the deletions nor stay first
-        // in line. The oldest ten being such render targets stopped the collector for good, and
-        // VRAM grew with every area visited up to the pressure mark (~10 GB on 16 GB).
-        // Under memory pressure, stale tiled images are reclaimed rather than permanently kept.
-        if ((tiled && download && !pressured) || (download && !pressured)) {
+        const bool can_tile = !tiled || CanTileImage(image);
+        if (download && (!pressured || !can_tile)) {
+            if (tiled && !can_tile) {
+                LogUnsupportedTiledImageOnce(image);
+            }
             image.lru_touched_tick = gc_tick;
             lru_cache.Touch(image.lru_id, gc_tick);
             BbStats::gc_kept_images.fetch_add(1, std::memory_order_relaxed);

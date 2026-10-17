@@ -628,6 +628,7 @@ void Menu() {
     bool restart = s.object_motion != s.startup_object_motion ||
                    s.model_lod != s.startup_model_lod ||
                    s.live_resolution != s.startup_live_resolution ||
+                   s.prep_workers != s.startup_prep_workers ||
                    BbSettings::ResolutionNeedsRestart();
     for (int e = 0; e < BbSettings::EffectCount; ++e) {
         restart |= s.effects[e] != s.startup_effects[e];
@@ -640,6 +641,43 @@ void Menu() {
             BbSettings::Save();
             runtime_restart();
         }
+    }
+
+    ImGui::SeparatorText(Tr("Performance & CPU", "Производительность и процессор"));
+    {
+        const char* const prep_worker_labels[] = {
+            Tr("Auto (recommended for high core-count)", "Авто (рекомендуется для 6+ ядер)"),
+            Tr("Off (single-threaded)", "Выкл (в одном потоке)"),
+            Tr("1 worker (recommended for 4-thread CPUs)", "1 поток (рекомендуется для 4-поточных CPU)"),
+            Tr("2 workers", "2 потока"),
+            Tr("3 workers", "3 потока"),
+            Tr("4 workers", "4 потока"),
+            Tr("6 workers", "6 потоков"),
+            Tr("8 workers", "8 потоков"),
+        };
+        static constexpr int prep_worker_values[] = {-1, 0, 1, 2, 3, 4, 6, 8};
+        int current_val = s.prep_workers.load();
+        int cur_idx = 0;
+        for (int i = 0; i < 8; ++i) {
+            if (prep_worker_values[i] == current_val) {
+                cur_idx = i;
+                break;
+            }
+        }
+        if (ImGui::BeginCombo(Tr("Draw prep workers", "Потоки подготовки отрисовки"), prep_worker_labels[cur_idx])) {
+            for (int i = 0; i < 8; ++i) {
+                if (ImGui::Selectable(prep_worker_labels[i], i == cur_idx)) {
+                    Store(s.prep_workers, prep_worker_values[i], true);
+                }
+            }
+            ImGui::EndCombo();
+        }
+        Hint(Tr("Number of background worker threads preparing draw commands ahead of GPU submission. "
+                "On 4-core/4-thread CPUs (like i5-4xxx/6xxx/7xxx), setting this to 1 worker prevents "
+                "thread oversubscription and eliminates CPU stutter. Requires restart.",
+                "Количество фоновых потоков подготовки команд отрисовки. "
+                "На 4-ядерных/4-поточных процессорах установка значения '1 поток' предотвращает "
+                "перегрузку ядер и убирает статтеры. Требуется перезапуск."));
     }
 
     ImGui::SeparatorText(Tr("Other", "Прочее"));

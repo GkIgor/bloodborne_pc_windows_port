@@ -31,6 +31,7 @@ from bblauncher_Utils import (
     DEFAULT_KEYBINDS,
     FPS_CHOICES,
     KEYBINDINGS,
+    PREP_WORKER_CHOICES,
     RES_CHOICES,
     WINDOW_MODE_CHOICES,
 )
@@ -891,6 +892,14 @@ class LauncherUI:
         self.cmb_aa.setCurrentText(self.settings.get("anti_aliasing", AA_CHOICES[0]))
         self.cmb_aa.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
         grid_disp.addWidget(self.cmb_aa, 2, 1)
+
+        grid_disp.addWidget(QLabel("Draw Prep Workers:"), 2, 2)
+        self.cmb_prep_workers = QComboBox()
+        for label, _ in PREP_WORKER_CHOICES:
+            self.cmb_prep_workers.addItem(label)
+        self.cmb_prep_workers.setCurrentText(self.settings.get("prep_workers", PREP_WORKER_CHOICES[0][0]))
+        self.cmb_prep_workers.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+        grid_disp.addWidget(self.cmb_prep_workers, 2, 3)
 
         l_disp.addLayout(grid_disp)
 

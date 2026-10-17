@@ -27,6 +27,7 @@ from bblauncher_Utils import (
     DEFAULT_GAME,
     DEFAULT_SETTINGS,
     LOG_FILE,
+    PREP_WORKER_CHOICES,
     RUN_BAT,
     SETTINGS_FILE,
     VK_NOISE,
@@ -46,7 +47,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Bloodborne PC Launcher")
-        self.setFixedSize(1000, 720)
+        self.setFixedSize(1100, 720)
         self.setStyleSheet(STYLE_SHEET)
         
         icon_file = APP_DIR / "icon.ico"
@@ -131,6 +132,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "fps": self.cmb_fps.currentText(),
                 "res": self.cmb_res.currentText(),
                 "aniso": self.cmb_aniso.currentText(),
+                "prep_workers": self.cmb_prep_workers.currentText(),
                 "anti_aliasing": self.cmb_aa.currentText(),
                 "mods": self.chk_mods.isChecked(),
                 "hide_vk": self.chk_vk_noise.isChecked(),
@@ -183,9 +185,17 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         aa_choice = self.cmb_aa.currentText()
         effect_game_aa = "0" if "Disable" in aa_choice or "TAA" in aa_choice else "1"
 
+        prep_choice = self.cmb_prep_workers.currentText()
+        prep_workers_val = "auto"
+        for label, val in PREP_WORKER_CHOICES:
+            if label == prep_choice:
+                prep_workers_val = val
+                break
+
         keys_to_update = {
             "output_res": output_res_val,
             "effect_game_aa": effect_game_aa,
+            "prep_workers": prep_workers_val,
             "mk_enabled": "1" if self.chk_mk_enabled.isChecked() else "0",
             "mk_sens_x": f"{self.sl_sens_x.value() / 100:.2f}",
             "mk_sens_y": f"{self.sl_sens_y.value() / 100:.2f}",
@@ -286,6 +296,15 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
             self.chk_inv_x.setChecked(ini_opts.get("mk_invert_x", "0") != "0")
             self.chk_inv_y.setChecked(ini_opts.get("mk_invert_y", "0") != "0")
+
+            if hasattr(self, "cmb_prep_workers"):
+                ini_pw = ini_opts.get("prep_workers", "auto").strip().lower()
+                for label, val in PREP_WORKER_CHOICES:
+                    if val == ini_pw or (ini_pw == "auto" and val == "auto"):
+                        self.cmb_prep_workers.blockSignals(True)
+                        self.cmb_prep_workers.setCurrentText(label)
+                        self.cmb_prep_workers.blockSignals(False)
+                        break
 
             for w in widgets:
                 w.blockSignals(False)
@@ -531,6 +550,13 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
         aniso_mapping = {c[0]: c[1] for c in ANISO_CHOICES}
         env["BB_ANISO"] = aniso_mapping.get(cfg["aniso"], "16")
+
+        prep_mapping = {c[0]: c[1] for c in PREP_WORKER_CHOICES}
+        prep_val = prep_mapping.get(cfg.get("prep_workers"), "auto")
+        if prep_val and prep_val != "auto":
+            env["BB_PREP_WORKERS"] = prep_val
+        else:
+            env.pop("BB_PREP_WORKERS", None)
 
         active_patches = list(cfg["enabled_patches"])
         if ("Disable" in aa_mode or "TAA" in aa_mode) and "Disable AA" not in active_patches:

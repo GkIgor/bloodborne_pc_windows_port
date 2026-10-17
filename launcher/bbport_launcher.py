@@ -98,6 +98,7 @@ INI_DEFAULTS = {
     "output_res": "1920x1080",
     "model_lod": "0",
     "live_resolution": "0",
+    "prep_workers": "auto",
     **{key: "1" if default else "0" for key, _, default in EFFECTS},
 }
 

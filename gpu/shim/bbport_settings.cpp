@@ -140,6 +140,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.fsr4_invert_jitter = i != 0;
     } else if (key == "model_lod") {
         v.model_lod = std::clamp(i, -2, 2);
+    } else if (key == "prep_workers") {
+        v.prep_workers = value == "auto" ? -1 : std::clamp(i, 0, 16);
     } else if (key == "live_resolution") {
         v.live_resolution = value == "auto" ? -1 : std::clamp(i, 0, 1);
     } else if (key == "language") {
@@ -220,6 +222,7 @@ void Load() {
         {"BB_UPSCALE_PRESET", "preset"},            {"BB_OBJECT_MOTION", "object_motion"},
         {"BB_HUD", "show_hud"},                     {"BB_HUD_QUADRANT", "hud_quadrant"},
         {"BB_HUD_OPACITY", "hud_opacity"},          {"BB_HUD_SCALE", "hud_scale"},
+        {"BB_PREP_WORKERS", "prep_workers"},
         {"BB_LANG", "language"},
     };
     for (const auto& [env, key] : env_keys) {
@@ -234,6 +237,7 @@ void Load() {
         v.startup_effects[e] = v.effects[e];
     }
     v.startup_model_lod = v.model_lod;
+    v.startup_prep_workers = v.prep_workers;
     v.startup_output_res = v.output_res;
     v.startup_live_resolution = v.live_resolution;
 }
@@ -320,6 +324,11 @@ void Save() {
     }
     std::fprintf(file, "model_lod=%d\noutput_res=%dx%d\n", v.model_lod.load(),
                  OutputWidths[v.output_res], OutputHeights[v.output_res]);
+    if (v.prep_workers < 0) {
+        std::fprintf(file, "prep_workers=auto\n");
+    } else {
+        std::fprintf(file, "prep_workers=%d\n", v.prep_workers.load());
+    }
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");
