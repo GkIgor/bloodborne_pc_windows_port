@@ -5,6 +5,8 @@
 [![Downloads](https://flat.badgen.net/github/assets-dl/Mrsuss60/bloodborne_pc_windows_port/total?label=DOWNLOADS&labelColor=1a0f0f&color=b22222)](https://github.com/Mrsuss60/bloodborne_pc_windows_port/releases)
 [![Stars](https://flat.badgen.net/github/stars/Mrsuss60/bloodborne_pc_windows_port?label=STARS&labelColor=1a0f0f&color=c9a227&icon=github)](https://github.com/Mrsuss60/bloodborne_pc_windows_port/stargazers)
 [![Last commit](https://flat.badgen.net/github/last-commit/Mrsuss60/bloodborne_pc_windows_port?label=LAST%20COMMIT&labelColor=1a0f0f&color=6b6b6b&icon=git)](https://github.com/Mrsuss60/bloodborne_pc_windows_port/commits)
+
+* Discord Server: https://discord.gg/xHFkvtssuV
 #
 `bloodborne_pc_windows_port` is a 64-bit Windows port of the PlayStation 4 executable of *Bloodborne* (CUSA03173, version 1.09). 
 
