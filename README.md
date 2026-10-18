@@ -6,16 +6,31 @@
 [![Stars](https://flat.badgen.net/github/stars/Mrsuss60/bloodborne_pc_windows_port?label=STARS&labelColor=1a0f0f&color=c9a227&icon=github)](https://github.com/Mrsuss60/bloodborne_pc_windows_port/stargazers)
 [![Last commit](https://flat.badgen.net/github/last-commit/Mrsuss60/bloodborne_pc_windows_port?label=LAST%20COMMIT&labelColor=1a0f0f&color=6b6b6b&icon=git)](https://github.com/Mrsuss60/bloodborne_pc_windows_port/commits)
 #
-`bloodborne_pc_windows_port` is a native 64-bit Windows port of the PlayStation 4 executable of *Bloodborne* (CUSA03173, version 1.09). 
+`bloodborne_pc_windows_port` is a 64-bit Windows port of the PlayStation 4 executable of *Bloodborne* (CUSA03173, version 1.09). 
 
-This project is a Windows adaptation of the original Linux port ([bbport](https://github.com/deadinside28/bloodborne_pc) by [deadinside28](https://github.com/deadinside28)). It replaces the Linux-specific kernel, memory mapping, and POSIX threading implementation with a native Win32 runtime, allowing the game to run directly on Windows with Vulkan.
+This project is a Windows adaptation of the original Linux port ([bbport](https://github.com/deadinside28/bloodborne_pc) by [deadinside28](https://github.com/deadinside28)). It replaces the Linux-specific kernel, memory mapping, and POSIX threading implementation with a native Win32 runtime, allowing the game to run on Windows with Vulkan.
 
-The game's x86-64 code executes natively on your CPU without general emulation. System library calls are handled by a dedicated lightweight runtime, and GPU commands are translated directly to Vulkan with support for AMD FSR 3.1 and FSR 4 temporal upscaling.
-
-> **No game files or copyrighted assets are included.** You must provide your own decrypted dump of Bloodborne (CUSA03173, version 1.09).
-> This project is not affiliated with Sony Interactive Entertainment, FromSoftware, or AMD.
+> **Important Architecture Clarifications:**
+> - **Native CPU Execution (No CPU Emulation or JIT)**: Because the PlayStation 4 uses an x86-64 processor, the game's compiled CPU machine code runs natively and directly on your PC processor. There is no CPU emulator, virtual machine, or dynamic recompiler (JIT) translation layer.
+> - **GPU Emulation Handled by shadPS4**: Desktop graphics cards cannot natively parse PS4 AMD GCN command packets or PS4 GPU hardware shaders. All GPU emulation, command stream translation, and shader recompilation into Vulkan SPIR-V pipelines are handled by the [shadPS4](https://github.com/shadps4-emu/shadPS4) Vulkan video core (`gpu/`, `libbbgpu`), customized with a multithreaded draw pipeline and FSR upscaling.
+> - **Not a Source Decompilation or Source Port**: This project is not a PC port recompiled from leaked source code or a reverse-engineered C/C++ decompilation. It executes the retail PS4 binary directly by preparing an offline flat memory image and providing a specialized High-Level Emulation (HLE) runtime for PS4 system calls.
+> - **No game files or copyrighted assets are included.** You must provide your own decrypted dump of Bloodborne (CUSA03173, version 1.09).
+> - This project is not affiliated with Sony Interactive Entertainment, FromSoftware, or AMD.
 
 **Status: Playable on Windows.** The game boots, loads saves, and runs with audio, gamepad support, and state persistence.
+
+---
+
+## Architecture: Native vs Emulated
+
+| Component | Execution Model | Implementation Details |
+|---|---|---|
+| **CPU / Game Logic** | **100% Native** | Direct x86-64 execution on host CPU. No CPU emulation, no JIT, no instruction translation. |
+| **System Calls / OS** | **Native HLE Runtime** | Custom lightweight C runtime (`src/`) implementing memory mapping, threading, file I/O, and PS4 libc/libSceFios2 calls. |
+| **GPU / Graphics** | **Emulation / Translation (shadPS4)** | Handled by the [shadPS4](https://github.com/shadps4-emu/shadPS4) Vulkan core (`gpu/`). Translates PS4 PM4 command streams and GCN shaders into Vulkan SPIR-V pipelines with custom multithreaded command dispatch. |
+| **Upscaling** | **Native Vulkan** | AMD FSR 3.1 and FSR 4 integration using custom synthetic motion vectors and subpixel jitter. |
+| **Audio** | **Native Win32** | Decoded directly using bundled LibAtrac9 and output via SDL3 audio streams. |
+| **Controls** | **Native Win32 / SDL3** | Raw mouse capture with a direct 360-degree camera rotation hook (`src/probe.c`) alongside native gamepad support. |
 
 ---
 
@@ -24,9 +39,9 @@ The game's x86-64 code executes natively on your CPU without general emulation. 
 This repository adapts the original Linux codebase specifically for Windows systems:
 
 - **Win32 Memory & Synchronization**: Replaced Linux `mmap`, `mprotect`, and POSIX primitives with Windows `VirtualAlloc`, `VirtualProtect`, and native Win32 synchronization events (`src/win32_compat.c`, `src/win32_memory.c`, `src/runtime_host.c`).
+- **Direct 360-Degree Native Mouse Look**: Replaced legacy gamepad stick emulation with a direct camera hook into the engine's update routines (`src/probe.c`). Raw mouse deltas inject directly into camera orientation angles and dynamic motion buffers, enabling full 360-degree rotation (yaw and pitch), real-time view matrix recalculation, and customization sliders for responsiveness, acceleration, and smoothing.
 - **Graphical Launcher**: Modular PySide6 launcher (`BloodborneLauncher.exe` / `bblauncherAPP/`), providing real-time configuration for target frame rates (30, 60, 90, uncap), render resolutions, FSR upscaling, community patches, and full interactive keybind remapping.
 - **Command Line Launcher**: `run.bat` provides direct scripted startup, automatic patch compilation, and mod staging on Windows. Automatically prioritizes bundled portable Python runtimes (`python-embed/`).
-- **Modern Mouse & Keyboard Support**: Relative cursor capture and mouse look adapted from the Linux port (`deadinside28`), engine deadzone jump compensation (~16/127), smoothing filters, and a modern press-to-rebind keybinding system with conflict auto-swapping.
 - **Vulkan Frame Pacing**: Integrated presenter queue pacing (`BB_FRAMES_AHEAD=2`) to bound GPU run-ahead, stabilizing frametimes and smoothing 0.1% and 1.0% stutter lows.
 - **Texture Barrier Fix**: Fixed dynamic texture streaming race conditions in `tile_manager.cpp`, ensuring item icons in the HUD and loading screens render correctly without static noise.
 - **AT9 Audio Playback**: Bundles LibAtrac9 compilation to decode AT9 game audio natively on Windows with soft-clipping saturation curves to eliminate audio pops.
@@ -37,6 +52,7 @@ This repository adapts the original Linux codebase specifically for Windows syst
 ## Technical Highlights
 
 - **Native Execution**: The game eboot is converted offline into a flat memory image; PS4 libc and libSceFios2 functions are linked directly into the binary. No CPU emulation or instruction translation occurs at run time.
+- **shadPS4 Vulkan Core**: Graphics rendering and shader translation are handled through a dedicated integration of shadPS4's Vulkan backend, with hundreds of engine-specific performance fixes and synchronization enhancements.
 - **High Framerate Support**: Community simulation patches allow running at 60 FPS, 90 FPS, or uncapped with accurate physics and movement speeds.
 - **Synthetic Motion Vectors & Temporal Upscaling**: Because Bloodborne lacks an internal velocity buffer, the port computes camera motion from depth buffers and object motion from previous frame vertex positions. The scene can render at lower internal resolutions (e.g., 720p or 1080p) while FSR 3.1 / 4 upscales to your display resolution, leaving UI elements crisp at native resolution.
 - **Persistent Pipeline Binary Caches**: Hardware-compiled Vulkan driver pipeline binaries (`.vkp`) are saved to disk and reloaded on startup, eliminating recurring shader compilation stutter.
@@ -146,7 +162,7 @@ Save files and shader caches are stored in `user/`. Settings are saved to `bbpor
 ## Controls and In-Game Features
 
 - **Mouse & Keyboard**:
-  - **Mouse Look**: Relative cursor capture with seamless release when opening menus or alt-tabbing.
+  - **Mouse Look**: Direct 360-degree native camera rotation hook with 1:1 mouse input. Configurable sensitivity, smoothing, responsiveness, and acceleration sliders in the launcher and in-game overlay. Relative cursor capture releases automatically when menus open or when alt-tabbing.
   - **Light Attack (R1)**: Mouse Left
   - **Heavy / Charged Attack (R2)**: Shift + Mouse Left
   - **Firearm / Gun (L2)**: Mouse Right
