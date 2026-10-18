@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <math.h>
 #include "runtime.h"
 #include "gpu/bbgpu.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
@@ -67,6 +68,214 @@ static volatile uint64_t g_stat_total_seconds = 0;
 static volatile uint64_t g_stat_zero_flip_seconds = 0;
 static volatile uint64_t g_stat_longest_freeze_s = 0;
 static volatile uint64_t g_stat_current_freeze_s = 0;
+
+/* Native direct mouse camera hook & watchdog */
+static volatile int g_native_camera_hook_installed = 0;
+static volatile int g_native_camera_disabled = 0;
+static volatile uint64_t g_native_cam_fire_count = 0;
+
+int native_camera_hook_is_installed(void) {
+    return g_native_camera_hook_installed;
+}
+
+uint64_t native_camera_get_fire_count(void) {
+    return g_native_cam_fire_count;
+}
+
+void native_camera_disable_with_log(const char *reason) {
+    if (!g_native_camera_disabled) {
+        g_native_camera_disabled = 1;
+        fprintf(stderr, "[NATIVE MOUSE WATCHDOG] %s\n", reason ? reason : "unknown reason");
+        fflush(stderr);
+    }
+}
+
+int native_camera_is_active(void) {
+    return g_native_camera_hook_installed && !g_native_camera_disabled && bbgpu_get_mk_native_mouse();
+}
+
+extern void bbgpu_get_mk_tuning(float *responsiveness, float *acceleration);
+void (ABI *orig_cam_update)(void *cam, void *r14, void *r15) = NULL;
+
+void host_native_mouse_inject(void *cam, void *rsi_ctx) {
+    g_native_cam_fire_count++;
+    if (!native_camera_is_active() || !cam) return;
+    uintptr_t cam_addr = (uintptr_t)cam;
+    if (cam_addr < 0x10000) return;
+
+    const uint8_t lock_on_byte = *(volatile uint8_t*)(cam_addr + 0x260);
+    const int captured = bbgpu_mouse_captured();
+
+    /* Diagnostic log once every 120 camera updates (approx 2s at 60 FPS) */
+    static uint64_t s_diag_counter = 0;
+    if ((s_diag_counter++ % 120) == 0) {
+        printf("[NATIVE MOUSE DIAG] cam=%p pitch=%.3f yaw=%.3f lock_on=%u captured=%d\n",
+               cam, *(float*)(cam_addr + 0x140), *(float*)(cam_addr + 0x144), lock_on_byte, captured);
+        fflush(stdout);
+    }
+
+    if (lock_on_byte != 0 || !captured) {
+        return;
+    }
+
+    float sens_x = 1.0f, sens_y = 1.0f, dz = 0.0f, sm = 0.0f;
+    int inv_x = 0, inv_y = 0;
+    const int mk_enabled = bbgpu_get_mk_config(&sens_x, &sens_y, &inv_x, &inv_y, &dz, &sm);
+    if (!mk_enabled) return;
+
+    float responsiveness = 1.0f, acceleration = 1.0f;
+    bbgpu_get_mk_tuning(&responsiveness, &acceleration);
+
+    float dx = 0.0f, dy = 0.0f;
+    bbgpu_consume_mouse_delta(&dx, &dy);
+
+    /* Subtle mouse acceleration curve if configured (> 1.0) */
+    if (acceleration > 1.0f) {
+        const float mag = sqrtf(dx * dx + dy * dy);
+        if (mag > 1.0f) {
+            const float factor = 1.0f + (acceleration - 1.0f) * (mag / (mag + 30.0f));
+            dx *= factor;
+            dy *= factor;
+        }
+    }
+
+    /* Mouse smoothing (EMA filter): 0.0 = raw 1:1, higher = smoothed */
+    static float s_smooth_dx = 0.0f;
+    static float s_smooth_dy = 0.0f;
+    const float s_factor = (sm < 0.0f) ? 0.0f : (sm > 0.85f ? 0.85f : sm);
+    if (s_factor > 0.0f) {
+        s_smooth_dx = s_smooth_dx * s_factor + dx * (1.0f - s_factor);
+        s_smooth_dy = s_smooth_dy * s_factor + dy * (1.0f - s_factor);
+        if (fabsf(s_smooth_dx) < 0.001f) s_smooth_dx = 0.0f;
+        if (fabsf(s_smooth_dy) < 0.001f) s_smooth_dy = 0.0f;
+        dx = s_smooth_dx;
+        dy = s_smooth_dy;
+    } else {
+        s_smooth_dx = 0.0f;
+        s_smooth_dy = 0.0f;
+    }
+
+    if (dx == 0.0f && dy == 0.0f) return;
+
+    /* Scaled delta for camera angles and stick vector injection */
+    const float base_sens = 0.0015f * responsiveness;
+    const float delta_yaw   = (inv_x ? -1.0f : 1.0f) * dx * sens_x * base_sens;
+    const float delta_pitch = (inv_y ? -1.0f : 1.0f) * dy * sens_y * base_sens;
+
+    /* 1. Direct Angle Injection (+0x140 pitch, +0x144 yaw) */
+    float pitch = *(float*)(cam_addr + 0x140);
+    float yaw   = *(float*)(cam_addr + 0x144);
+    float min_p = *(float*)(cam_addr + 0x1f0);
+    float max_p = *(float*)(cam_addr + 0x1ec);
+    if (min_p >= max_p || min_p < -3.14159f || max_p > 3.14159f) {
+        min_p = -0.6981317f; /* -40 deg */
+        max_p =  1.2217305f; /* +70 deg */
+    }
+
+    pitch += delta_pitch;
+    if (pitch < min_p) pitch = min_p;
+    if (pitch > max_p) pitch = max_p;
+
+    yaw += delta_yaw;
+    const float pi_val = 3.14159265358979323846f;
+    const float two_pi = 6.28318530717958647692f;
+    while (yaw > pi_val) yaw -= two_pi;
+    while (yaw < -pi_val) yaw += two_pi;
+
+    *(float*)(cam_addr + 0x140) = pitch;
+    *(float*)(cam_addr + 0x144) = yaw;
+    *(float*)(cam_addr + 0x150) = pitch;
+    *(float*)(cam_addr + 0x26c) = pitch;
+    *(float*)(cam_addr + 0x270) = yaw;
+
+    /* 2. Dynamic Controller Stick Vector Injection
+     * Following disassembly at 0x183b85a:
+     * rcx = rsi_ctx->0x58
+     * rax = rcx->0x280 (or rcx->0x80)
+     * buffer = rax + 0x40 (xmm3: X=pitch, Y=yaw) */
+    if (rsi_ctx && (uintptr_t)rsi_ctx > 0x10000) {
+        uintptr_t *rcx_ptr = *(uintptr_t**)((uintptr_t)rsi_ctx + 0x58);
+        if (rcx_ptr && (uintptr_t)rcx_ptr > 0x10000) {
+            uintptr_t rax_val = *(uintptr_t*)((uintptr_t)rcx_ptr + 0x280);
+            if (!rax_val) rax_val = *(uintptr_t*)((uintptr_t)rcx_ptr + 0x80);
+            if (rax_val && rax_val > 0x10000) {
+                float *stick_buf = (float*)(rax_val + 0x40);
+                stick_buf[0] += delta_pitch * 25.0f;
+                stick_buf[1] += delta_yaw   * 25.0f;
+                *(uint8_t*)(cam_addr + 0x15c) = 1;
+            }
+        }
+    }
+}
+
+__attribute__((naked)) void guest_camera_update_thunk(void) {
+    __asm__ __volatile__(
+        /* Save caller-save registers and camera pointer (SysV ABI: rdi=cam, rsi=ctx) */
+        "pushfq\n\t"
+        "push %%rax\n\t"
+        "push %%rcx\n\t"
+        "push %%rdx\n\t"
+        "push %%rsi\n\t"
+        "push %%rdi\n\t"
+        "push %%r8\n\t"
+        "push %%r9\n\t"
+        "push %%r10\n\t"
+        "push %%r11\n\t"
+        "sub $296, %%rsp\n\t"
+        "movdqu %%xmm0,   32(%%rsp)\n\t"
+        "movdqu %%xmm1,   48(%%rsp)\n\t"
+        "movdqu %%xmm2,   64(%%rsp)\n\t"
+        "movdqu %%xmm3,   80(%%rsp)\n\t"
+        "movdqu %%xmm4,   96(%%rsp)\n\t"
+        "movdqu %%xmm5,  112(%%rsp)\n\t"
+        "movdqu %%xmm6,  128(%%rsp)\n\t"
+        "movdqu %%xmm7,  144(%%rsp)\n\t"
+        "movdqu %%xmm8,  160(%%rsp)\n\t"
+        "movdqu %%xmm9,  176(%%rsp)\n\t"
+        "movdqu %%xmm10, 192(%%rsp)\n\t"
+        "movdqu %%xmm11, 208(%%rsp)\n\t"
+        "movdqu %%xmm12, 224(%%rsp)\n\t"
+        "movdqu %%xmm13, 240(%%rsp)\n\t"
+        "movdqu %%xmm14, 256(%%rsp)\n\t"
+        "movdqu %%xmm15, 272(%%rsp)\n\t"
+
+        /* 1. Inject mouse deltas into camera stick buffer and angles before update runs */
+        "mov 328(%%rsp), %%rcx\n\t" /* saved rdi (cam) -> Windows arg0 (rcx) */
+        "mov 336(%%rsp), %%rdx\n\t" /* saved rsi (ctx) -> Windows arg1 (rdx) */
+        "call host_native_mouse_inject\n\t"
+
+        /* 2. Restore all registers and pass through to original camera update */
+        "movdqu  32(%%rsp), %%xmm0\n\t"
+        "movdqu  48(%%rsp), %%xmm1\n\t"
+        "movdqu  64(%%rsp), %%xmm2\n\t"
+        "movdqu  80(%%rsp), %%xmm3\n\t"
+        "movdqu  96(%%rsp), %%xmm4\n\t"
+        "movdqu 112(%%rsp), %%xmm5\n\t"
+        "movdqu 128(%%rsp), %%xmm6\n\t"
+        "movdqu 144(%%rsp), %%xmm7\n\t"
+        "movdqu 160(%%rsp), %%xmm8\n\t"
+        "movdqu 176(%%rsp), %%xmm9\n\t"
+        "movdqu 192(%%rsp), %%xmm10\n\t"
+        "movdqu 208(%%rsp), %%xmm11\n\t"
+        "movdqu 224(%%rsp), %%xmm12\n\t"
+        "movdqu 240(%%rsp), %%xmm13\n\t"
+        "movdqu 256(%%rsp), %%xmm14\n\t"
+        "movdqu 272(%%rsp), %%xmm15\n\t"
+        "add $296, %%rsp\n\t"
+        "pop %%r11\n\t"
+        "pop %%r10\n\t"
+        "pop %%r9\n\t"
+        "pop %%r8\n\t"
+        "pop %%rdi\n\t"
+        "pop %%rsi\n\t"
+        "pop %%rdx\n\t"
+        "pop %%rcx\n\t"
+        "pop %%rax\n\t"
+        "popfq\n\t"
+        "jmp *orig_cam_update(%%rip)\n\t"
+        : : : "memory"
+    );
+}
 
 static void print_exit_summary(void) {
     static int summary_printed = 0;
@@ -2384,6 +2593,58 @@ int main(int argc, char **argv) {
         patch_non_bmi1(image, size, segments, ns);
     }
 #endif
+    /* Install native mouse camera hook only when enabled in settings AND binary signatures match */
+    if (!bbgpu_get_mk_native_mouse()) {
+        printf("[NATIVE MOUSE] Native mouse look disabled in settings; call sites remain original, stick emulation active.\n");
+    } else {
+        do {
+            if (size <= 0x183ac60) {
+                fprintf(stderr, "[NATIVE MOUSE GUARD] image size 0x%" PRIx64 " too small for camera offsets; skipping hook.\n", size);
+                break;
+            }
+
+            static const unsigned char site1_expected[5] = { 0xe8, 0x5b, 0x40, 0x00, 0x00 };
+            static const unsigned char site2_expected[5] = { 0xe8, 0x46, 0x3e, 0x00, 0x00 };
+            static const unsigned char target_expected[4] = { 0x55, 0x48, 0x89, 0xe5 };
+
+            if (memcmp(image + 0x1436c00, site1_expected, 5) != 0) {
+                fprintf(stderr, "[NATIVE MOUSE GUARD] Site 1 at image+0x1436c00 signature mismatch; skipping hook.\n");
+                break;
+            }
+            if (memcmp(image + 0x1436e15, site2_expected, 5) != 0) {
+                fprintf(stderr, "[NATIVE MOUSE GUARD] Site 2 at image+0x1436e15 signature mismatch; skipping hook.\n");
+                break;
+            }
+            if (memcmp(image + 0x143ac60, target_expected, 4) != 0) {
+                fprintf(stderr, "[NATIVE MOUSE GUARD] Target func at image+0x143ac60 signature mismatch; skipping hook.\n");
+                break;
+            }
+
+            unsigned char *t = thunks + import_count * 32;
+            uintptr_t hook_fn = (uintptr_t)guest_camera_update_thunk;
+            /* 14-byte rip-relative jmp without clobbering rax or any other register: jmp *(%rip + 0) */
+            t[0] = 0xff; t[1] = 0x25; t[2] = 0x00; t[3] = 0x00; t[4] = 0x00; t[5] = 0x00;
+            memcpy(t + 6, &hook_fn, 8);
+
+            int64_t disp1 = (int64_t)t - (int64_t)(image + 0x1436c00 + 5);
+            int64_t disp2 = (int64_t)t - (int64_t)(image + 0x1436e15 + 5);
+            if (disp1 < INT32_MIN || disp1 > INT32_MAX || disp2 < INT32_MIN || disp2 > INT32_MAX) {
+                fprintf(stderr, "[NATIVE MOUSE GUARD] Hook displacement out of 32-bit range (d1=%" PRId64 ", d2=%" PRId64 "); skipping hook.\n", disp1, disp2);
+                break;
+            }
+
+            orig_cam_update = (void (ABI *)(void*, void*, void*))(image + 0x143ac60);
+
+            int32_t d1 = (int32_t)disp1;
+            int32_t d2 = (int32_t)disp2;
+            memcpy(image + 0x1436c01, &d1, 4);
+            memcpy(image + 0x1436e16, &d2, 4);
+
+            g_native_camera_hook_installed = 1;
+            printf("[NATIVE MOUSE] Direct camera rotation hook installed successfully at image+0x1436c00 and image+0x1436e15 (thunk=%p, orig=%p)\n", (void*)t, (void*)orig_cam_update);
+        } while (0);
+    }
+
     protect(thunks, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;

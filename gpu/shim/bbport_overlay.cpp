@@ -727,10 +727,11 @@ void Menu() {
     if (s.mk_enabled) {
         Slider(Tr("Horizontal sensitivity (X)", "Чувствительность по горизонтали (X)"), s.mk_sens_x, 0.1f, 10.0f);
         Slider(Tr("Vertical sensitivity (Y)", "Чувствительность по вертикали (Y)"), s.mk_sens_y, 0.1f, 10.0f);
+        Slider(Tr("Mouse smoothing", "Сглаживание движений мыши"), s.mk_smoothing, 0.0f, 0.80f);
+        Slider(Tr("Responsiveness", "Отзывчивость обзора"), s.mk_responsiveness, 0.5f, 2.5f);
+        Slider(Tr("Mouse acceleration", "Ускорение мыши"), s.mk_acceleration, 1.0f, 2.0f);
         Checkbox(Tr("Invert horizontal look (X)", "Инвертировать обзор по горизонтали (X)"), s.mk_invert_x);
         Checkbox(Tr("Invert vertical look (Y)", "Инвертировать обзор по вертикали (Y)"), s.mk_invert_y);
-        Slider(Tr("Mouse dead zone", "Мёртвая зона мыши"), s.mk_deadzone, 0.0f, 0.35f);
-        Slider(Tr("Mouse smoothing", "Сглаживание движений мыши"), s.mk_smoothing, 0.0f, 0.80f);
 
         ImGui::Spacing();
         ImGui::SeparatorText(Tr("Keybindings", "Назначение клавиш"));

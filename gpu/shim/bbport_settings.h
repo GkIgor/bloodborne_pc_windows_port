@@ -86,12 +86,14 @@ struct Values {
     std::atomic<int> active_render_width{1920}, active_render_height{1080};
     /// Mouse & Keyboard controls settings
     std::atomic<bool> mk_enabled{true};
+    std::atomic<bool> mk_native_mouse{true};
     std::atomic<float> mk_sens_x{1.5f};
     std::atomic<float> mk_sens_y{1.5f};
     std::atomic<bool> mk_invert_x{false};
     std::atomic<bool> mk_invert_y{false};
-    std::atomic<float> mk_deadzone{0.13f};
     std::atomic<float> mk_smoothing{0.0f};
+    std::atomic<float> mk_responsiveness{1.0f};
+    std::atomic<float> mk_acceleration{1.0f};
     std::atomic<int> keybinds[BB_ACTION_COUNT];
     Values();
     /// Applied at start (patches.py); the menu shows when a restart is needed.

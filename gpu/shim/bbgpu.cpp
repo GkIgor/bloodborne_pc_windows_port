@@ -450,8 +450,19 @@ extern "C" int bbgpu_get_mk_config(float* sens_x, float* sens_y, int* invert_x, 
     if (sens_y) *sens_y = s.mk_sens_y.load();
     if (invert_x) *invert_x = s.mk_invert_x.load() ? 1 : 0;
     if (invert_y) *invert_y = s.mk_invert_y.load() ? 1 : 0;
-    if (deadzone) *deadzone = s.mk_deadzone.load();
+    if (deadzone) *deadzone = 0.0f;
     if (smoothing) *smoothing = s.mk_smoothing.load();
+    return s.mk_enabled.load() ? 1 : 0;
+}
+
+extern "C" void bbgpu_get_mk_tuning(float* responsiveness, float* acceleration) {
+    const auto& s = BbSettings::Get();
+    if (responsiveness) *responsiveness = s.mk_responsiveness.load();
+    if (acceleration) *acceleration = s.mk_acceleration.load();
+}
+
+extern "C" int bbgpu_get_mk_native_mouse(void) {
+    const auto& s = BbSettings::Get();
     return s.mk_enabled.load() ? 1 : 0;
 }
 

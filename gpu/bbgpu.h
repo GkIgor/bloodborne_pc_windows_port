@@ -55,6 +55,8 @@ int bbgpu_mouse_captured(void);
 void bbgpu_set_mouse_capture(int capture);
 /* Returns 1 if M&K is enabled, and retrieves sensitivity and invert flags. */
 int bbgpu_get_mk_config(float *sens_x, float *sens_y, int *invert_x, int *invert_y, float *deadzone, float *smoothing);
+/* Returns 1 if native direct mouse camera rotation is enabled. */
+int bbgpu_get_mk_native_mouse(void);
 
 enum BbCustomKey {
     BB_KEY_NONE = 0,

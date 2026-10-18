@@ -102,13 +102,6 @@ static SDL_Gamepad *current_gamepad(void) {
     }
     return gamepad;
 }
-static inline uint8_t calc_look_axis(float val, uint8_t stick_curr, int hw_deadzone) {
-    if (val > -0.5f && val < 0.5f) return stick_curr;
-    const float mag = val < 0.0f ? -val : val;
-    const float out = (float)hw_deadzone + mag * (127.0f - (float)hw_deadzone) / 127.0f;
-    const int v = 128 + (int)(val < 0.0f ? -out : out);
-    return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
-}
 
 enum { CHORD_LMB = 1, CHORD_RMB = 2 };
 
@@ -169,12 +162,7 @@ static void sample_host(PadData *d) {
     if (!k) return;
 
     // Souls PC Mouse & Keyboard integration
-    float mouse_dx = 0.0f, mouse_dy = 0.0f;
-    bbgpu_consume_mouse_delta(&mouse_dx, &mouse_dy);
-
-    float sens_x = 1.0f, sens_y = 1.0f, deadzone = 0.05f, smoothing = 0.2f;
-    int inv_x = 0, inv_y = 0;
-    const int mk_enabled = bbgpu_get_mk_config(&sens_x, &sens_y, &inv_x, &inv_y, &deadzone, &smoothing);
+    const int mk_enabled = bbgpu_get_mk_config(NULL, NULL, NULL, NULL, NULL, NULL);
 
     // Mouse Buttons (only active while mouse is captured in relative mode)
     const int mouse_is_captured = bbgpu_mouse_captured();
@@ -231,45 +219,6 @@ static void sample_host(PadData *d) {
         else if (is_action_down(binds[BB_ACTION_MOVE_RIGHT], k, lmb, rmb, mmb, x1, x2, chords)) d->left_x = stick_hi;
         if (is_action_down(binds[BB_ACTION_MOVE_FORWARD], k, lmb, rmb, mmb, x1, x2, chords)) d->left_y = stick_lo;
         else if (is_action_down(binds[BB_ACTION_MOVE_BACKWARD], k, lmb, rmb, mmb, x1, x2, chords)) d->left_y = stick_hi;
-
-        // Camera Look: impulse & exponential decay model (LOOK_TAU_US = 60ms)
-        // Deflection follows mouse speed over LOOK_TAU_US smoothly without per-frame stutter.
-        // A moving mouse starts past the game's internal deadzone (16/127) for crisp micro-aiming.
-        #define LOOK_TAU_US 60000.0f
-        static float look_x = 0.0f, look_y = 0.0f;
-        static float smooth_dx = 0.0f, smooth_dy = 0.0f;
-        static uint64_t look_last_us = 0;
-        const int captured = bbgpu_mouse_captured();
-
-        float dt = (look_last_us && d->timestamp > look_last_us) ? (float)(d->timestamp - look_last_us) : 0.0f;
-        look_last_us = d->timestamp;
-
-        if (!captured) {
-            look_x = look_y = 0.0f;
-            smooth_dx = smooth_dy = 0.0f;
-        } else {
-            if (dt > LOOK_TAU_US) dt = LOOK_TAU_US;
-            const float decay = 1.0f - dt / LOOK_TAU_US;
-            const float base_gain = 127.0f / (1000.0f * LOOK_TAU_US / 1e6f);
-            const float gain_x = base_gain * sens_x;
-            const float gain_y = base_gain * sens_y;
-
-            // Mouse smoothing (EMA filter): 0.0 = raw 1:1, higher = smoothed
-            const float s_factor = (smoothing < 0.0f) ? 0.0f : (smoothing > 0.95f ? 0.95f : smoothing);
-            smooth_dx = smooth_dx * s_factor + mouse_dx * (1.0f - s_factor);
-            smooth_dy = smooth_dy * s_factor + mouse_dy * (1.0f - s_factor);
-
-            look_x = look_x * decay + smooth_dx * (inv_x ? -gain_x : gain_x);
-            look_y = look_y * decay + smooth_dy * (inv_y ? -gain_y : gain_y);
-
-            if (look_x < -127.0f) look_x = -127.0f; else if (look_x > 127.0f) look_x = 127.0f;
-            if (look_y < -127.0f) look_y = -127.0f; else if (look_y > 127.0f) look_y = 127.0f;
-
-            // Bloodborne engine deadzone jump: Compensate for the engine's ~16/127 stick deadzone
-            const int hw_deadzone = (int)(deadzone * 127.0f + 0.5f);
-            d->right_x = calc_look_axis(look_x, d->right_x, hw_deadzone);
-            d->right_y = calc_look_axis(look_y, d->right_y, hw_deadzone);
-        }
     } else {
         // Fallback layout when M&K mode is disabled
         static const struct { SDL_Scancode key; uint32_t ps; } keys[]={

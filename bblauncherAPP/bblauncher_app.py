@@ -223,12 +223,14 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             "effect_game_aa": effect_game_aa,
             "prep_workers": prep_workers_val,
             "mk_enabled": "1" if self.chk_mk_enabled.isChecked() else "0",
+            "mk_native_mouse": "1",
             "mk_sens_x": f"{self.sl_sens_x.value() / 100:.2f}",
             "mk_sens_y": f"{self.sl_sens_y.value() / 100:.2f}",
             "mk_invert_x": "1" if self.chk_inv_x.isChecked() else "0",
             "mk_invert_y": "1" if self.chk_inv_y.isChecked() else "0",
-            "mk_deadzone": f"{self.sl_dz.value() / 100:.2f}",
             "mk_smoothing": f"{self.sl_smoothing.value() / 100:.2f}",
+            "mk_responsiveness": f"{self.sl_responsiveness.value() / 100:.2f}" if hasattr(self, "sl_responsiveness") else "1.00",
+            "mk_acceleration": f"{self.sl_acceleration.value() / 100:.2f}" if hasattr(self, "sl_acceleration") else "1.00",
         }
         if hasattr(self, "keybind_buttons"):
             for k, btn in self.keybind_buttons.items():
@@ -297,8 +299,10 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 return
             self._last_ini_mtime = mtime
             ini_opts = self.load_bbport_ini()
-            widgets = [self.sl_sens_x, self.sl_sens_y, self.sl_dz, self.sl_smoothing,
+            widgets = [self.sl_sens_x, self.sl_sens_y, self.sl_smoothing,
                        self.chk_mk_enabled, self.chk_inv_x, self.chk_inv_y]
+            if hasattr(self, "sl_responsiveness"): widgets.append(self.sl_responsiveness)
+            if hasattr(self, "sl_acceleration"): widgets.append(self.sl_acceleration)
             for w in widgets:
                 w.blockSignals(True)
 
@@ -312,13 +316,19 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             self.sl_sens_y.setValue(max(10, min(1000, sy)))
             self.lbl_sens_y_val.setText(f"{self.sl_sens_y.value() / 100:.2f}")
 
-            dz = int(float(ini_opts.get("mk_deadzone", "0.13")) * 100)
-            self.sl_dz.setValue(max(0, min(35, dz)))
-            self.lbl_dz_val.setText(f"{self.sl_dz.value() / 100:.2f}")
-
             sm = int(float(ini_opts.get("mk_smoothing", "0.00")) * 100)
             self.sl_smoothing.setValue(max(0, min(80, sm)))
             self.lbl_smoothing_val.setText(f"{self.sl_smoothing.value() / 100:.2f}")
+
+            if hasattr(self, "sl_responsiveness"):
+                resp = int(float(ini_opts.get("mk_responsiveness", "1.00")) * 100)
+                self.sl_responsiveness.setValue(max(50, min(250, resp)))
+                self.lbl_responsiveness_val.setText(f"{self.sl_responsiveness.value() / 100:.2f}")
+
+            if hasattr(self, "sl_acceleration"):
+                acc = int(float(ini_opts.get("mk_acceleration", "1.00")) * 100)
+                self.sl_acceleration.setValue(max(100, min(200, acc)))
+                self.lbl_acceleration_val.setText(f"{self.sl_acceleration.value() / 100:.2f}")
 
             self.chk_inv_x.setChecked(ini_opts.get("mk_invert_x", "0") != "0")
             self.chk_inv_y.setChecked(ini_opts.get("mk_invert_y", "0") != "0")

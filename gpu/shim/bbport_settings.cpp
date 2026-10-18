@@ -150,6 +150,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.language = value == "ru" ? LangRu : LangEn;
     } else if (key == "mk_enabled") {
         v.mk_enabled = i != 0;
+    } else if (key == "mk_native_mouse") {
+        v.mk_native_mouse = i != 0;
     } else if (key == "mk_sens_x") {
         v.mk_sens_x = Clamp(f, 0.1f, 10.0f);
     } else if (key == "mk_sens_y") {
@@ -158,10 +160,12 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.mk_invert_x = i != 0;
     } else if (key == "mk_invert_y") {
         v.mk_invert_y = i != 0;
-    } else if (key == "mk_deadzone") {
-        v.mk_deadzone = Clamp(f, 0.0f, 0.35f);
     } else if (key == "mk_smoothing") {
         v.mk_smoothing = Clamp(f, 0.0f, 0.80f);
+    } else if (key == "mk_responsiveness") {
+        v.mk_responsiveness = Clamp(f, 0.5f, 2.5f);
+    } else if (key == "mk_acceleration") {
+        v.mk_acceleration = Clamp(f, 1.0f, 2.0f);
     } else if (key.rfind("key.", 0) == 0) {
         for (int a = 0; a < BB_ACTION_COUNT; ++a) {
             if (key == s_action_infos[a].ini_key) {
@@ -312,7 +316,7 @@ void Save() {
                  "reactive=%d\nobject_motion=%d\nreactive_scale=%.2f\nreactive_threshold=%.2f\nreactive_max=%.2f\n"
                  "debug_view=%d\nshow_fps=%d\nshow_hud=%d\nhud_quadrant=%d\nhud_opacity=%.2f\nhud_scale=%.2f\n"
                  "fsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n"
-                 "mk_enabled=%d\nmk_sens_x=%.2f\nmk_sens_y=%.2f\nmk_invert_x=%d\nmk_invert_y=%d\nmk_deadzone=%.2f\nmk_smoothing=%.2f\n",
+                 "mk_enabled=%d\nmk_sens_x=%.2f\nmk_sens_y=%.2f\nmk_invert_x=%d\nmk_invert_y=%d\nmk_smoothing=%.2f\nmk_responsiveness=%.2f\nmk_acceleration=%.2f\n",
                  UpscalerName(v.upscaler), v.preset.load(), int(v.sharpen.load()),
                  v.sharpness.load(), int(v.jitter.load()), int(v.reactive.load()),
                  int(v.object_motion.load()),
@@ -323,7 +327,7 @@ void Save() {
                  int(v.fsr4_auto_exposure.load()), int(v.fsr4_invert_jitter.load()),
                  int(v.mk_enabled.load()), v.mk_sens_x.load(), v.mk_sens_y.load(),
                  int(v.mk_invert_x.load()), int(v.mk_invert_y.load()),
-                 v.mk_deadzone.load(), v.mk_smoothing.load());
+                 v.mk_smoothing.load(), v.mk_responsiveness.load(), v.mk_acceleration.load());
     // Read by patches.py at start.
     for (int e = 0; e < EffectCount; ++e) {
         std::fprintf(file, "%s=%d\n", Effects[e].key, int(v.effects[e].load()));
