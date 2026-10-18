@@ -100,7 +100,9 @@ void Set(Values& v, const std::string& key, const std::string& value) {
     const int i = std::atoi(value.c_str());
     if (key == "upscaler") {
         for (int u = 0; u < UpscalerCount; ++u) {
-            if (value == UpscalerName(u)) {
+            if (value == UpscalerName(u) ||
+                (u == UpscalerFsr3 && (value == "fsr31" || value == "fsr3")) ||
+                (u == UpscalerFsr4 && value == "fsr4")) {
                 v.upscaler = u;
             }
         }
@@ -212,7 +214,11 @@ void Load() {
     if (const char* env = std::getenv("BB_UPSCALER")) {
         v.upscaler = UpscalerOff;
         for (int u = 0; u < UpscalerCount; ++u) {
-            if (std::strcmp(env, UpscalerName(u)) == 0) v.upscaler = u;
+            if (std::strcmp(env, UpscalerName(u)) == 0 ||
+                (u == UpscalerFsr3 && (std::strcmp(env, "fsr31") == 0 || std::strcmp(env, "fsr3") == 0)) ||
+                (u == UpscalerFsr4 && std::strcmp(env, "fsr4") == 0)) {
+                v.upscaler = u;
+            }
         }
     }
     const std::pair<const char*, const char*> env_keys[] = {
@@ -352,7 +358,7 @@ const char* PresetName(int preset) {
 }
 
 const char* UpscalerName(int upscaler) {
-    static constexpr const char* names[UpscalerCount] = {"off", "fsr3", "fsr4", "fsr411", "taa"};
+    static constexpr const char* names[UpscalerCount] = {"off", "fsr31", "fsr4", "fsr411", "taa"};
     return names[std::clamp(upscaler, 0, UpscalerCount - 1)];
 }
 

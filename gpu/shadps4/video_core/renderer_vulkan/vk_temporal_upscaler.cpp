@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 #include <vk_mem_alloc.h>
@@ -1072,6 +1073,8 @@ void TemporalUpscaler::Run() {
     float frame_ms = std::chrono::duration<float, std::milli>(now - last_frame).count();
     if (frame_ms <= 0.0f || frame_ms > 200.0f) {
         frame_ms = 16.6f;
+    } else {
+        frame_ms = std::min(frame_ms, 66.7f);
     }
     last_frame = now;
 
@@ -1112,8 +1115,10 @@ void TemporalUpscaler::Run() {
                                          FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ);
         }
         info.transparencyAndCompositionMask.structSize = sizeof(info.transparencyAndCompositionMask);
-        // Toggle 1 << 26 (tests): the opposite sign convention for FSR.
-        const float sign = BbToggle::Disabled(1u << 26) ? -1.0f : 1.0f;
+        const auto& settings = BbSettings::Get();
+        // Toggle 1 << 26 or menu flips jitter sign for tests.
+        const float sign =
+            BbToggle::Disabled(1u << 26) != settings.fsr4_invert_jitter.load() ? -1.0f : 1.0f;
         info.jitterOffset = {sign * jitter[0], sign * jitter[1]};
         info.motionVectorScale = {1.0f, 1.0f};
         info.renderSize = {w, h};
@@ -1126,10 +1131,18 @@ void TemporalUpscaler::Run() {
         info.viewSpaceToMeters = 1.0f;
         // RCAS strength 0..1 (menu, BB_FSR_SHARPNESS); jitter at 1:1 softens the image slightly.
         // AMD's RCAS ends at 1; ExtraSharpen adds the rest of the menu's 0..2.
-        info.sharpness = std::min(BbSettings::Get().sharpness.load(), 1.0f);
-        info.enableSharpening = BbSettings::Get().sharpen ? VK_TRUE : VK_FALSE;
+        info.sharpness = std::min(settings.sharpness.load(), 1.0f);
+        info.enableSharpening = settings.sharpen ? VK_TRUE : VK_FALSE;
         info.reset = reset ? VK_TRUE : VK_FALSE;
         info.frameId = frame_id++;
+
+        static u32 jitter_log_count = 0;
+        if (jitter_log_count < 32 || std::getenv("BB_JITTER_LOG")) {
+            std::printf("Upscaler: frame %llu jitter [%u] = (%.6f, %.6f) reset=%d\n",
+                        (unsigned long long)info.frameId, jitter_index,
+                        info.jitterOffset.x, info.jitterOffset.y, (int)info.reset);
+            ++jitter_log_count;
+        }
     
         FfxVkPortableUpscaleCreateInfo create_info{};
         create_info.structSize = sizeof(create_info);
@@ -1268,7 +1281,11 @@ float TemporalUpscaler::SceneMipBias() const {
     if (!Active() || BbSettings::Get().upscaler == BbSettings::UpscalerTaa) return 0.0f;
     const float render = float(BbSettings::Get().active_render_width.load());
     const float output = float(Scaled() ? target_width : 1920u);
-    return render > 0.0f && render < output ? std::log2(render / output) : 0.0f;
+    if (render <= 0.0f || output <= 0.0f) return 0.0f;
+    // AMD FidelityFX guideline: log2(render / output) - 0.5f to recover texture detail lost to
+    // subpixel jitter. At 1:1 ratio (Native AA), apply -0.5f so jittered sampling retains crisp detail.
+    const float base_bias = render < output ? std::log2(render / output) : 0.0f;
+    return std::clamp(base_bias - 0.5f, -3.0f, 0.0f);
 }
 
 bool TemporalUpscaler::Scaled() const {
@@ -1604,6 +1621,8 @@ void TemporalUpscaler::RunScaled() {
     float frame_ms = std::chrono::duration<float, std::milli>(now - last_frame).count();
     if (frame_ms <= 0.0f || frame_ms > 200.0f) {
         frame_ms = 16.6f;
+    } else {
+        frame_ms = std::min(frame_ms, 66.7f);
     }
     last_frame = now;
 
@@ -1707,7 +1726,9 @@ void TemporalUpscaler::RunScaled() {
     }
 
     info.transparencyAndCompositionMask.structSize = sizeof(info.transparencyAndCompositionMask);
-    const float sign = BbToggle::Disabled(1u << 26) ? -1.0f : 1.0f;
+    // Toggle 1 << 26 or menu flips jitter sign for tests.
+    const float sign =
+        BbToggle::Disabled(1u << 26) != settings.fsr4_invert_jitter.load() ? -1.0f : 1.0f;
     info.jitterOffset = {sign * jitter[0], sign * jitter[1]};
     info.motionVectorScale = {1.0f, 1.0f};
     info.renderSize = {w, h};
@@ -1722,6 +1743,14 @@ void TemporalUpscaler::RunScaled() {
     info.enableSharpening = settings.sharpen ? VK_TRUE : VK_FALSE;
     info.reset = reset ? VK_TRUE : VK_FALSE;
     info.frameId = frame_id++;
+
+    static u32 jitter_log_count = 0;
+    if (jitter_log_count < 32 || std::getenv("BB_JITTER_LOG")) {
+        std::printf("Upscaler: frame %llu scaled jitter [%u] = (%.6f, %.6f) reset=%d\n",
+                    (unsigned long long)info.frameId, jitter_index,
+                    info.jitterOffset.x, info.jitterOffset.y, (int)info.reset);
+        ++jitter_log_count;
+    }
 
     FfxVkPortableUpscaleCreateInfo create_info{};
     create_info.structSize = sizeof(create_info);
@@ -1912,10 +1941,31 @@ namespace Vulkan {
 
 bool TemporalUpscaler::UseFsr4() const {
     const int selected = BbSettings::Get().upscaler;
-    const bool supported = selected == BbSettings::UpscalerFsr411
-                               ? instance.IsFsr411Supported()
-                               : instance.IsFsr4Int8Supported();
-    return BbSettings::IsFsr4(selected) && supported && !fsr4_failed;
+    if (!BbSettings::IsFsr4(selected) || fsr4_failed) {
+        return false;
+    }
+    const bool is_411 = (selected == BbSettings::UpscalerFsr411);
+    const bool supported = is_411 ? instance.IsFsr411Supported() : instance.IsFsr4Int8Supported();
+
+    const char* env_dir = is_411 ? std::getenv("BB_FSR411_DIR") : std::getenv("BB_FSR4_DIR");
+    const std::string asset_dir =
+        env_dir && env_dir[0] ? env_dir : (is_411 ? "fsr4_411" : "fsr4_shaders");
+    std::error_code ec;
+    const bool assets_exist = std::filesystem::is_directory(asset_dir, ec) && !ec;
+
+    if (!supported || !assets_exist) {
+        static bool logged_fallback = false;
+        if (!logged_fallback) {
+            logged_fallback = true;
+            std::printf("Upscaler: FSR 4 unavailable: missing fsr4_shaders/ or unsupported GPU; falling back to FSR 3.1\n");
+        }
+        static const char* reason = !assets_exist
+            ? "missing fsr4_shaders/ or assets directory"
+            : "unsupported GPU (lacks INT8 dot product / compute derivatives)";
+        BbSettings::Get().fsr4_problem = reason;
+        return false;
+    }
+    return true;
 }
 
 bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color,

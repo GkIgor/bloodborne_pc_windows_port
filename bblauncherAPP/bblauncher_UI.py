@@ -33,6 +33,7 @@ from bblauncher_Utils import (
     KEYBINDINGS,
     PREP_WORKER_CHOICES,
     RES_CHOICES,
+    UPSCALER_CHOICES,
     WINDOW_MODE_CHOICES,
 )
 
@@ -901,14 +902,23 @@ class LauncherUI:
         self.cmb_prep_workers.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
         grid_disp.addWidget(self.cmb_prep_workers, 2, 3)
 
+        grid_disp.addWidget(QLabel("Upscaler Technology:"), 3, 0)
+        self.cmb_upscaler = QComboBox()
+        for label, _ in UPSCALER_CHOICES:
+            self.cmb_upscaler.addItem(label)
+        self.cmb_upscaler.setCurrentText(self.settings.get("upscaler_model", UPSCALER_CHOICES[0][0]))
+        self.cmb_upscaler.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+        grid_disp.addWidget(self.cmb_upscaler, 3, 1)
+
         l_disp.addLayout(grid_disp)
 
         row_flags = QGridLayout()
         row_flags.setHorizontalSpacing(16)
         row_flags.setVerticalSpacing(8)
 
-        self.chk_fsr = QCheckBox("Enable FSR 3.1 Temporal Upscaler")
+        self.chk_fsr = QCheckBox("Enable Temporal Upscaler")
         self.chk_fsr.setChecked(self.settings.get("feat_upscaler", False))
+        self.chk_fsr.toggled.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
         row_flags.addWidget(self.chk_fsr, 0, 0)
 
         self.chk_fps_patch = QCheckBox("Engine Framerate Patch (60/90/Uncap)")

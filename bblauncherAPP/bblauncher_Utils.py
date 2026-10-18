@@ -40,6 +40,10 @@ ANISO_CHOICES = [
     ("Off", "0", "Game's default anisotropic filtering (no override)"),
 ]
 AA_CHOICES = ["Native FXAA (PS4 Default)", "Disable AA (No FXAA)", "TAA (Temporal Anti-Aliasing)"]
+UPSCALER_CHOICES = [
+    ("FSR 3.1", "fsr31"),
+    ("FSR 4", "fsr4"),
+]
 PREP_WORKER_CHOICES = [
     ("Auto (dynamic threads)", "auto"),
     ("Off (single-threaded)", "0"),
@@ -63,6 +67,7 @@ DEFAULT_SETTINGS = {
     "mods": False,
     "hide_vk": True,
     "feat_upscaler": False,
+    "upscaler_model": UPSCALER_CHOICES[0][0],
     "feat_overlay": True,
     "feat_hud": False,
     "feat_fps_patch": True,

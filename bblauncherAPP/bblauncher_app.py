@@ -47,7 +47,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Bloodborne PC Launcher")
-        self.setFixedSize(1100, 720)
+        self.setFixedSize(1200, 720)
         self.setStyleSheet(STYLE_SHEET)
         
         icon_file = APP_DIR / "icon.ico"
@@ -137,6 +137,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "mods": self.chk_mods.isChecked(),
                 "hide_vk": self.chk_vk_noise.isChecked(),
                 "feat_upscaler": self.chk_fsr.isChecked(),
+                "upscaler_model": self.cmb_upscaler.currentText() if hasattr(self, "cmb_upscaler") else "FSR 3.1 (High FPS)",
                 "feat_overlay": self.chk_overlay.isChecked(),
                 "feat_hud": self.chk_hud.isChecked(),
                 "feat_fps_patch": self.chk_fps_patch.isChecked(),
@@ -183,7 +184,18 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 break
 
         aa_choice = self.cmb_aa.currentText()
-        effect_game_aa = "0" if "Disable" in aa_choice or "TAA" in aa_choice else "1"
+        is_fsr = self.chk_fsr.isChecked() if hasattr(self, "chk_fsr") else False
+        is_taa = "TAA" in aa_choice
+        is_upscaler_active = is_fsr or is_taa
+        effect_game_aa = "0" if is_upscaler_active or "Disable" in aa_choice else "1"
+
+        if is_taa:
+            upscaler_val = "taa"
+        elif is_fsr:
+            upscaler_choice = self.cmb_upscaler.currentText() if hasattr(self, "cmb_upscaler") else "fsr31"
+            upscaler_val = "fsr4" if "FSR 4" in upscaler_choice else "fsr31"
+        else:
+            upscaler_val = "off"
 
         prep_choice = self.cmb_prep_workers.currentText()
         prep_workers_val = "auto"
@@ -193,6 +205,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 break
 
         keys_to_update = {
+            "upscaler": upscaler_val,
             "output_res": output_res_val,
             "effect_game_aa": effect_game_aa,
             "prep_workers": prep_workers_val,
@@ -514,7 +527,8 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         elif not cfg["feat_upscaler"]:
             env["BB_UPSCALER"] = "off"
         else:
-            env.pop("BB_UPSCALER", None)
+            upscaler_choice = cfg.get("upscaler_model", "FSR 3.1 (High FPS)")
+            env["BB_UPSCALER"] = "fsr4" if "FSR 4" in upscaler_choice else "fsr31"
 
         if not cfg["feat_overlay"]:
             env["BB_OVERLAY"] = "0"

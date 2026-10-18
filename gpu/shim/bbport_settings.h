@@ -67,12 +67,12 @@ struct Values {
     std::atomic<int> upscaler{UpscalerOff};
     std::atomic<int> preset{NativeAA};
     std::atomic<bool> sharpen{true};
-    std::atomic<float> sharpness{0.3f};
-    std::atomic<bool> jitter{false};
-    std::atomic<bool> reactive{false};
-    std::atomic<bool> object_motion{false};
+    std::atomic<float> sharpness{0.65f};
+    std::atomic<bool> jitter{true};
+    std::atomic<bool> reactive{true};
+    std::atomic<bool> object_motion{true};
     std::atomic<float> reactive_scale{1.0f};
-    std::atomic<float> reactive_threshold{0.2f};
+    std::atomic<float> reactive_threshold{0.18f};
     std::atomic<float> reactive_max{0.9f};
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{false};
