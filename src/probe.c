@@ -1668,13 +1668,67 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
         }
         if (rip >= (uintptr_t)image && rip < (uintptr_t)image + (image_size ? image_size : 0x20000000)) {
             uintptr_t off = rip - (uintptr_t)image;
-            // Functions 0x28ce7b0 .. 0x28d015e are the particle, blood splatter, and cloth
-            // vertex stream generators executed by GXWorker threads.
-            // On x86-64 System V ABI, these routines store temporary vertex and stream pointers
-            // in the 128-byte Red Zone below RSP (-0x8(%rsp) .. -0x68(%rsp)) and write to dynamic
-            // host/guest buffers. When KiUserExceptionDispatch handles GPU write-tracking faults,
-            // Windows kernel writes CONTEXT below RSP, clobbering red zone temporaries (-0x60(%rsp) becomes 0).
-            if (off >= 0x28ce7ba && off < 0x28d015e) {
+
+            // Issue #134: DLTemporaryHeap::Allocate failure when RCX == NULL
+            if ((off >= 0x207de20 && off <= 0x207de2a) && ep->ContextRecord->Rcx == 0) {
+                uintptr_t rsp = ep->ContextRecord->Rsp;
+                char buf[512];
+                snprintf(buf, sizeof(buf),
+                    "[HEAP ALLOC GUARD] Thread '%s' (TID %lu) at guest offset 0x%" PRIxPTR ": "
+                    "DLTemporaryHeap pointer is NULL (RAX=%p, RDX=%p, RSI=%p, RDI=%p). Returning NULL to caller.\n",
+                    cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId(), off,
+                    (void *)ep->ContextRecord->Rax, (void *)ep->ContextRecord->Rdx,
+                    (void *)ep->ContextRecord->Rsi, (void *)ep->ContextRecord->Rdi);
+                veh_write(buf);
+                fprintf(stderr, "%s", buf);
+                fflush(stderr);
+
+                ep->ContextRecord->Rax = 0;
+                ep->ContextRecord->Rbx = *(DWORD64 *)(rsp);
+                ep->ContextRecord->R14 = *(DWORD64 *)(rsp + 0x08);
+                ep->ContextRecord->Rbp = *(DWORD64 *)(rsp + 0x10);
+                ep->ContextRecord->Rip = *(DWORD64 *)(rsp + 0x18);
+                ep->ContextRecord->Rsp = rsp + 0x20;
+                if (cur) cur->exception_count++;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
+            // Issue #136: Bucket allocator refill loop NULL pointer write
+            if (off == 0x443025 && ep->ContextRecord->Rdi == 0) {
+                char buf[512];
+                snprintf(buf, sizeof(buf),
+                    "[ALLOCATOR GUARD] Thread '%s' (TID %lu) at guest offset 0x443025: "
+                    "NULL bucket chunk pointer in refill loop (ECX=%u remaining). Breaking chunk link loop.\n",
+                    cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId(),
+                    (unsigned int)ep->ContextRecord->Rcx);
+                veh_write(buf);
+                fprintf(stderr, "%s", buf);
+                fflush(stderr);
+
+                ep->ContextRecord->Rip = (uintptr_t)image + 0x443037;
+                if (cur) cur->exception_count++;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
+            // Issue #135 secondary write safeguard: 0x21d5b45 .. 0x21d5d70 when R13 == 0
+            if (off >= 0x21d5b45 && off < 0x21d5d71 && ep->ContextRecord->R13 == 0) {
+                char buf[512];
+                snprintf(buf, sizeof(buf),
+                    "[ASSET COPY GUARD] Thread '%s' (TID %lu) at guest offset 0x%" PRIxPTR ": "
+                    "NULL destination buffer R13 in structure copy. Advancing to function epilogue.\n",
+                    cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId(), off);
+                veh_write(buf);
+                fprintf(stderr, "%s", buf);
+                fflush(stderr);
+
+                ep->ContextRecord->Rcx = 0;
+                ep->ContextRecord->Rip = (uintptr_t)image + 0x21d5d71;
+                if (cur) cur->exception_count++;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
+            // Issue #127: particle, blood splatter, and cloth vertex stream generators
+            if (off >= 0x28ce7ba && off < 0x28d064e) {
                 uintptr_t rsp = ep->ContextRecord->Rsp;
                 log_redzone_guard_hit(off, rip, rsp, cur);
                 if (off >= 0x28ce7ba && off < 0x28ceeb8) { // 0x28ce7b0 (sub $0x30, %rsp)
@@ -1686,6 +1740,7 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
                     ep->ContextRecord->Rbp = *(DWORD64 *)(rsp + 0x58);
                     ep->ContextRecord->Rip = *(DWORD64 *)(rsp + 0x60);
                     ep->ContextRecord->Rsp = rsp + 0x68;
+                    if (cur) cur->exception_count++;
                     return EXCEPTION_CONTINUE_EXECUTION;
                 } else if (off >= 0x28ceeca && off < 0x28cf572) { // 0x28ceec0 (sub $0x20, %rsp)
                     ep->ContextRecord->Rbx = *(DWORD64 *)(rsp + 0x20);
@@ -1696,6 +1751,7 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
                     ep->ContextRecord->Rbp = *(DWORD64 *)(rsp + 0x48);
                     ep->ContextRecord->Rip = *(DWORD64 *)(rsp + 0x50);
                     ep->ContextRecord->Rsp = rsp + 0x58;
+                    if (cur) cur->exception_count++;
                     return EXCEPTION_CONTINUE_EXECUTION;
                 } else if (off >= 0x28cf58a && off < 0x28cfb95) { // 0x28cf580 (push %rax = 8 bytes)
                     ep->ContextRecord->Rbx = *(DWORD64 *)(rsp + 0x08);
@@ -1706,6 +1762,7 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
                     ep->ContextRecord->Rbp = *(DWORD64 *)(rsp + 0x30);
                     ep->ContextRecord->Rip = *(DWORD64 *)(rsp + 0x38);
                     ep->ContextRecord->Rsp = rsp + 0x40;
+                    if (cur) cur->exception_count++;
                     return EXCEPTION_CONTINUE_EXECUTION;
                 } else if (off >= 0x28cfbaa && off < 0x28d015e) { // 0x28cfba0 (sub $0x18, %rsp)
                     ep->ContextRecord->Rbx = *(DWORD64 *)(rsp + 0x18);
@@ -1716,6 +1773,17 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
                     ep->ContextRecord->Rbp = *(DWORD64 *)(rsp + 0x40);
                     ep->ContextRecord->Rip = *(DWORD64 *)(rsp + 0x48);
                     ep->ContextRecord->Rsp = rsp + 0x50;
+                    if (cur) cur->exception_count++;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                } else if ((off >= 0x28d0164 && off < 0x28d02b4) ||
+                           (off >= 0x28d02c4 && off < 0x28d046b) ||
+                           (off >= 0x28d0484 && off < 0x28d0505)) { // 0x28d0160, 0x28d02c0, 0x28d0480 (push rbp, r14, rbx)
+                    ep->ContextRecord->Rbx = *(DWORD64 *)(rsp);
+                    ep->ContextRecord->R14 = *(DWORD64 *)(rsp + 0x08);
+                    ep->ContextRecord->Rbp = *(DWORD64 *)(rsp + 0x10);
+                    ep->ContextRecord->Rip = *(DWORD64 *)(rsp + 0x18);
+                    ep->ContextRecord->Rsp = rsp + 0x20;
+                    if (cur) cur->exception_count++;
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
             }

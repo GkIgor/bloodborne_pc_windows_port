@@ -513,6 +513,12 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        LOG_CRITICAL(Render_Vulkan, "VK_ERROR_DEVICE_LOST in vkQueueSubmit: queue={}, fence={}, cmdbuf={}",
+                     fmt::ptr((void*)static_cast<VkQueue>(instance.GetGraphicsQueue())),
+                     fmt::ptr((void*)static_cast<VkFence>(info.fence)),
+                     fmt::ptr((void*)static_cast<VkCommandBuffer>(current_cmdbuf)));
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     work_semaphore.Refresh();

@@ -161,16 +161,64 @@ static ABI __attribute__((noreturn)) void stack_fail(void) {
     exit(22);
 }
 static ABI void *guest_memset(void *dst, int value, size_t size) {
-    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memset(dst, value, size);
+    atomic_fetch_add_explicit(&memory_calls, 1, memory_order_relaxed);
+    if (!dst) {
+        if (size > 0) {
+            GuestThread *cur = runtime_thread_current();
+            fprintf(stderr,
+                "[RUNTIME GUARD] Invalid memset: dst is NULL, val=%d, size=%zu (caller %p, thread '%s', TID %lu)\n",
+                value, size, __builtin_return_address(0),
+                cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId());
+            fflush(stderr);
+        }
+        return dst;
+    }
+    return memset(dst, value, size);
 }
 static ABI void *guest_memcpy(void *dst, const void *src, size_t size) {
-    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcpy(dst, src, size);
+    atomic_fetch_add_explicit(&memory_calls, 1, memory_order_relaxed);
+    if (!dst || !src) {
+        if (size > 0) {
+            GuestThread *cur = runtime_thread_current();
+            fprintf(stderr,
+                "[RUNTIME GUARD] Invalid memcpy: dst=%p, src=%p, size=%zu (caller %p, thread '%s', TID %lu)\n",
+                dst, src, size, __builtin_return_address(0),
+                cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId());
+            fflush(stderr);
+        }
+        return dst;
+    }
+    return memcpy(dst, src, size);
 }
 static ABI void *guest_memmove(void *dst, const void *src, size_t size) {
-    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memmove(dst, src, size);
+    atomic_fetch_add_explicit(&memory_calls, 1, memory_order_relaxed);
+    if (!dst || !src) {
+        if (size > 0) {
+            GuestThread *cur = runtime_thread_current();
+            fprintf(stderr,
+                "[RUNTIME GUARD] Invalid memmove: dst=%p, src=%p, size=%zu (caller %p, thread '%s', TID %lu)\n",
+                dst, src, size, __builtin_return_address(0),
+                cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId());
+            fflush(stderr);
+        }
+        return dst;
+    }
+    return memmove(dst, src, size);
 }
 static ABI int guest_memcmp(const void *a, const void *b, size_t size) {
-    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcmp(a, b, size);
+    atomic_fetch_add_explicit(&memory_calls, 1, memory_order_relaxed);
+    if (!a || !b) {
+        if (size > 0) {
+            GuestThread *cur = runtime_thread_current();
+            fprintf(stderr,
+                "[RUNTIME GUARD] Invalid memcmp: a=%p, b=%p, size=%zu (caller %p, thread '%s', TID %lu)\n",
+                a, b, size, __builtin_return_address(0),
+                cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId());
+            fflush(stderr);
+        }
+        return (a == b) ? 0 : (a ? 1 : -1);
+    }
+    return memcmp(a, b, size);
 }
 static ABI size_t guest_strlen(const char *text) { return strlen(text); }
 static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {

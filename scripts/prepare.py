@@ -24,8 +24,10 @@ def unpack(fmt, data, offset):
 
 
 def parse_self(data):
+    if len(data) < 32:
+        raise ValueError(f"executable binary is empty or truncated ({len(data)} bytes, minimum 32 bytes required)")
     if span(data, 0, 4) != b'O\x15=\x1d':
-        raise ValueError("expected PS4 SELF")
+        raise ValueError("expected PS4 SELF header (magic bytes O\\x15=\\x1d)")
     count, = unpack('<H', data, 24)
     base = 32 + count * 32
     header = unpack('<16sHHIQQQIHHHHHH', data, base)
@@ -121,7 +123,14 @@ def inspect_libc(path):
 
 
 def prepare(game, out):
-    source = (game / 'eboot.bin').read_bytes()
+    eboot_path = game / 'eboot.bin'
+    if not eboot_path.is_file():
+        raise FileNotFoundError(f"Missing eboot.bin at '{eboot_path}'. Please check your game directory.")
+    source = eboot_path.read_bytes()
+    if len(source) == 0:
+        raise ValueError(f"eboot.bin at '{eboot_path}' is completely empty (0 bytes). Check your game dump or extraction.")
+    if len(source) < 32:
+        raise ValueError(f"eboot.bin at '{eboot_path}' is truncated ({len(source)} bytes).")
     elf, header, ph, segments, missing = parse_self(source)
     loads = [p for p in ph if p['type'] in (1, 0x61000010)]
     def mapped(addr, size=8):

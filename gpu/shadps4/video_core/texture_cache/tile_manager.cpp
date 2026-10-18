@@ -196,6 +196,9 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
 void TileManager::RecordTilingDispatch(vk::Pipeline pipeline, const vk::DescriptorBufferInfo& tiled,
                                        const vk::DescriptorBufferInfo& linear,
                                        const vk::DescriptorBufferInfo& params, u32 dim_x) {
+    if (!pipeline || dim_x == 0) {
+        return;
+    }
     scheduler.Record([pipeline, layout = *pl_layout, tiled, linear, params,
                       dim_x](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
@@ -227,6 +230,15 @@ void TileManager::RecordTilingDispatch(vk::Pipeline pipeline, const vk::Descript
 std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* in_buffer,
                                                        u64 in_offset, const ImageInfo& info) {
     if (!info.props.is_tiled) {
+        return {in_buffer, in_offset};
+    }
+
+    const auto bpp = info.num_bits / 8;
+    if (bpp == 0 || info.guest_size == 0) {
+        return {in_buffer, in_offset};
+    }
+    const auto dim_x = static_cast<u32>((info.guest_size / bpp) / 64);
+    if (dim_x == 0) {
         return {in_buffer, in_offset};
     }
 
@@ -264,7 +276,6 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
         .offset = staging.offset,
         .range = info.guest_size,
     };
-    const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
     // bbport: recorded with copies of the descriptor infos (threaded recording).
     RecordTilingDispatch(GetTilingPipeline(info, false), tiled_buffer_info, linear_buffer_info,
                          params_buffer_info, dim_x);
@@ -277,6 +288,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     runtime.AccessBuffer(staging.buffer, staging.offset, info.guest_size,
                          vk::PipelineStageFlagBits2::eComputeShader,
                          vk::AccessFlagBits2::eShaderWrite);
+    runtime.FlushBarriers();
 
     return {staging.buffer, staging.offset};
 }
@@ -289,6 +301,15 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
             copy.bufferOffset += out_offset;
         }
         runtime.DownloadImage(&in_image, out_buffer, buffer_copies);
+        return;
+    }
+
+    const auto bpp = info.num_bits / 8;
+    if (bpp == 0 || info.guest_size == 0) {
+        return;
+    }
+    const auto dim_x = static_cast<u32>((info.guest_size / bpp) / 64);
+    if (dim_x == 0) {
         return;
     }
 
@@ -329,7 +350,6 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         .offset = staging.offset,
         .range = info.guest_size,
     };
-    const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
     // bbport: recorded with copies of the descriptor infos (threaded recording).
     RecordTilingDispatch(GetTilingPipeline(info, true), tiled_buffer_info, linear_buffer_info,
                          params_buffer_info, dim_x);
@@ -340,6 +360,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,
                          vk::PipelineStageFlagBits2::eComputeShader,
                          vk::AccessFlagBits2::eShaderWrite);
+    runtime.FlushBarriers();
 }
 
 } // namespace VideoCore
