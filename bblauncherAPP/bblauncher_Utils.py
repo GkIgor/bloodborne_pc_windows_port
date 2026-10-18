@@ -41,6 +41,7 @@ ANISO_CHOICES = [
 ]
 AA_CHOICES = ["Native FXAA (PS4 Default)", "Disable AA (No FXAA)", "TAA (Temporal Anti-Aliasing)"]
 UPSCALER_CHOICES = [
+    ("Off", "off"),
     ("FSR 3.1", "fsr31"),
     ("FSR 4", "fsr4"),
 ]

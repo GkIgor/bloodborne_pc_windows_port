@@ -60,9 +60,9 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.log_fh = None
         self.hidden_count = 0
 
-        self._patches_built = True
-        self._settings_built = True
-        self.all_xml_patches = load_xml_patches()
+        self._patches_built = False
+        self._settings_built = False
+        self.all_xml_patches = []
         self.patch_checkboxes = {}
 
         self.settings = self.load_settings()
@@ -70,6 +70,10 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
         self.init_ui()
         self.log("Ready. Select your eboot.bin and press Launch Bloodborne.")
+
+        # Deferred background warming for secondary tabs after window is already shown
+        QTimer.singleShot(100, self._build_settings_tab_now)
+        QTimer.singleShot(300, self._build_patches_tab_now)
 
         self._last_ini_mtime = 0
         try:
@@ -95,23 +99,30 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         super().changeEvent(event)
 
     def _build_patches_tab_now(self):
-        if self._patches_built:
+        if getattr(self, "_patches_built", False):
             return
+        self._patches_built = True
         self.all_xml_patches = load_xml_patches()
         patches_widget = self.create_patches_tab()
-        self.stack.removeWidget(self.patches_placeholder)
-        self.patches_placeholder.deleteLater()
-        self.stack.insertWidget(1, patches_widget)
-        self._patches_built = True
+        if hasattr(self, "patches_placeholder"):
+            idx = self.stack.indexOf(self.patches_placeholder)
+            if idx >= 0:
+                self.stack.removeWidget(self.patches_placeholder)
+                self.patches_placeholder.deleteLater()
+                self.stack.insertWidget(idx, patches_widget)
+        self.update_patch_count_label()
 
     def _build_settings_tab_now(self):
-        if self._settings_built:
+        if getattr(self, "_settings_built", False):
             return
-        settings_widget = self.create_settings_tab()
-        self.stack.removeWidget(self.settings_placeholder)
-        self.settings_placeholder.deleteLater()
-        self.stack.insertWidget(2, settings_widget)
         self._settings_built = True
+        settings_widget = self.create_settings_tab()
+        if hasattr(self, "settings_placeholder"):
+            idx = self.stack.indexOf(self.settings_placeholder)
+            if idx >= 0:
+                self.stack.removeWidget(self.settings_placeholder)
+                self.settings_placeholder.deleteLater()
+                self.stack.insertWidget(idx, settings_widget)
 
     def load_settings(self) -> dict:
         merged = dict(DEFAULT_SETTINGS)
@@ -127,6 +138,8 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
     def current_config(self) -> dict:
         if self._settings_built:
             win_mode = self.cmb_win_mode.currentText()
+            upscaler_choice = self.cmb_upscaler.currentText() if hasattr(self, "cmb_upscaler") else "Off"
+            is_fsr = self.chk_fsr.isChecked() and upscaler_choice != "Off"
             return {
                 "eboot": self.txt_eboot.text().strip(),
                 "fps": self.cmb_fps.currentText(),
@@ -136,8 +149,8 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "anti_aliasing": self.cmb_aa.currentText(),
                 "mods": self.chk_mods.isChecked(),
                 "hide_vk": self.chk_vk_noise.isChecked(),
-                "feat_upscaler": self.chk_fsr.isChecked(),
-                "upscaler_model": self.cmb_upscaler.currentText() if hasattr(self, "cmb_upscaler") else "FSR 3.1 (High FPS)",
+                "feat_upscaler": is_fsr,
+                "upscaler_model": upscaler_choice,
                 "feat_overlay": self.chk_overlay.isChecked(),
                 "feat_hud": self.chk_hud.isChecked(),
                 "feat_fps_patch": self.chk_fps_patch.isChecked(),
@@ -184,7 +197,8 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 break
 
         aa_choice = self.cmb_aa.currentText()
-        is_fsr = self.chk_fsr.isChecked() if hasattr(self, "chk_fsr") else False
+        upscaler_choice = self.cmb_upscaler.currentText() if hasattr(self, "cmb_upscaler") else "Off"
+        is_fsr = (self.chk_fsr.isChecked() if hasattr(self, "chk_fsr") else False) and (upscaler_choice != "Off")
         is_taa = "TAA" in aa_choice
         is_upscaler_active = is_fsr or is_taa
         effect_game_aa = "0" if is_upscaler_active or "Disable" in aa_choice else "1"
@@ -192,7 +206,6 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if is_taa:
             upscaler_val = "taa"
         elif is_fsr:
-            upscaler_choice = self.cmb_upscaler.currentText() if hasattr(self, "cmb_upscaler") else "fsr31"
             upscaler_val = "fsr4" if "FSR 4" in upscaler_choice else "fsr31"
         else:
             upscaler_val = "off"
@@ -321,6 +334,32 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
             for w in widgets:
                 w.blockSignals(False)
+
+            if hasattr(self, "chk_fsr") and hasattr(self, "cmb_upscaler"):
+                ini_upscaler = ini_opts.get("upscaler", "off").strip().lower()
+                self.chk_fsr.blockSignals(True)
+                self.cmb_upscaler.blockSignals(True)
+                if ini_upscaler in ("fsr3", "fsr31"):
+                    self.chk_fsr.setChecked(True)
+                    self.cmb_upscaler.setCurrentText("FSR 3.1")
+                elif ini_upscaler in ("fsr4", "fsr411"):
+                    self.chk_fsr.setChecked(True)
+                    self.cmb_upscaler.setCurrentText("FSR 4")
+                else:
+                    self.chk_fsr.setChecked(False)
+                    self.cmb_upscaler.setCurrentText("Off")
+                self.chk_fsr.blockSignals(False)
+                self.cmb_upscaler.blockSignals(False)
+
+            if hasattr(self, "cmb_res"):
+                ini_res = ini_opts.get("output_res", "").strip()
+                if ini_res:
+                    for idx_res in range(self.cmb_res.count()):
+                        if ini_res in self.cmb_res.itemText(idx_res):
+                            self.cmb_res.blockSignals(True)
+                            self.cmb_res.setCurrentIndex(idx_res)
+                            self.cmb_res.blockSignals(False)
+                            break
 
             if hasattr(self, "keybind_buttons"):
                 for k, btn in self.keybind_buttons.items():
@@ -498,6 +537,9 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if self.blocked_by_running_instance():
             return
 
+        self.save_settings()
+        self.save_bbport_ini()
+
         cfg = self.current_config()
         target = cfg["eboot"]
         if not target:
@@ -522,12 +564,12 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         env["BB_MODS_ENABLED"] = "1" if cfg["mods"] else "0"
 
         aa_mode = cfg.get("anti_aliasing", "Native FXAA (PS4 Default)")
+        upscaler_choice = cfg.get("upscaler_model", "Off")
         if "TAA" in aa_mode:
             env["BB_UPSCALER"] = "taa"
-        elif not cfg["feat_upscaler"]:
+        elif not cfg.get("feat_upscaler", False) or upscaler_choice == "Off":
             env["BB_UPSCALER"] = "off"
         else:
-            upscaler_choice = cfg.get("upscaler_model", "FSR 3.1 (High FPS)")
             env["BB_UPSCALER"] = "fsr4" if "FSR 4" in upscaler_choice else "fsr31"
 
         if not cfg["feat_overlay"]:

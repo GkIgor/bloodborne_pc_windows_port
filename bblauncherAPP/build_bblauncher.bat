@@ -104,6 +104,25 @@ echo.
     --exclude-module "PySide6.Qt3DCore" ^
     --exclude-module "PySide6.QtNetwork" ^
     --exclude-module "PySide6.QtMultimedia" ^
+    --exclude-module "PySide6.QtVirtualKeyboard" ^
+    --exclude-module "PySide6.QtPdf" ^
+    --exclude-module "PySide6.QtPdfWidgets" ^
+    --exclude-module "PySide6.QtSvg" ^
+    --exclude-module "PySide6.QtOpenGL" ^
+    --exclude-module "PySide6.QtOpenGLWidgets" ^
+    --exclude-module "PySide6.QtSql" ^
+    --exclude-module "PySide6.QtTest" ^
+    --exclude-module "PySide6.QtXml" ^
+    --exclude-module "PySide6.QtPrintSupport" ^
+    --exclude-module "PySide6.QtDesigner" ^
+    --exclude-module "PySide6.QtHelp" ^
+    --exclude-module "PySide6.QtUiTools" ^
+    --exclude-module "tkinter" ^
+    --exclude-module "unittest" ^
+    --exclude-module "pydoc" ^
+    --exclude-module "doctest" ^
+    --exclude-module "email" ^
+    --exclude-module "http" ^
     bblauncher_app.py
 if errorlevel 1 (
     echo.

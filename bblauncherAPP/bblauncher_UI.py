@@ -55,33 +55,11 @@ class KeybindButton(QPushButton):
     def update_style(self):
         if self.listening:
             self.setText("< Press Key / Click >")
-            self.setStyleSheet("""
-                QPushButton#KeybindBtn {
-                    background-color: #2b2510;
-                    border: 2px solid #d1b87a;
-                    border-radius: 4px;
-                    color: #ffd700;
-                    font-weight: 700;
-                    font-size: 12px;
-                }
-            """)
         else:
             self.setText(self.current_binding if self.current_binding else "None")
-            self.setStyleSheet("""
-                QPushButton#KeybindBtn {
-                    background-color: #1a1a24;
-                    border: 1px solid #363645;
-                    border-radius: 4px;
-                    color: #d1b87a;
-                    font-weight: 600;
-                    font-size: 12px;
-                    padding: 0 10px;
-                }
-                QPushButton#KeybindBtn:hover {
-                    background-color: #242433;
-                    border-color: #d1b87a;
-                }
-            """)
+        self.setProperty("listening", "true" if self.listening else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     def set_binding(self, text: str):
         self.current_binding = text
@@ -408,6 +386,27 @@ QPushButton#StopBtn:disabled {
     color: #44444c;
     border-color: #222228;
 }
+QPushButton#KeybindBtn {
+    background-color: #1a1a24;
+    border: 1px solid #363645;
+    border-radius: 4px;
+    color: #d1b87a;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 0 10px;
+}
+QPushButton#KeybindBtn:hover {
+    background-color: #242433;
+    border-color: #d1b87a;
+}
+QPushButton#KeybindBtn[listening="true"] {
+    background-color: #2b2510;
+    border: 2px solid #d1b87a;
+    border-radius: 4px;
+    color: #ffd700;
+    font-weight: 700;
+    font-size: 12px;
+}
 QMessageBox, QDialog {
     background-color: #111113;
 }
@@ -584,7 +583,7 @@ class LauncherUI:
         tb_layout.addWidget(lbl_win_title)
         tb_layout.addStretch()
 
-        btn_min = QPushButton("\u2014")
+        btn_min = QPushButton("\u2212")
         btn_min.setObjectName("WinBtn")
         btn_min.setFixedSize(46, 36)
         btn_min.clicked.connect(self.showMinimized)
@@ -600,8 +599,10 @@ class LauncherUI:
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self.create_home_tab())
-        self.stack.addWidget(self.create_patches_tab())
-        self.stack.addWidget(self.create_settings_tab())
+        self.patches_placeholder = QWidget()
+        self.settings_placeholder = QWidget()
+        self.stack.addWidget(self.patches_placeholder)
+        self.stack.addWidget(self.settings_placeholder)
         right_layout.addWidget(self.stack, 1)
 
         root_layout.addWidget(right_panel, 1)
@@ -621,6 +622,10 @@ class LauncherUI:
         super().mousePressEvent(event)
 
     def switch_tab(self, idx: int):
+        if idx == 1 and hasattr(self, "_build_patches_tab_now"):
+            self._build_patches_tab_now()
+        elif idx == 2 and hasattr(self, "_build_settings_tab_now"):
+            self._build_settings_tab_now()
         self.btn_home.setChecked(idx == 0)
         self.btn_patches.setChecked(idx == 1)
         self.btn_settings.setChecked(idx == 2)
@@ -906,8 +911,10 @@ class LauncherUI:
         self.cmb_upscaler = QComboBox()
         for label, _ in UPSCALER_CHOICES:
             self.cmb_upscaler.addItem(label)
-        self.cmb_upscaler.setCurrentText(self.settings.get("upscaler_model", UPSCALER_CHOICES[0][0]))
-        self.cmb_upscaler.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+        init_upscaler = self.settings.get("upscaler_model", "Off")
+        if not self.settings.get("feat_upscaler", False) and init_upscaler != "Off":
+            init_upscaler = "Off"
+        self.cmb_upscaler.setCurrentText(init_upscaler)
         grid_disp.addWidget(self.cmb_upscaler, 3, 1)
 
         l_disp.addLayout(grid_disp)
@@ -917,9 +924,29 @@ class LauncherUI:
         row_flags.setVerticalSpacing(8)
 
         self.chk_fsr = QCheckBox("Enable Temporal Upscaler")
-        self.chk_fsr.setChecked(self.settings.get("feat_upscaler", False))
-        self.chk_fsr.toggled.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+        self.chk_fsr.setChecked(self.settings.get("feat_upscaler", False) and init_upscaler != "Off")
         row_flags.addWidget(self.chk_fsr, 0, 0)
+
+        def on_upscaler_combo_changed():
+            active = self.cmb_upscaler.currentText() != "Off"
+            self.chk_fsr.blockSignals(True)
+            self.chk_fsr.setChecked(active)
+            self.chk_fsr.blockSignals(False)
+            self.save_settings()
+            self.save_bbport_ini()
+
+        def on_chk_fsr_toggled(checked):
+            self.cmb_upscaler.blockSignals(True)
+            if not checked:
+                self.cmb_upscaler.setCurrentText("Off")
+            elif self.cmb_upscaler.currentText() == "Off":
+                self.cmb_upscaler.setCurrentText("FSR 3.1")
+            self.cmb_upscaler.blockSignals(False)
+            self.save_settings()
+            self.save_bbport_ini()
+
+        self.cmb_upscaler.currentIndexChanged.connect(on_upscaler_combo_changed)
+        self.chk_fsr.toggled.connect(on_chk_fsr_toggled)
 
         self.chk_fps_patch = QCheckBox("Engine Framerate Patch (60/90/Uncap)")
         self.chk_fps_patch.setChecked(self.settings.get("feat_fps_patch", True))
@@ -1023,6 +1050,11 @@ class LauncherUI:
         row_kb_header.addWidget(lbl_kb)
         row_kb_header.addStretch()
 
+        btn_save_ini = QPushButton("Save Input Parameters to bbport.ini")
+        btn_save_ini.setObjectName("SecondaryBtn")
+        btn_save_ini.clicked.connect(self.save_bbport_ini)
+        row_kb_header.addWidget(btn_save_ini)
+
         btn_reset_kb = QPushButton("Reset Keybinds to Defaults")
         btn_reset_kb.setObjectName("SecondaryBtn")
         btn_reset_kb.clicked.connect(self.reset_keybinds_to_defaults)
@@ -1050,11 +1082,6 @@ class LauncherUI:
             grid_kb.addWidget(btn_kb, row, 1)
 
         l_mk.addLayout(grid_kb)
-
-        btn_save_ini = QPushButton("Save Input Parameters to bbport.ini")
-        btn_save_ini.setObjectName("SecondaryBtn")
-        btn_save_ini.clicked.connect(self.save_bbport_ini)
-        l_mk.addWidget(btn_save_ini)
 
         c_layout.addWidget(card_mk)
         c_layout.addStretch()
