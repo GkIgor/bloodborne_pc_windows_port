@@ -154,6 +154,40 @@ static ABI int64_t posix_time(int64_t *out) { int64_t t=(int64_t)time(NULL); if 
 static ABI int32_t get_pagesize(void) { return PAGE; }
 static ABI int32_t get_pid(void) { return 1000; }
 static ABI int32_t yield(void) { host_yield(); return 0; }
+static ABI void raise_exception(uint32_t code,uint64_t argument) {
+    /* The renderer's own debug assertions on blur-kernel sample counts (Yebis, GPUMath.cpp 3199 and
+     * GPUTextureUtil.cpp 18141: "nBaseSamples >= 3", "nSamples >= 2"; a game-data value that
+     * got small, seen at +0xbbc429 and +0xc33efe). The code after the check goes on with the
+     * value, so a retail build just continued: logged, and the game goes on.
+     * BB_GAME_ASSERT_STOP=1 stops as before. */
+    {
+        const uint64_t base=0x800000000ull, hi=base+0x50d96dcull;
+        /* The call goes through an import stub: the first game address up the stack is the site. */
+        const uint64_t *frame=(const uint64_t *)__builtin_frame_address(0);
+        uint64_t at=0;
+        for (int i=0;i<64 && !at;++i) if (frame[i]>=base && frame[i]<hi) at=frame[i]-base;
+        static int stop=-1, told;
+        if (stop<0) { const char *e=getenv("BB_GAME_ASSERT_STOP"); stop=e && e[0]=='1'; }
+        if (!stop && code==0xa0020007u && ((at>=0xbbc3e0 && at<0xbbc700) || (at>=0xc33000 && at<0xc34200))) {
+            if (told++<5) printf("Runtime: the game's blur-kernel assertion at +0x%llx ignored (BB_GAME_ASSERT_STOP=1: stop)\n",(unsigned long long)at);
+            return;
+        }
+    }
+    fprintf(stderr,"STOP: guest raised debug exception code=0x%x argument=0x%llx\n",code,(unsigned long long)argument);
+    /* Who raised it: the caller and the game's return addresses further up this thread's stack. */
+    const uint64_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
+    const uint64_t caller=(uint64_t)__builtin_return_address(0);
+    fprintf(stderr,"STOP: called from %s0x%llx; game code up the stack:",
+            caller>=text_lo && caller<text_hi ? "+" : "host ",
+            (unsigned long long)(caller>=text_lo && caller<text_hi ? caller-text_lo : caller));
+    const uint64_t *stack=(const uint64_t *)__builtin_frame_address(0);
+    for (int i=0,found=0;i<256 && found<12;++i)
+        if (stack[i]>=text_lo && stack[i]<text_hi) { fprintf(stderr," +0x%llx",(unsigned long long)(stack[i]-text_lo)); ++found; }
+    fprintf(stderr,"\n");
+    runtime_report();
+    fflush(NULL);
+    exit(23);
+}
 static ABI __attribute__((noreturn)) void hard_exit(int status) {
     printf("Runtime: guest requested _exit(%d)\n",status);
     runtime_report();
@@ -322,6 +356,8 @@ static const RuntimeExport exports[]={
     {"QcteRwbsnV0#I#J",posix_usleep},
     {"0wu33hunNdE#I#J",posix_sleep},
     {"FJrT5LuUBAU#I#J",hard_exit},
+    {"OMDRKKAZ8I4#p#J",raise_exception},
+    {"zE-wXIZjLoM#p#J",raise_exception},
     {"DFmMT80xcNI#p#J",guest_sysctl},
 
     /* Alternate NIDs & plain symbol names */
@@ -370,6 +406,8 @@ static const RuntimeExport exports[]={
     {"gettimeofday",posix_gettimeofday},
     {"time",posix_time},
     {"sysctl",guest_sysctl},
+    {"sceKernelDebugRaiseException",raise_exception},
+    {"sceKernelDebugRaiseExceptionOnReleaseMode",raise_exception},
     {"pthread_key_create",posix_key_create},
     {"pthread_key_delete",posix_key_delete},
     {"pthread_setspecific",posix_key_set},

@@ -31,10 +31,12 @@ from bblauncher_Utils import (
     DEFAULT_KEYBINDS,
     FPS_CHOICES,
     KEYBINDINGS,
+    LANGUAGE_CHOICES,
     PREP_WORKER_CHOICES,
     RES_CHOICES,
     UPSCALER_CHOICES,
     WINDOW_MODE_CHOICES,
+    connected_gpus,
 )
 
 
@@ -833,6 +835,30 @@ class LauncherUI:
         w.setUpdatesEnabled(True)
         return w
 
+    def fill_gpu_choices(self):
+        if not hasattr(self, "cmb_gpu"):
+            return
+        self.cmb_gpu.blockSignals(True)
+        self.cmb_gpu.clear()
+        gpus = connected_gpus()
+        best_name = next((name for _, _, _, name, best in gpus if best), "")
+        auto_label = f"Auto (Default: {best_name})" if best_name else "Auto (Default)"
+        self.cmb_gpu.addItem(auto_label, "")
+        for idx, vendor, kind, name, best in gpus:
+            note = f" ({kind})" if kind in ("integrated", "cpu") else ""
+            self.cmb_gpu.addItem(f"{name}{note}", name)
+        cur_gpu = self.settings.get("gpu", "")
+        if cur_gpu:
+            idx = self.cmb_gpu.findData(cur_gpu)
+            if idx >= 0:
+                self.cmb_gpu.setCurrentIndex(idx)
+            else:
+                self.cmb_gpu.addItem(f"{cur_gpu} (Not detected)", cur_gpu)
+                self.cmb_gpu.setCurrentIndex(self.cmb_gpu.count() - 1)
+        else:
+            self.cmb_gpu.setCurrentIndex(0)
+        self.cmb_gpu.blockSignals(False)
+
     def create_settings_tab(self) -> QWidget:
         w = QWidget()
         w.setObjectName("ScrollContent")
@@ -916,6 +942,22 @@ class LauncherUI:
             init_upscaler = "Off"
         self.cmb_upscaler.setCurrentText(init_upscaler)
         grid_disp.addWidget(self.cmb_upscaler, 3, 1)
+
+        grid_disp.addWidget(QLabel("GPU Adapter:"), 3, 2)
+        self.cmb_gpu = QComboBox()
+        self.fill_gpu_choices()
+        self.cmb_gpu.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+        grid_disp.addWidget(self.cmb_gpu, 3, 3)
+
+        grid_disp.addWidget(QLabel("Game Text Language:"), 4, 0)
+        self.cmb_lang = QComboBox()
+        for label, code in LANGUAGE_CHOICES:
+            self.cmb_lang.addItem(label, code)
+        cur_lang = self.settings.get("language", "1")
+        lang_idx = next((i for i, (_, c) in enumerate(LANGUAGE_CHOICES) if c == cur_lang), 0)
+        self.cmb_lang.setCurrentIndex(lang_idx)
+        self.cmb_lang.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+        grid_disp.addWidget(self.cmb_lang, 4, 1)
 
         l_disp.addLayout(grid_disp)
 

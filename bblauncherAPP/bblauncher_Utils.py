@@ -58,6 +58,49 @@ PREP_WORKER_CHOICES = [
 VK_NOISE = "<Warning> vk_instance.cpp"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+# All 21 text languages supported by Bloodborne (PS4 system language code)
+LANGUAGE_CHOICES = [
+    ("English (United States)", "1"),
+    ("English (United Kingdom)", "18"),
+    ("Russian", "8"),
+    ("Japanese", "0"),
+    ("French", "2"),
+    ("Spanish (Spain)", "3"),
+    ("Spanish (Latin America)", "20"),
+    ("German", "4"),
+    ("Italian", "5"),
+    ("Dutch", "6"),
+    ("Portuguese (Portugal)", "7"),
+    ("Portuguese (Brazil)", "17"),
+    ("Polish", "16"),
+    ("Turkish", "19"),
+    ("Korean", "9"),
+    ("Traditional Chinese", "10"),
+    ("Simplified Chinese", "11"),
+    ("Finnish", "12"),
+    ("Swedish", "13"),
+    ("Danish", "14"),
+    ("Norwegian", "15"),
+]
+
+def connected_gpus(app_dir: Path = APP_DIR) -> list:
+    """(index, vendor_id, type, name, is_best) of GPUs in Vulkan order via bb-gpu-capabilities.exe --gpus"""
+    candidates = [
+        app_dir / "out" / "bb-gpu-capabilities.exe",
+        app_dir / "bb-gpu-capabilities.exe",
+        app_dir / "tools" / "bb-gpu-capabilities.exe",
+    ]
+    tool = next((c for c in candidates if c.is_file()), None)
+    if not tool:
+        return []
+    env = {k: v for k, v in os.environ.items() if k != "BB_GPU_ID"}
+    try:
+        res = subprocess.run([str(tool), "--gpus"], capture_output=True, text=True, timeout=8, env=env, creationflags=NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = [ln.split("\t") for ln in res.stdout.splitlines() if ln.count("\t") == 4]
+    return [(int(idx), vendor, kind, name, best == "1") for idx, vendor, kind, name, best in rows if idx.isdigit()]
+
 DEFAULT_SETTINGS = {
     "eboot": "",
     "fps": "60",
@@ -65,6 +108,8 @@ DEFAULT_SETTINGS = {
     "aniso": "16x",
     "prep_workers": PREP_WORKER_CHOICES[0][0],
     "anti_aliasing": AA_CHOICES[0],
+    "gpu": "",
+    "language": "1",
     "mods": False,
     "hide_vk": True,
     "feat_upscaler": False,

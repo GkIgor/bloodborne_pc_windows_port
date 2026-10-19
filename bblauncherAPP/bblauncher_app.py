@@ -33,6 +33,7 @@ from bblauncher_Utils import (
     VK_NOISE,
     ProcessWorker,
     acquire_single_instance,
+    connected_gpus,
     get_bb_guard,
     load_xml_patches,
     resolve_game_dir,
@@ -147,6 +148,8 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "aniso": self.cmb_aniso.currentText(),
                 "prep_workers": self.cmb_prep_workers.currentText(),
                 "anti_aliasing": self.cmb_aa.currentText(),
+                "gpu": self.cmb_gpu.currentData() if hasattr(self, "cmb_gpu") else self.settings.get("gpu", ""),
+                "language": self.cmb_lang.currentData() if hasattr(self, "cmb_lang") else self.settings.get("language", "1"),
                 "mods": self.chk_mods.isChecked(),
                 "hide_vk": self.chk_vk_noise.isChecked(),
                 "feat_upscaler": is_fsr,
@@ -217,11 +220,16 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 prep_workers_val = val
                 break
 
+        gpu_choice = self.cmb_gpu.currentData() if hasattr(self, "cmb_gpu") else self.settings.get("gpu", "")
+        lang_choice = self.cmb_lang.currentData() if hasattr(self, "cmb_lang") else self.settings.get("language", "1")
+
         keys_to_update = {
             "upscaler": upscaler_val,
             "output_res": output_res_val,
             "effect_game_aa": effect_game_aa,
             "prep_workers": prep_workers_val,
+            "gpu": gpu_choice if gpu_choice else "",
+            "language": lang_choice if lang_choice else "1",
             "mk_enabled": "1" if self.chk_mk_enabled.isChecked() else "0",
             "mk_native_mouse": "1",
             "mk_sens_x": f"{self.sl_sens_x.value() / 100:.2f}",
@@ -623,6 +631,18 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             env["BB_PREP_WORKERS"] = prep_val
         else:
             env.pop("BB_PREP_WORKERS", None)
+
+        chosen_gpu = cfg.get("gpu", "")
+        if chosen_gpu and "BB_GPU_ID" not in os.environ:
+            gpu_idx = next((idx for idx, _vendor, _kind, name, _best in connected_gpus(APP_DIR) if name == chosen_gpu), None)
+            if gpu_idx is not None:
+                env["BB_GPU_ID"] = str(gpu_idx)
+            else:
+                env.pop("BB_GPU_ID", None)
+
+        lang_code = cfg.get("language", "1")
+        if lang_code:
+            env["BB_LANGUAGE"] = str(lang_code)
 
         active_patches = list(cfg["enabled_patches"])
         if ("Disable" in aa_mode or "TAA" in aa_mode) and "Disable AA" not in active_patches:

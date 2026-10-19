@@ -93,6 +93,22 @@ int main(int argc, char **argv) {
         vkDestroyInstance(instance, NULL);
         return 1;
     }
+    if (argc > 1 && !strcmp(argv[1], "--gpus")) {
+        VkPhysicalDevice best = devices[0];
+        for (uint32_t i = 1; i < count; ++i)
+            if (better_device(devices[i], best)) best = devices[i];
+        static const char *const types[] = {"other", "integrated", "discrete", "virtual", "cpu"};
+        for (uint32_t i = 0; i < count; ++i) {
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(devices[i], &props);
+            const unsigned type = props.deviceType <= VK_PHYSICAL_DEVICE_TYPE_CPU ? props.deviceType : 0;
+            printf("%u\t%#06x\t%s\t%s\t%d\n", i, props.vendorID, types[type], props.deviceName,
+                   devices[i] == best);
+        }
+        free(devices);
+        vkDestroyInstance(instance, NULL);
+        return 0;
+    }
     /* Match vk_instance.cpp's default ranking or its explicit BB_GPU_ID index. */
     VkPhysicalDevice selected = devices[0];
     const char *gpu_id = getenv("BB_GPU_ID");

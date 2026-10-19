@@ -2530,7 +2530,7 @@ int main(int argc, char **argv) {
             is_unbound[i] = 1;
         }
     }
-    unsigned char *thunks = allocate(round_page((import_count + 1) * 32));
+    unsigned char *thunks = allocate(round_page((import_count + 16) * 32));
     unsigned char *data_traps = allocate((import_count + 1) * page_size);
     protect(data_traps, (import_count + 1) * page_size, 0);
     for (uint64_t i = 0; i < import_count; ++i) {
@@ -2653,7 +2653,50 @@ int main(int argc, char **argv) {
         } while (0);
     }
 
-    protect(thunks, round_page((import_count + 1) * 32), 5);
+    /* Blur-kernel sample count clamp (0xa0020007 / crash 23 guard at GPUTexUtil_GetRecursiveSampleParameters, 0xbbc3e0) */
+    do {
+        const char *clamp_env = getenv("BB_KERNEL_CLAMP");
+        if (clamp_env && clamp_env[0] == '0') break;
+        if (size <= 0xbbc3e0 + 6) break;
+        static const unsigned char expected_entry[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+        if (memcmp(image + 0xbbc3e0, expected_entry, sizeof(expected_entry)) != 0) {
+            printf("Guest hooks: blur-kernel sample count clamp not installed (unmatched signature)\n");
+            break;
+        }
+        unsigned char *t = thunks + (import_count + 1) * 32;
+        /* Thunk implementation:
+         * 83 ff 03                cmp    $0x3, %edi
+         * 7d 05                   jge    over
+         * bf 03 00 00 00          mov    $0x3, %edi
+         * 55 48 89 e5 41 57       (over: entry instructions)
+         * ff 25 00 00 00 00       jmp    *(%rip)
+         * <8-byte return address> (image + 0xbbc3e0 + 6)
+         */
+        unsigned char stub[30] = {
+            0x83, 0xff, 0x03,
+            0x7d, 0x05,
+            0xbf, 0x03, 0x00, 0x00, 0x00,
+            0x55, 0x48, 0x89, 0xe5, 0x41, 0x57,
+            0xff, 0x25, 0x00, 0x00, 0x00, 0x00,
+            0, 0, 0, 0, 0, 0, 0, 0
+        };
+        uint64_t return_addr = (uint64_t)(image + 0xbbc3e0 + 6);
+        memcpy(stub + 22, &return_addr, 8);
+        memcpy(t, stub, sizeof(stub));
+
+        int64_t disp = (int64_t)t - (int64_t)(image + 0xbbc3e0 + 5);
+        if (disp < INT32_MIN || disp > INT32_MAX) {
+            printf("Guest hooks: blur-kernel clamp thunk displacement out of 32-bit range\n");
+            break;
+        }
+        int32_t rel = (int32_t)disp;
+        unsigned char jmp_over[6] = {0xe9, 0, 0, 0, 0, 0x90};
+        memcpy(jmp_over + 1, &rel, 4);
+        memcpy(image + 0xbbc3e0, jmp_over, sizeof(jmp_over));
+        printf("Guest hooks: blur-kernel sample count clamp on (GPUTexUtil_GetRecursiveSampleParameters +0xbbc3e0)\n");
+    } while (0);
+
+    protect(thunks, round_page((import_count + 16) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;
     for (uint64_t i = 0; i < ns; ++i) {
