@@ -97,11 +97,40 @@ int native_camera_is_active(void) {
 extern void bbgpu_get_mk_tuning(float *responsiveness, float *acceleration);
 void (ABI *orig_cam_update)(void *cam, void *r14, void *r15) = NULL;
 
-void host_native_mouse_inject(void *cam, void *rsi_ctx) {
+/* Turn speeds (rad/s) for stick input below full tilt: pitch base/max, yaw base/max. */
+static const unsigned k_cam_speed_offs[4] = { 0x20c, 0x214, 0x210, 0x218 };
+static uintptr_t g_boosted_cam;
+static float g_saved_speed[4];
+
+/* The pad leaves the stick buffer untouched in some states (loading), so our last offset is removed if still there. */
+static float *g_stick_buf;
+static float g_stick_added[2], g_stick_left[2];
+
+/* Right-stick buffer the camera update reads (rsi_ctx->0x58->0x280, or ->0x80, + 0x40): x = pitch, y = yaw. */
+static float *camera_stick_buf(void *rsi_ctx) {
+    if (!rsi_ctx || (uintptr_t)rsi_ctx <= 0x10000) return NULL;
+    uintptr_t rcx_ptr = *(uintptr_t*)((uintptr_t)rsi_ctx + 0x58);
+    if (rcx_ptr <= 0x10000) return NULL;
+    uintptr_t rax_val = *(uintptr_t*)(rcx_ptr + 0x280);
+    if (!rax_val) rax_val = *(uintptr_t*)(rcx_ptr + 0x80);
+    if (rax_val <= 0x10000) return NULL;
+    return (float*)(rax_val + 0x40);
+}
+
+void host_native_mouse_inject(void *cam, void *rsi_ctx, float dt) {
     g_native_cam_fire_count++;
-    if (!native_camera_is_active() || !cam) return;
     uintptr_t cam_addr = (uintptr_t)cam;
     if (cam_addr < 0x10000) return;
+    if (g_boosted_cam == cam_addr)
+        for (int i = 0; i < 4; ++i) *(float*)(cam_addr + k_cam_speed_offs[i]) = g_saved_speed[i];
+    g_boosted_cam = 0;
+    float *stick = camera_stick_buf(rsi_ctx);
+    if (stick && stick == g_stick_buf && stick[0] == g_stick_left[0] && stick[1] == g_stick_left[1]) {
+        stick[0] -= g_stick_added[0];
+        stick[1] -= g_stick_added[1];
+    }
+    g_stick_buf = NULL;
+    if (!native_camera_is_active()) return;
 
     const uint8_t lock_on_byte = *(volatile uint8_t*)(cam_addr + 0x260);
     const int captured = bbgpu_mouse_captured();
@@ -162,50 +191,28 @@ void host_native_mouse_inject(void *cam, void *rsi_ctx) {
     const float delta_yaw   = (inv_x ? -1.0f : 1.0f) * dx * sens_x * base_sens;
     const float delta_pitch = (inv_y ? -1.0f : 1.0f) * dy * sens_y * base_sens;
 
-    /* 1. Direct Angle Injection (+0x140 pitch, +0x144 yaw) */
-    float pitch = *(float*)(cam_addr + 0x140);
-    float yaw   = *(float*)(cam_addr + 0x144);
-    float min_p = *(float*)(cam_addr + 0x1f0);
-    float max_p = *(float*)(cam_addr + 0x1ec);
-    if (min_p >= max_p || min_p < -3.14159f || max_p > 3.14159f) {
-        min_p = -0.6981317f; /* -40 deg */
-        max_p =  1.2217305f; /* +70 deg */
+    /* The engine rebuilds pitch/yaw from the camera position each update, so only the stick moves it.
+     * Above |stick| 0.998 it turns at a fixed rate that ramps up while held and resets on reversal;
+     * below, it turns by stick * speed * dt. Use a half-tilt stick and set speed so that equals the delta;
+     * the original speeds are restored at the next update. */
+    if (!stick) return;
+    if (!(dt > 0.0f && dt < 0.5f)) dt = 1.0f / 30.0f;
+
+    for (int i = 0; i < 4; ++i) g_saved_speed[i] = *(float*)(cam_addr + k_cam_speed_offs[i]);
+    g_boosted_cam = cam_addr;
+    const float delta[2] = { delta_pitch, delta_yaw };
+    for (int axis = 0; axis < 2; ++axis) {
+        g_stick_added[axis] = 0.0f;
+        if (delta[axis] == 0.0f) continue;
+        const float speed = 2.0f * fabsf(delta[axis]) / dt;
+        *(float*)(cam_addr + k_cam_speed_offs[2 * axis]) = speed;
+        *(float*)(cam_addr + k_cam_speed_offs[2 * axis + 1]) = speed;
+        g_stick_added[axis] = delta[axis] > 0.0f ? 0.5f : -0.5f;
+        stick[axis] += g_stick_added[axis];
     }
-
-    pitch += delta_pitch;
-    if (pitch < min_p) pitch = min_p;
-    if (pitch > max_p) pitch = max_p;
-
-    yaw += delta_yaw;
-    const float pi_val = 3.14159265358979323846f;
-    const float two_pi = 6.28318530717958647692f;
-    while (yaw > pi_val) yaw -= two_pi;
-    while (yaw < -pi_val) yaw += two_pi;
-
-    *(float*)(cam_addr + 0x140) = pitch;
-    *(float*)(cam_addr + 0x144) = yaw;
-    *(float*)(cam_addr + 0x150) = pitch;
-    *(float*)(cam_addr + 0x26c) = pitch;
-    *(float*)(cam_addr + 0x270) = yaw;
-
-    /* 2. Dynamic Controller Stick Vector Injection
-     * Following disassembly at 0x183b85a:
-     * rcx = rsi_ctx->0x58
-     * rax = rcx->0x280 (or rcx->0x80)
-     * buffer = rax + 0x40 (xmm3: X=pitch, Y=yaw) */
-    if (rsi_ctx && (uintptr_t)rsi_ctx > 0x10000) {
-        uintptr_t *rcx_ptr = *(uintptr_t**)((uintptr_t)rsi_ctx + 0x58);
-        if (rcx_ptr && (uintptr_t)rcx_ptr > 0x10000) {
-            uintptr_t rax_val = *(uintptr_t*)((uintptr_t)rcx_ptr + 0x280);
-            if (!rax_val) rax_val = *(uintptr_t*)((uintptr_t)rcx_ptr + 0x80);
-            if (rax_val && rax_val > 0x10000) {
-                float *stick_buf = (float*)(rax_val + 0x40);
-                stick_buf[0] += delta_pitch * 25.0f;
-                stick_buf[1] += delta_yaw   * 25.0f;
-                *(uint8_t*)(cam_addr + 0x15c) = 1;
-            }
-        }
-    }
+    g_stick_buf = stick;
+    g_stick_left[0] = stick[0];
+    g_stick_left[1] = stick[1];
 }
 
 __attribute__((naked)) void guest_camera_update_thunk(void) {
@@ -242,6 +249,7 @@ __attribute__((naked)) void guest_camera_update_thunk(void) {
         /* 1. Inject mouse deltas into camera stick buffer and angles before update runs */
         "mov 328(%%rsp), %%rcx\n\t" /* saved rdi (cam) -> Windows arg0 (rcx) */
         "mov 336(%%rsp), %%rdx\n\t" /* saved rsi (ctx) -> Windows arg1 (rdx) */
+        "movss 32(%%rsp), %%xmm2\n\t" /* guest xmm0 (frame dt) -> Windows arg2 (xmm2) */
         "call host_native_mouse_inject\n\t"
 
         /* 2. Restore all registers and pass through to original camera update */
