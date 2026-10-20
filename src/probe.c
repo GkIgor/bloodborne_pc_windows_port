@@ -119,6 +119,18 @@ static float *camera_stick_buf(void *rsi_ctx) {
 
 void host_native_mouse_inject(void *cam, void *rsi_ctx, float dt) {
     g_native_cam_fire_count++;
+    uintptr_t expected_orig = (uintptr_t)image + 0x143ac60;
+    if ((uintptr_t)orig_cam_update < (uintptr_t)image ||
+        (uintptr_t)orig_cam_update >= (uintptr_t)image + (image_size ? image_size : 0x20000000)) {
+        static int s_logged_bad_orig = 0;
+        if (!s_logged_bad_orig) {
+            s_logged_bad_orig = 1;
+            fprintf(stderr, "[NATIVE MOUSE GUARD] Corrupted orig_cam_update pointer (%p), resetting to %p\n",
+                    (void*)orig_cam_update, (void*)expected_orig);
+            fflush(stderr);
+        }
+        orig_cam_update = (void (ABI *)(void*, void*, void*))expected_orig;
+    }
     uintptr_t cam_addr = (uintptr_t)cam;
     if (cam_addr < 0x10000) return;
     if (g_boosted_cam == cam_addr)
@@ -1462,13 +1474,15 @@ static int emulate_lzcnt_site(CONTEXT *ctx, uintptr_t rip) {
         uint64_t res = 0;
         if (src_val == 0) {
             res = 64;
-            ctx->EFlags |= 0x01; // CF = 1
+            ctx->EFlags |= 0x01;  // CF = 1
             ctx->EFlags &= ~0x40; // ZF = 0
         } else {
             unsigned long bit_idx = 0;
             _BitScanReverse64(&bit_idx, src_val);
             res = 63 - bit_idx;
-            ctx->EFlags &= ~(0x01 | 0x40);
+            ctx->EFlags &= ~0x01; // CF = 0
+            if (res == 0) ctx->EFlags |= 0x40;  // ZF = 1
+            else          ctx->EFlags &= ~0x40; // ZF = 0
         }
         *regs[dest_idx] = res;
     } else {
@@ -1476,13 +1490,15 @@ static int emulate_lzcnt_site(CONTEXT *ctx, uintptr_t rip) {
         uint32_t res = 0;
         if (val32 == 0) {
             res = 32;
-            ctx->EFlags |= 0x01;
-            ctx->EFlags &= ~0x40;
+            ctx->EFlags |= 0x01;  // CF = 1
+            ctx->EFlags &= ~0x40; // ZF = 0
         } else {
             unsigned long bit_idx = 0;
             _BitScanReverse(&bit_idx, val32);
             res = 31 - bit_idx;
-            ctx->EFlags &= ~(0x01 | 0x40);
+            ctx->EFlags &= ~0x01; // CF = 0
+            if (res == 0) ctx->EFlags |= 0x40;  // ZF = 1
+            else          ctx->EFlags &= ~0x40; // ZF = 0
         }
         *regs[dest_idx] = (uint64_t)res;
     }
@@ -1520,109 +1536,6 @@ static void patch_non_bmi1(unsigned char *img, uint64_t total_size, Segment *seg
                 }
 
                 if (lzcnt_len > 0) {
-                    int mod = modrm >> 6;
-                    int rm = modrm & 7;
-                    int reg = (modrm >> 3) & 7;
-                    int r_bit = rex ? ((rex >> 2) & 1) : 0;
-                    int b_bit = rex ? (rex & 1) : 0;
-                    int tmp_reg = reg | (r_bit << 3);
-                    int src_reg = rm | (b_bit << 3);
-                    uint64_t cur = idx + lzcnt_len;
-                    if (mod != 3) {
-                        if (rm == 4) {
-                            unsigned char sib = img[cur++];
-                            lzcnt_len++;
-                            if (mod == 0 && (sib & 7) == 5) { cur += 4; lzcnt_len += 4; }
-                        } else if (mod == 0 && rm == 5) {
-                            cur += 4;
-                            lzcnt_len += 4;
-                        }
-                        if (mod == 1) { cur += 1; lzcnt_len += 1; }
-                        else if (mod == 2) { cur += 4; lzcnt_len += 4; }
-                    }
-
-                    // Check for Allocator pattern: lzcnt tmp, src; mov dest, 0x3f/0x1f; sub dest, tmp
-                    int is_pattern = 0;
-                    uint64_t p1 = idx + lzcnt_len;
-                    int mov_len = 0;
-                    uint32_t mov_val = 0;
-                    int mov_reg = 0;
-                    int mrex = 0;
-                    if (p1 + 8 < seg_end) {
-                        if (img[p1] >= 0xB8 && img[p1] <= 0xBF) {
-                            mov_reg = img[p1] - 0xB8;
-                            memcpy(&mov_val, &img[p1 + 1], 4);
-                            mov_len = 5;
-                        } else if ((img[p1] & 0xF0) == 0x40 && img[p1 + 1] >= 0xB8 && img[p1 + 1] <= 0xBF) {
-                            mrex = img[p1];
-                            mov_reg = (img[p1 + 1] - 0xB8) | ((mrex & 1) << 3);
-                            memcpy(&mov_val, &img[p1 + 2], 4);
-                            mov_len = 6;
-                        }
-
-                        if (mov_len > 0 && (mov_val == 0x3F || mov_val == 0x1F) && mod == 3) {
-                            uint64_t p2 = p1 + mov_len;
-                            int srex = 0;
-                            int sub_len = 0;
-                            unsigned char sub_modrm = 0;
-                            unsigned char opcode = 0;
-                            if ((img[p2] & 0xF0) == 0x40 && (img[p2 + 1] == 0x29 || img[p2 + 1] == 0x2B)) {
-                                srex = img[p2];
-                                opcode = img[p2 + 1];
-                                sub_modrm = img[p2 + 2];
-                                sub_len = 3;
-                            } else if (img[p2] == 0x29 || img[p2] == 0x2B) {
-                                opcode = img[p2];
-                                sub_modrm = img[p2 + 1];
-                                sub_len = 2;
-                            }
-
-                            if (sub_len > 0 && (sub_modrm >> 6) == 3) {
-                                int s_r = ((sub_modrm >> 3) & 7) | (srex ? (((srex >> 2) & 1) << 3) : 0);
-                                int s_b = (sub_modrm & 7) | (srex ? ((srex & 1) << 3) : 0);
-                                if (opcode == 0x29 && s_b == mov_reg && s_r == tmp_reg) {
-                                    is_pattern = 1;
-                                } else if (opcode == 0x2B && s_r == mov_reg && s_b == tmp_reg) {
-                                    is_pattern = 1;
-                                }
-                            }
-
-                            if (is_pattern) {
-                                int is_64 = (mov_val == 0x3F);
-                                int dest_reg = mov_reg;
-                                uint64_t total_len = lzcnt_len + mov_len + sub_len;
-                                int bsr_len = 0;
-                                unsigned char bsr_bytes[4];
-                                int d_bit = (dest_reg >= 8) ? 1 : 0;
-                                int s_bit = (src_reg >= 8) ? 1 : 0;
-                                if (is_64) {
-                                    bsr_bytes[0] = 0x48 | (d_bit << 2) | s_bit;
-                                    bsr_bytes[1] = 0x0F;
-                                    bsr_bytes[2] = 0xBD;
-                                    bsr_bytes[3] = 0xC0 | ((dest_reg & 7) << 3) | (src_reg & 7);
-                                    bsr_len = 4;
-                                } else if (d_bit || s_bit) {
-                                    bsr_bytes[0] = 0x40 | (d_bit << 2) | s_bit;
-                                    bsr_bytes[1] = 0x0F;
-                                    bsr_bytes[2] = 0xBD;
-                                    bsr_bytes[3] = 0xC0 | ((dest_reg & 7) << 3) | (src_reg & 7);
-                                    bsr_len = 4;
-                                } else {
-                                    bsr_bytes[0] = 0x0F;
-                                    bsr_bytes[1] = 0xBD;
-                                    bsr_bytes[2] = 0xC0 | ((dest_reg & 7) << 3) | (src_reg & 7);
-                                    bsr_len = 3;
-                                }
-                                memcpy(img + idx, bsr_bytes, bsr_len);
-                                fill_nops(img + idx + bsr_len, total_len - bsr_len);
-                                bsr_patched++;
-                                idx += total_len;
-                                continue;
-                            }
-                        }
-                    }
-
-                    // Standalone LZCNT -> replace first 2 bytes with UD2 (0x0F 0x0B)
                     if (s_num_lzcnt_sites < MAX_LZCNT_SITES && lzcnt_len <= 10) {
                         LzcntPatchSite *site = &s_lzcnt_sites[s_num_lzcnt_sites++];
                         site->addr = (uintptr_t)(img + idx);
@@ -1644,8 +1557,7 @@ static void patch_non_bmi1(unsigned char *img, uint64_t total_size, Segment *seg
         qsort(s_lzcnt_sites, s_num_lzcnt_sites, sizeof(LzcntPatchSite), compare_lzcnt_sites);
     }
 
-    printf("Non-BMI1 CPU optimizations applied: %u allocator BSR patches, %u standalone LZCNT UD2 traps\n",
-           bsr_patched, ud2_patched);
+    printf("Non-BMI1 CPU optimizations applied: %u LZCNT UD2 traps installed\n", ud2_patched);
 }
 
 static int emulate_bmi1(CONTEXT *ctx) {
@@ -1759,27 +1671,51 @@ static int emulate_bmi1(CONTEXT *ctx) {
         if (w) {
             uint64_t src = src2_val;
             uint64_t res = 0;
-            if (subop == 3) res = (-src) & src; // BLSI
-            else if (subop == 2) res = (src - 1) ^ src; // BLSMSK
-            else if (subop == 1) res = (src - 1) & src; // BLSR
-            else return 0;
+            int cf = 0, zf = 0;
+            if (subop == 3) { // BLSI
+                res = (-src) & src;
+                cf = (src != 0);
+                zf = (res == 0);
+            } else if (subop == 2) { // BLSMSK
+                res = (src - 1) ^ src;
+                cf = (src == 0);
+                zf = 0;
+            } else if (subop == 1) { // BLSR
+                res = (src - 1) & src;
+                cf = (src == 0);
+                zf = (res == 0);
+            } else {
+                return 0;
+            }
             *regs[dest_idx] = res;
             ctx->EFlags &= ~(0x800 | 0x80 | 0x40 | 0x10 | 0x04 | 0x01);
-            if (res == 0) ctx->EFlags |= 0x40;
+            if (cf) ctx->EFlags |= 0x01;
+            if (zf) ctx->EFlags |= 0x40;
             if ((int64_t)res < 0) ctx->EFlags |= 0x80;
-            if (src != 0) ctx->EFlags |= 0x01;
         } else {
             uint32_t src = (uint32_t)src2_val;
             uint32_t res = 0;
-            if (subop == 3) res = (-src) & src;
-            else if (subop == 2) res = (src - 1) ^ src;
-            else if (subop == 1) res = (src - 1) & src;
-            else return 0;
+            int cf = 0, zf = 0;
+            if (subop == 3) { // BLSI
+                res = (-src) & src;
+                cf = (src != 0);
+                zf = (res == 0);
+            } else if (subop == 2) { // BLSMSK
+                res = (src - 1) ^ src;
+                cf = (src == 0);
+                zf = 0;
+            } else if (subop == 1) { // BLSR
+                res = (src - 1) & src;
+                cf = (src == 0);
+                zf = (res == 0);
+            } else {
+                return 0;
+            }
             *regs[dest_idx] = (uint64_t)res;
             ctx->EFlags &= ~(0x800 | 0x80 | 0x40 | 0x10 | 0x04 | 0x01);
-            if (res == 0) ctx->EFlags |= 0x40;
+            if (cf) ctx->EFlags |= 0x01;
+            if (zf) ctx->EFlags |= 0x40;
             if ((int32_t)res < 0) ctx->EFlags |= 0x80;
-            if (src != 0) ctx->EFlags |= 0x01;
         }
         ctx->Rip += insn_len;
         return 1;
@@ -1883,29 +1819,59 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
             if (cur) cur->exception_count++;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // Camera update thunk DEP or unmapped jump safeguard (Discord crash 204614)
+        ULONG_PTR access_type = (ep->ExceptionRecord && ep->ExceptionRecord->NumberParameters >= 1) ?
+                                ep->ExceptionRecord->ExceptionInformation[0] : 0;
+        if (access_type == 8 /* EXECUTE violation */ || rip < 0x10000 || rip == (uintptr_t)orig_cam_update) {
+            uintptr_t expected_orig = (uintptr_t)image + 0x143ac60;
+            uintptr_t rsp = ep->ContextRecord->Rsp;
+            if (rsp >= 0x10000 && !IsBadReadPtr((const void *)rsp, 8)) {
+                uintptr_t ret_candidate = *(DWORD64 *)rsp;
+                if (ret_candidate >= (uintptr_t)image && ret_candidate < (uintptr_t)image + (image_size ? image_size : 0x20000000)) {
+                    uintptr_t ret_off = ret_candidate - (uintptr_t)image;
+                    if (ret_off == 0x1436c05 || ret_off == 0x1436e1a) {
+                        char buf[512];
+                        snprintf(buf, sizeof(buf),
+                            "[NATIVE MOUSE THUNK GUARD] Thread '%s' (TID %lu): "
+                            "Intercepted execution violation at %p. Redirecting to original camera update at %p.\n",
+                            cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId(), (void *)rip, (void *)expected_orig);
+                        veh_write(buf);
+                        fprintf(stderr, "%s", buf);
+                        fflush(stderr);
+
+                        orig_cam_update = (void (ABI *)(void*, void*, void*))expected_orig;
+                        ep->ContextRecord->Rip = expected_orig;
+                        if (cur) cur->exception_count++;
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+            }
+        }
         if (rip >= (uintptr_t)image && rip < (uintptr_t)image + (image_size ? image_size : 0x20000000)) {
             uintptr_t off = rip - (uintptr_t)image;
 
-            // Issue #134: DLTemporaryHeap::Allocate failure when RCX == NULL
-            if ((off >= 0x207de20 && off <= 0x207de2a) && ep->ContextRecord->Rcx == 0) {
-                uintptr_t rsp = ep->ContextRecord->Rsp;
+            // Issue #140 / Discord 231500: Graphics worker job dispatch NULL or culled batch
+            if (off >= 0x21b4b30 && off <= 0x21b4b55) {
+                uintptr_t rbp = ep->ContextRecord->Rbp;
                 char buf[512];
                 snprintf(buf, sizeof(buf),
-                    "[HEAP ALLOC GUARD] Thread '%s' (TID %lu) at guest offset 0x%" PRIxPTR ": "
-                    "DLTemporaryHeap pointer is NULL (RAX=%p, RDX=%p, RSI=%p, RDI=%p). Returning NULL to caller.\n",
+                    "[GRAPHICS WORKER GUARD] Thread '%s' (TID %lu) at guest offset 0x%" PRIxPTR ": "
+                    "Invalid graphics job batch (fault_addr=%p, RAX=%p, R14=%p, R15=%p). Unwinding to caller 0x%" PRIx64 ".\n",
                     cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId(), off,
-                    (void *)ep->ContextRecord->Rax, (void *)ep->ContextRecord->Rdx,
-                    (void *)ep->ContextRecord->Rsi, (void *)ep->ContextRecord->Rdi);
+                    fault_addr, (void *)ep->ContextRecord->Rax, (void *)ep->ContextRecord->R14,
+                    (void *)ep->ContextRecord->R15, *(DWORD64 *)(rbp + 0x08) - (uintptr_t)image);
                 veh_write(buf);
                 fprintf(stderr, "%s", buf);
                 fflush(stderr);
 
+                ep->ContextRecord->Rbx = *(DWORD64 *)(rbp - 0x20);
+                ep->ContextRecord->R12 = *(DWORD64 *)(rbp - 0x18);
+                ep->ContextRecord->R14 = *(DWORD64 *)(rbp - 0x10);
+                ep->ContextRecord->R15 = *(DWORD64 *)(rbp - 0x08);
+                ep->ContextRecord->Rip = *(DWORD64 *)(rbp + 0x08);
+                ep->ContextRecord->Rsp = rbp + 0x10;
+                ep->ContextRecord->Rbp = *(DWORD64 *)(rbp);
                 ep->ContextRecord->Rax = 0;
-                ep->ContextRecord->Rbx = *(DWORD64 *)(rsp);
-                ep->ContextRecord->R14 = *(DWORD64 *)(rsp + 0x08);
-                ep->ContextRecord->Rbp = *(DWORD64 *)(rsp + 0x10);
-                ep->ContextRecord->Rip = *(DWORD64 *)(rsp + 0x18);
-                ep->ContextRecord->Rsp = rsp + 0x20;
                 if (cur) cur->exception_count++;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }

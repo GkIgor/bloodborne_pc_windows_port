@@ -23,24 +23,24 @@ def unpack(fmt, data, offset):
     return struct.unpack(fmt, span(data, offset, struct.calcsize(fmt)))
 
 
-def parse_self(data):
+def parse_self(data, name="executable binary"):
     if len(data) < 32:
-        raise ValueError(f"executable binary is empty or truncated ({len(data)} bytes, minimum 32 bytes required)")
+        raise ValueError(f"{name} is empty or truncated ({len(data)} bytes, minimum 32 bytes required)")
     if span(data, 0, 4) != b'O\x15=\x1d':
-        raise ValueError("expected PS4 SELF header (magic bytes O\\x15=\\x1d)")
+        raise ValueError(f"{name}: expected PS4 SELF header (magic bytes O\\x15=\\x1d)")
     count, = unpack('<H', data, 24)
     base = 32 + count * 32
     header = unpack('<16sHHIQQQIHHHHHH', data, base)
     if header[0][:7] != b'\x7fELF\x02\x01\x01' or header[2] != 62:
-        raise ValueError("expected little-endian x86-64 ELF")
+        raise ValueError(f"{name}: expected little-endian x86-64 ELF")
     if header[9] != 56 or not 0 < header[10] < 256:
-        raise ValueError("unsupported program headers")
+        raise ValueError(f"{name}: unsupported program headers")
     ph = [dict(zip(('type', 'flags', 'offset', 'vaddr', 'paddr', 'filesz', 'memsz', 'align'),
                    unpack('<IIQQQQQQ', data, base + header[5] + i * 56)))
           for i in range(header[10])]
     end = max(p['offset'] + p['filesz'] for p in ph)
     if end > 512 * 1024 * 1024:
-        raise ValueError("probe image exceeds 512 MiB limit")
+        raise ValueError(f"{name}: probe image exceeds 512 MiB limit")
     elf = bytearray(end)
     header_end = header[5] + header[10] * 56
     elf[:header_end] = span(data, base, header_end)
@@ -52,13 +52,13 @@ def parse_self(data):
         if not flags & 0x800:
             continue
         if flags & 10:
-            raise ValueError("encrypted/compressed SELF segment is unsupported")
+            raise ValueError(f"{name}: encrypted/compressed SELF segment is unsupported")
         index = (flags >> 20) & 4095
         if index >= len(ph):
-            raise ValueError("invalid segment index")
+            raise ValueError(f"{name}: invalid segment index")
         p = ph[index]
         if size != p['filesz'] or size != mem:
-            raise ValueError("unsupported blocked segment layout")
+            raise ValueError(f"{name}: unsupported blocked segment layout")
         elf[p['offset']:p['offset'] + size] = span(data, off, size)
         covered.append((p['offset'], p['offset'] + size))
     missing = []
@@ -67,7 +67,7 @@ def parse_self(data):
                                   for a, z in covered):
             missing.append(i)
             if p['type'] in (1, 2, 0x61000000, 0x61000010):
-                raise ValueError(f"required segment {i} is unavailable")
+                raise ValueError(f"{name}: required segment {i} is unavailable")
     return elf, header, ph, segments, missing
 
 
@@ -92,8 +92,13 @@ def nid(name):
 
 def inspect_libc(path):
     """Prove that this dump's _init_env is exactly RET; never assume it."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing required module '{path.name}' at '{path}'. Bloodborne requires sce_module/libc.prx from the game dump.")
+    size = path.stat().st_size
+    if size < 32:
+        raise ValueError(f"Module '{path.name}' at '{path}' is invalid or empty ({size} bytes, minimum 32 bytes required). Please ensure your game files are fully decrypted and dumped.")
     source = path.read_bytes()
-    elf, header, ph, _, missing = parse_self(source)
+    elf, header, ph, _, missing = parse_self(source, name=str(path.name))
     dynamic = next(p for p in ph if p['type'] == 2)
     tags = dict(unpack('<QQ', elf, pos) for pos in
                 range(dynamic['offset'], dynamic['offset'] + dynamic['filesz'], 16))
@@ -131,7 +136,7 @@ def prepare(game, out):
         raise ValueError(f"eboot.bin at '{eboot_path}' is completely empty (0 bytes). Check your game dump or extraction.")
     if len(source) < 32:
         raise ValueError(f"eboot.bin at '{eboot_path}' is truncated ({len(source)} bytes).")
-    elf, header, ph, segments, missing = parse_self(source)
+    elf, header, ph, segments, missing = parse_self(source, name='eboot.bin')
     loads = [p for p in ph if p['type'] in (1, 0x61000010)]
     def mapped(addr, size=8):
         return any(p['vaddr'] <= addr and addr + size <= p['vaddr'] + p['memsz'] for p in loads)
