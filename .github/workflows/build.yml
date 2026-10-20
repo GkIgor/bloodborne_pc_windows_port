@@ -63,6 +63,8 @@ jobs:
           done
           mkdir -p /mingw64/include/magic_enum
           curl -sSL -o /mingw64/include/magic_enum/magic_enum.hpp https://raw.githubusercontent.com/Neargye/magic_enum/master/include/magic_enum/magic_enum.hpp
+          mkdir -p /mingw64/share/licenses/magic_enum
+          curl -sSfL -o /mingw64/share/licenses/magic_enum/LICENSE https://raw.githubusercontent.com/Neargye/magic_enum/master/LICENSE
           
           # Fix VMA header location
           if [ -f /mingw64/include/vma/vk_mem_alloc.h ]; then
@@ -74,11 +76,13 @@ jobs:
           cmake -S /tmp/miniz_repo -B /tmp/miniz_build -G Ninja -DCMAKE_INSTALL_PREFIX=/mingw64 -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF
           cmake --build /tmp/miniz_build --target install
           cp -f /mingw64/include/miniz/*.h /mingw64/include/ || true
+          install -Dm644 /tmp/miniz_repo/LICENSE /mingw64/share/licenses/miniz/LICENSE
           echo "Miniz successfully built and installed to /mingw64"
 
           # Install xbyak headers
           git clone --depth 1 https://github.com/herumi/xbyak /tmp/xbyak
           cp -r /tmp/xbyak/xbyak /mingw64/include/
+          install -Dm644 /tmp/xbyak/COPYRIGHT /mingw64/share/licenses/xbyak/COPYRIGHT
           echo "Xbyak headers installed to /mingw64/include/xbyak"
 
       - name: Compile Bloodborne PC Port
@@ -122,19 +126,41 @@ jobs:
           cp -f LICENSE out/licenses/LICENSE
           cp -rf licenses/. out/licenses/
           # The MSYS2 packages that own the staged DLLs, with their licence files and versions.
-          pkgs=$(for dll in out/*.dll; do pacman -Qqo "/mingw64/bin/$(basename "$dll")" 2>/dev/null; done | sort -u)
+          pkgs=$(for dll in out/*.dll; do pacman -Qqo "/mingw64/bin/$(basename "$dll")" 2>/dev/null || true; done | sort -u)
           test -n "$pkgs" || { echo "No staged DLL belongs to an MSYS2 package"; exit 1; }
           pacman -Qi $pkgs | awk -F ' *: ' '/^Name/{n=$2} /^Version/{v=$2} /^Licenses/{print n, v, "-", $2}' \
             > out/licenses/msys2/PACKAGES.txt
           echo "Sources: https://repo.msys2.org/mingw/sources/" >> out/licenses/msys2/PACKAGES.txt
           for pkg in $pkgs; do
-            pacman -Qql "$pkg" | grep '^/mingw64/share/licenses/.*[^/]$' | while read -r f; do
+            # Not every package ships files under share/licenses.
+            pacman -Qql "$pkg" | { grep '^/mingw64/share/licenses/.*[^/]$' || true; } | while read -r f; do
               rel=${f#/mingw64/share/licenses/}
               mkdir -p "out/licenses/msys2/$(dirname "$rel")"
               cp -f "$f" "out/licenses/msys2/$rel"
             done
           done
-          ls -R out/licenses | head -n 50
+          # Libraries compiled into bbport.exe: name:licence file.
+          for spec in \
+            imgui:gpu/third_party/imgui/LICENSE.txt \
+            LibAtrac9:third_party/LibAtrac9/LICENSE \
+            fsr-vulkan:gpu/third_party/fsr-vulkan/LICENSE.txt \
+            fsr-vulkan:gpu/third_party/fsr-vulkan/NOTICE.md \
+            fsr-vulkan:gpu/third_party/fsr-vulkan/UPSTREAM.md \
+            fsr-vulkan/ffx-1.1.4:gpu/third_party/fsr-vulkan/upstream/ffx-1.1.4/sdk/LICENSE.txt \
+            sirit:gpu/third_party/sirit/LICENSE.txt \
+            SPIRV-Headers:gpu/third_party/sirit/externals/SPIRV-Headers/LICENSE \
+            half:gpu/third_party/half/LICENSE.txt \
+            DejaVu-fonts:gpu/third_party/fonts/LICENSE-DejaVu.txt \
+            robin-map:/mingw64/share/licenses/robin-map/LICENSE \
+            VulkanMemoryAllocator:/mingw64/share/licenses/VulkanMemoryAllocator/LICENSE \
+            vulkan-headers:/mingw64/share/licenses/vulkan-headers/LICENSE \
+            magic_enum:/mingw64/share/licenses/magic_enum/LICENSE \
+            miniz:/mingw64/share/licenses/miniz/LICENSE \
+            xbyak:/mingw64/share/licenses/xbyak/COPYRIGHT; do
+            mkdir -p "out/licenses/third_party/${spec%%:*}"
+            cp -f "${spec#*:}" "out/licenses/third_party/${spec%%:*}/"
+          done
+          ls -R out/licenses | head -n 50 || true
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
