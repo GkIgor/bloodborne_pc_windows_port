@@ -239,6 +239,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             "mk_smoothing": f"{self.sl_smoothing.value() / 100:.2f}",
             "mk_responsiveness": f"{self.sl_responsiveness.value() / 100:.2f}" if hasattr(self, "sl_responsiveness") else "1.00",
             "mk_acceleration": f"{self.sl_acceleration.value() / 100:.2f}" if hasattr(self, "sl_acceleration") else "1.00",
+            "mouse_menu": "1" if self.chk_mouse_menu.isChecked() else "0",
         }
         if hasattr(self, "keybind_buttons"):
             for k, btn in self.keybind_buttons.items():
@@ -308,7 +309,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             self._last_ini_mtime = mtime
             ini_opts = self.load_bbport_ini()
             widgets = [self.sl_sens_x, self.sl_sens_y, self.sl_smoothing,
-                       self.chk_mk_enabled, self.chk_inv_x, self.chk_inv_y]
+                       self.chk_mk_enabled, self.chk_inv_x, self.chk_inv_y, self.chk_mouse_menu]
             if hasattr(self, "sl_responsiveness"): widgets.append(self.sl_responsiveness)
             if hasattr(self, "sl_acceleration"): widgets.append(self.sl_acceleration)
             for w in widgets:
@@ -340,6 +341,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
             self.chk_inv_x.setChecked(ini_opts.get("mk_invert_x", "0") != "0")
             self.chk_inv_y.setChecked(ini_opts.get("mk_invert_y", "0") != "0")
+            self.chk_mouse_menu.setChecked(ini_opts.get("mouse_menu", "1") != "0")
 
             if hasattr(self, "cmb_prep_workers"):
                 ini_pw = ini_opts.get("prep_workers", "auto").strip().lower()
