@@ -87,6 +87,8 @@ struct Values {
     /// Mouse & Keyboard controls settings
     std::atomic<bool> mk_enabled{true};
     std::atomic<bool> mk_native_mouse{true};
+    /// The mouse as a pointer in the game's menus (bbport_menu_pointer.h).
+    std::atomic<bool> mouse_menu{true};
     std::atomic<float> mk_sens_x{1.5f};
     std::atomic<float> mk_sens_y{1.5f};
     std::atomic<bool> mk_invert_x{false};

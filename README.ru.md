@@ -229,3 +229,6 @@ bbport распространяется по **GNU GPL v2 или новее** ([
 [dxil-spirv](https://github.com/HansKristian-Work/dxil-spirv) (MIT, для сборки ассетов FSR 4.1.1).
 Патчи игры — Kyo, Lance McDonald, auser1337, illusion, emoose и другие участники сообщества
 (`patches/Bloodborne.xml`). DLL и данные модели FSR 4 от AMD здесь не распространяются.
+Указатель мыши в меню игры взят из [bbhost](https://github.com/droogie/bbhost) (GPL-3.0-or-later,
+через порт DarkIzuku), поэтому сборки с ним распространяются по **GNU GPL v3 или новее**
+([licenses/GPL-3.0.txt](licenses/GPL-3.0.txt), [licenses/BBHOST-PORTS.md](licenses/BBHOST-PORTS.md)).

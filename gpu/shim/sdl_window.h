@@ -57,6 +57,8 @@ private:
     WindowSystemInfo window_info{};
     uint64_t last_mouse_motion_ms = 0;
     bool mouse_cursor_hidden = false;
+    bool window_focused = true, mouse_inside = true;
+    bool menu_released = false; ///< a game menu released the mouse; it is taken back when they close
     void UpdateClipCursor(bool clip);
 };
 

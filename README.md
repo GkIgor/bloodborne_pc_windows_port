@@ -209,11 +209,13 @@ Save files and shader caches are stored in `user/`. Settings are saved to `bbpor
 ## Credits and Licenses
 
 This project is licensed under the **GNU General Public License v2 or later** ([LICENSE](LICENSE)) due to its use of shadPS4 components.
+The game menu mouse pointer is adapted from [bbhost](https://github.com/droogie/bbhost) (GPL-3.0-or-later), so builds that contain it are distributed under the **GNU GPL v3 or later** ([licenses/GPL-3.0.txt](licenses/GPL-3.0.txt), [licenses/BBHOST-PORTS.md](licenses/BBHOST-PORTS.md)).
 
 Special thanks to the original creators and open source projects that made this port possible:
 
 - **deadinside28**: Creator of the original Linux port (`bbport`), pioneering the flat memory image architecture, custom Vulkan two-stage pipeline, relative mouse look implementation, and synthetic motion vector generation.
 - **shadPS4 Team**: Base Vulkan video core and shader recompiler.
+- **droogie and the bbhost contributors**: game menu mouse pointer ([bbhost](https://github.com/droogie/bbhost)), via **DarkIzuku**'s bloodborne_pc port.
 - **FireBurn**: FSR-Vulkan runtime and temporal upscaling backend.
 - **Thealexbarney**: LibAtrac9 audio decoding library.
 - **ocornut**: Dear ImGui library for the in-game settings overlay.

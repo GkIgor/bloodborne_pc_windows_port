@@ -1089,6 +1089,12 @@ class LauncherUI:
         self.chk_inv_y.stateChanged.connect(lambda: self.save_bbport_ini())
         grid_mk.addWidget(self.chk_inv_y, 5, 1)
 
+        self.chk_mouse_menu = QCheckBox("Mouse Pointer in Game Menus")
+        self.chk_mouse_menu.setToolTip("Hover selects a menu row, left click chooses it, right click goes back, the wheel scrolls.")
+        self.chk_mouse_menu.setChecked(ini_opts.get("mouse_menu", "1") != "0")
+        self.chk_mouse_menu.stateChanged.connect(lambda: self.save_bbport_ini())
+        grid_mk.addWidget(self.chk_mouse_menu, 6, 0)
+
         l_mk.addLayout(grid_mk)
 
         sep = QFrame()

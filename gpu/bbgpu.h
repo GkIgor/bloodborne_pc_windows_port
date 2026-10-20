@@ -57,6 +57,10 @@ void bbgpu_set_mouse_capture(int capture);
 int bbgpu_get_mk_config(float *sens_x, float *sens_y, int *invert_x, int *invert_y, float *deadzone, float *smoothing);
 /* Returns 1 if native direct mouse camera rotation is enabled. */
 int bbgpu_get_mk_native_mouse(void);
+/* Hooks the game's menu list update for the mouse pointer; before the image is protected. */
+int bbgpu_menu_pointer_install(unsigned char *image, uint64_t size);
+/* Notes the pad's own state and returns the buttons the menu pointer presses this sample. */
+uint32_t bbgpu_menu_pointer_buttons(uint32_t buttons, uint8_t lx, uint8_t ly);
 
 enum BbCustomKey {
     BB_KEY_NONE = 0,

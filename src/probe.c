@@ -2618,6 +2618,7 @@ int main(int argc, char **argv) {
             printf("[NATIVE MOUSE] Direct camera rotation hook installed successfully at image+0x1436c00 and image+0x1436e15 (thunk=%p, orig=%p)\n", (void*)t, (void*)orig_cam_update);
         } while (0);
     }
+    if (!cpu_only) bbgpu_menu_pointer_install(image, size);
 
     /* Blur-kernel sample count clamp (0xa0020007 / crash 23 guard at GPUTexUtil_GetRecursiveSampleParameters, 0xbbc3e0) */
     do {
