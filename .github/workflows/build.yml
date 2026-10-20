@@ -114,6 +114,7 @@ jobs:
           cmake --build out/gpu --target bbgpu bbport bb-gpu-capabilities -j $(nproc)
 
           echo "=== 5. Finalizing binaries ==="
+          strip -s out/bbport.exe
           cp -f out/bbport.exe out/bb-probe.exe
 
           echo "=== 6. Staging DLLs ==="

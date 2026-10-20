@@ -176,6 +176,12 @@ if errorlevel 1 (
 )
 
 if exist "out\bbport.exe" (
+    rem Strip unneeded debug symbols and relocations to reduce binary size from ~260MB to ~12MB
+    where strip.exe >nul 2>nul
+    if not errorlevel 1 (
+        echo Stripping debug symbols from out\bbport.exe...
+        strip -s "out\bbport.exe"
+    )
     copy /Y "out\bbport.exe" "out\bb-probe.exe" >nul
 )
 
