@@ -1,0 +1,30 @@
+Notices for BloodborneLauncher.exe
+==================================
+
+BloodborneLauncher.exe is built from bblauncherAPP/ with PyInstaller
+(bblauncherAPP/build_bblauncher.bat). Besides the launcher's own code it
+bundles:
+
+Python
+------
+The Python interpreter and standard library, under the Python Software
+Foundation License Version 2. Its licence, with the licences of the
+libraries Python itself includes, is in PYTHON-LICENSE.txt.
+
+Qt for Python (PySide6, shiboken6) and Qt 6
+-------------------------------------------
+Copyright (C) The Qt Company Ltd. and other contributors.
+Used under the GNU Lesser General Public License version 3
+(../LGPL-3.0.txt, which supplements ../GPL-3.0.txt).
+
+Source code: https://download.qt.io/official_releases/QtForPython/ and
+https://code.qt.io/. Qt's own third-party components and their licences are
+listed at https://doc.qt.io/qt-6/licenses-used-in-qt.html.
+
+The launcher's source and build script are in this project's repository, so
+the launcher can be rebuilt against a modified version of Qt or PySide6.
+
+PyInstaller
+-----------
+The PyInstaller bootloader is under the GPL-2.0 with an exception that allows
+distributing bundled applications under their own terms.
