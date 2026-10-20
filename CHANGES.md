@@ -264,3 +264,46 @@ This document details the optimizations, fixes, and refactoring applied to ensur
   2. Packaged self-contained embedded Python runtime (`python-embed/`), enabling out-of-the-box patch generation and profile management without requiring host system Python installations.
   3. Updated `run.bat` launcher launcher script to auto-detect and resolve local embedded Python environment transparently.
 
+
+---
+
+## 15. Linear Mouse Look & In-Game Menu Pointer (PR #147 & PR #150 by @HatsyRei)
+
+- **Files**: `gpu/shim/window.cpp`, `src/probe.c`, `gpu/shim/bbhost/menu_pointer.cpp`, `gpu/shim/bbport_menu_pointer.cpp`, `bblauncherAPP/`.
+- **Change**:
+  1. Replaced exponential acceleration curve with 1:1 linear mouse camera look, overriding dynamic speed registers (`2.0f * |delta| / dt`) and preserving user sensitivity.
+  2. Ported in-game mouse pointer support from bbhost (credit @droogie / @DarkIzuku) allowing mouse cursor navigation inside native game menus (hover selects, left-click confirms, right-click backs out, wheel scrolls).
+  3. Added `mouse_menu` toggle under `[Controls]` in `bbport.ini` and the launcher GUI.
+
+---
+
+## 16. Upstream Launcher GPU Selection, Languages & Assertion Clamps
+
+- **Files**: `tools/gpu_capabilities.c`, `bblauncherAPP/`, `src/runtime_kernel.c`, `src/probe.c`.
+- **Change**:
+  1. Added physical Vulkan GPU adapter selection in the launcher and persistent INI configuration.
+  2. Added support for all 21 PS4 native text languages via `BB_LANGUAGE`.
+  3. Implemented `sceKernelDebugRaiseException` / `raise_exception` service and added assertion bypass clamp for blur kernel code `0xa0020007` (Code 23) to prevent black screens.
+
+---
+
+## 17. CPU Emulation, Graphics Worker Fault Recovery & Module Validation (Closes #27, #96, #124, #138, #140, #141, #145)
+
+- **Files**: `src/probe.c`, `src/runtime_alloc.c`, `scripts/prepare.py`, `gpu/shadps4/video_core/renderer_vulkan/vk_scheduler.cpp`.
+- **Change**:
+  1. Fixed CPU flag calculations in `emulate_lzcnt_site` (ZF flag on 0) and `emulate_bmi1` (CF/ZF for BLSR, BLSMSK, BLSI) for non-BMI1 processors.
+  2. Removed allocator BSR rewrite in `patch_non_bmi1` that left destination registers undefined on zero inputs, routing all non-BMI1 LZCNT sites through UD2 exception traps.
+  3. Removed broken heap alloc guard returning NULL at `0x207de26` that induced Dantelion2 WorldChrMan transaction panics.
+  4. Added graphics worker batch fault recovery in VEH (`0x21b4b30..0x21b4b55`) with full callee-saved register restoration to safely unwind culled batches.
+  5. Guarded native mouse camera thunk against corrupt jump targets and DEP violations.
+  6. Added explicit validation for companion modules (`sce_module/libc.prx`) during preparation.
+
+---
+
+## 18. Build System Optimization & License Compliance (PR #152 & Release Binary Strip)
+
+- **Files**: `build.bat`, `.github/workflows/build.yml`, `scripts/stage_dlls.py`, `licenses/`.
+- **Change**:
+  1. Automated executable symbol stripping (`strip -s`) in both `build.bat` and GitHub Actions CI workflow, reducing `bbport.exe` and `bb-probe.exe` binary footprint from ~260 MB to ~12.4 MB (~95% reduction).
+  2. Filtered out protected Windows system DLLs from being bundled during release staging.
+  3. Added comprehensive license notice staging for all MSYS2 packages, bundled third-party libraries, and the Python launcher runtime.
