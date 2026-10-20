@@ -117,6 +117,25 @@ jobs:
           
           ls -la out/bbport.exe
 
+          echo "=== 7. Staging licences ==="
+          mkdir -p out/licenses/msys2
+          cp -f LICENSE out/licenses/LICENSE
+          cp -rf licenses/. out/licenses/
+          # The MSYS2 packages that own the staged DLLs, with their licence files and versions.
+          pkgs=$(for dll in out/*.dll; do pacman -Qqo "/mingw64/bin/$(basename "$dll")" 2>/dev/null; done | sort -u)
+          test -n "$pkgs" || { echo "No staged DLL belongs to an MSYS2 package"; exit 1; }
+          pacman -Qi $pkgs | awk -F ' *: ' '/^Name/{n=$2} /^Version/{v=$2} /^Licenses/{print n, v, "-", $2}' \
+            > out/licenses/msys2/PACKAGES.txt
+          echo "Sources: https://repo.msys2.org/mingw/sources/" >> out/licenses/msys2/PACKAGES.txt
+          for pkg in $pkgs; do
+            pacman -Qql "$pkg" | grep '^/mingw64/share/licenses/.*[^/]$' | while read -r f; do
+              rel=${f#/mingw64/share/licenses/}
+              mkdir -p "out/licenses/msys2/$(dirname "$rel")"
+              cp -f "$f" "out/licenses/msys2/$rel"
+            done
+          done
+          ls -R out/licenses | head -n 50
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -125,3 +144,4 @@ jobs:
             out/bbport.exe
             out/bb-probe.exe
             out/*.dll
+            out/licenses/
