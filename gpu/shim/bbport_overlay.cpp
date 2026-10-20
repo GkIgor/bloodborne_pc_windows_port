@@ -724,6 +724,9 @@ void Menu() {
             "Shift+LMB - strong attack (R2), RMB - gun/left hand (L2), MMB - target lock (R3), "
             "Tab - weapon transform (L1)",
             "Схема управления в стиле Souls PC: обзор мышью (захват курсора), ЛКМ - обычная атака (R1), Shift+ЛКМ - сильная (R2), ПКМ - выстрел/левая рука (L2), СКМ - захват цели (R3), Tab - трансформация оружия (L1)"));
+    Checkbox(Tr("Mouse pointer in game menus", "Указатель мыши в меню игры"), s.mouse_menu);
+    Hint(Tr("Hover selects a menu row, left click chooses it, right click goes back, the wheel scrolls.",
+            "Наведение выбирает строку меню, ЛКМ - выбор, ПКМ - назад, колесо - прокрутка."));
     if (s.mk_enabled) {
         Slider(Tr("Horizontal sensitivity (X)", "Чувствительность по горизонтали (X)"), s.mk_sens_x, 0.1f, 10.0f);
         Slider(Tr("Vertical sensitivity (Y)", "Чувствительность по вертикали (Y)"), s.mk_sens_y, 0.1f, 10.0f);
