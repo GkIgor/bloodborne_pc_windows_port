@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "sdl_window.h"
+#include "bbport_menu_pointer.h"
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 
@@ -174,6 +175,7 @@ bool WindowSDL::PollEvents() {
     if (!text_active) {
         BbOverlay::UpdateTextInput(window);
     }
+    const bool pointer_menu = !text_active && !BbOverlay::CapturesInput() && BbMenuPointer::Active();
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         if (text_active && (event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_KEY_DOWN)) {
@@ -201,8 +203,43 @@ bool WindowSDL::PollEvents() {
                 mouse_cursor_hidden = false;
             }
         }
+        if (event.type == SDL_EVENT_MOUSE_MOTION) {
+            BbMenuPointer::NoteMouse(event.motion.x, event.motion.y);
+        } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+            BbMenuPointer::NoteMouse(event.button.x, event.button.y);
+        }
+        if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+            (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && std::abs(event.gaxis.value) > 8000)) {
+            BbMenuPointer::NoteDevice(true);
+        } else if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_MOUSE_MOTION ||
+                   event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_WHEEL) {
+            BbMenuPointer::NoteDevice(false);
+        }
+        if (event.type == SDL_EVENT_WINDOW_FOCUS_GAINED || event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+            window_focused = event.type == SDL_EVENT_WINDOW_FOCUS_GAINED;
+            menu_released = false;
+        } else if (event.type == SDL_EVENT_WINDOW_MOUSE_ENTER || event.type == SDL_EVENT_WINDOW_MOUSE_LEAVE) {
+            mouse_inside = event.type == SDL_EVENT_WINDOW_MOUSE_ENTER;
+        }
         if (BbOverlay::HandleEvent(event)) {
             continue;
+        }
+
+        // In the game's menus the cursor is a pointer: its clicks and the wheel go to the menu.
+        if (pointer_menu && !relative_mouse_active) {
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                if (event.button.button == SDL_BUTTON_LEFT) {
+                    BbMenuPointer::Click();
+                } else if (event.button.button == SDL_BUTTON_RIGHT) {
+                    BbMenuPointer::Back();
+                }
+                continue;
+            }
+            if (event.type == SDL_EVENT_MOUSE_WHEEL) {
+                BbMenuPointer::Wheel(event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.y
+                                                                                     : event.wheel.y);
+                continue;
+            }
         }
 
         const bool mk_active = BbSettings::Get().mk_enabled.load();
@@ -274,6 +311,24 @@ bool WindowSDL::PollEvents() {
     // The overlay menu, typing dialog, or disabling M&K in settings releases mouse capture
     if (relative_mouse_active && (overlay_capturing || !mk_active)) {
         CaptureMouse(false);
+    }
+
+    // The game's menus keep the cursor; the mouse they released is taken back when they close.
+    if (pointer_menu) {
+        if (relative_mouse_active) {
+            CaptureMouse(false);
+        }
+        menu_released = window_focused;
+    } else if (menu_released) {
+        menu_released = false;
+        if (mk_active && !overlay_capturing && window_focused && mouse_inside) {
+            CaptureMouse(true);
+        }
+    }
+    {
+        int w = 0, h = 0;
+        SDL_GetWindowSize(window, &w, &h);
+        BbMenuPointer::NoteWindow(w, h, window_focused, mouse_inside, relative_mouse_active);
     }
 
     if (!relative_mouse_active) {
