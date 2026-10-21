@@ -14,34 +14,70 @@ if len(sys.argv) > 1 and any(arg.lower().endswith(".py") for arg in sys.argv[1:]
     sys.path.insert(0, str(Path(target_script).parent))
     runpy.run_path(target_script, run_name="__main__")
     sys.exit(0)
+import ctypes
 import json
+import os
+import platform
+import sys
+import time
 from datetime import datetime
-from PySide6.QtCore import QEvent, QTimer
+from PySide6.QtCore import QEvent, QTimer, Qt
 from PySide6.QtGui import QIcon, QTextCursor
-from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow, QMessageBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
-from bblauncher_UI import STYLE_SHEET, LauncherUI, apply_dwm_styling, install_dialog_styling
+from bblauncher_UI import STYLE_SHEET, LauncherUI, WheelGuard, apply_dwm_styling, install_dialog_styling
 from bblauncher_Utils import (
     ANISO_CHOICES,
     APP_DIR,
     DEFAULT_GAME,
     DEFAULT_SETTINGS,
+    EFFECT_CHOICES,
+    LAUNCHER_VERSION,
+    LOG_DIR,
     LOG_FILE,
     PREP_WORKER_CHOICES,
     RUN_BAT,
     SETTINGS_FILE,
+    UPSCALER_CHOICES,
     VK_NOISE,
     ProcessWorker,
     acquire_single_instance,
+    build_stamp,
     connected_gpus,
     get_bb_guard,
     load_xml_patches,
     resolve_game_dir,
     rotate_log,
     running_instances,
-    shader_cache_dir,
     verify_prelaunch,
 )
+
+
+# XML patches that mirror bbport.ini effect switches.
+# The tuple is (ini key, ini value when the patch is enabled).
+EFFECT_PATCH_MAP = {
+    "Skip Intro": ("skip_intro", "1"),
+    "Disable Motion Blur (perf increase)": ("effect_motion_blur", "0"),
+    "Disable Dynamic Light Shadows (perf increase)": ("effect_dynamic_shadows", "0"),
+    "Disable Chromatic Aberration": ("effect_chromatic_aberration", "0"),
+    "Disable DoF": ("effect_dof", "0"),
+    "Disable SSAO": ("effect_ssao", "0"),
+    "Enable Screen Space Reflections (READ NOTE)": ("effect_ssr", "1"),
+    "Restore Debug Camera": ("debug_camera", "1"),
+    "Restore Debug Menu (READ NOTES)": ("debug_menu", "1"),
+}
 
 
 class BloodborneLauncher(LauncherUI, QMainWindow):
@@ -50,6 +86,11 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.setWindowTitle("Bloodborne PC Launcher")
         self.setFixedSize(1200, 720)
         self.setStyleSheet(STYLE_SHEET)
+
+        app = QApplication.instance()
+        if app is not None:
+            self._wheel_guard = WheelGuard(self)
+            app.installEventFilter(self._wheel_guard)
         
         icon_file = APP_DIR / "icon.ico"
         if not icon_file.is_file():
@@ -60,20 +101,49 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.worker = None
         self.log_fh = None
         self.hidden_count = 0
+        self._log_history = []
+        self._log_filter = "hide_vk"
+        self._run_started = None
+        self._path_valid = False
+        self._setup_kind = "empty"
 
         self._patches_built = False
-        self._settings_built = False
+        self._display_built = False
+        self._mk_built = False
+        self._advanced_built = False
+        self._syncing_ini = False
         self.all_xml_patches = []
         self.patch_checkboxes = {}
 
         self.settings = self.load_settings()
         self.enabled_patches = set(self.settings.get("enabled_patches", DEFAULT_SETTINGS["enabled_patches"]))
+        self._last_settings_mtime = 0
+        try:
+            if SETTINGS_FILE.is_file():
+                self._last_settings_mtime = SETTINGS_FILE.stat().st_mtime
+        except OSError:
+            pass
 
+        self._suppress_settings_save = True
         self.init_ui()
-        self.log("Ready. Select your eboot.bin and press Launch Bloodborne.")
+        self.log("Ready. Check setup status and press Launch Bloodborne.")
+
+        self.run_timer = QTimer(self)
+        self.run_timer.setInterval(1000)
+        self.run_timer.timeout.connect(self.update_run_clock)
+
+        self._setup_timer = QTimer(self)
+        self._setup_timer.setSingleShot(True)
+        self._setup_timer.setInterval(450)
+        self._setup_timer.timeout.connect(self.refresh_setup_status)
+
+        self.update_path_state()
+        self.update_last_run()
+        self.update_home_summary()
+        QTimer.singleShot(250, self.refresh_setup_status)
 
         # Deferred background warming for secondary tabs after window is already shown
-        QTimer.singleShot(100, self._build_settings_tab_now)
+        QTimer.singleShot(100, self._build_display_tab_now)
         QTimer.singleShot(300, self._build_patches_tab_now)
 
         self._last_ini_mtime = 0
@@ -87,6 +157,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.ini_sync_timer.setInterval(1000)
         self.ini_sync_timer.timeout.connect(self.sync_bbport_ini_to_ui)
         self.ini_sync_timer.start()
+        self._suppress_settings_save = False
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -103,27 +174,67 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if getattr(self, "_patches_built", False):
             return
         self._patches_built = True
-        self.all_xml_patches = load_xml_patches()
-        patches_widget = self.create_patches_tab()
-        if hasattr(self, "patches_placeholder"):
-            idx = self.stack.indexOf(self.patches_placeholder)
-            if idx >= 0:
-                self.stack.removeWidget(self.patches_placeholder)
-                self.patches_placeholder.deleteLater()
-                self.stack.insertWidget(idx, patches_widget)
-        self.update_patch_count_label()
+        previous = getattr(self, "_suppress_settings_save", False)
+        self._suppress_settings_save = True
+        try:
+            self.all_xml_patches = load_xml_patches()
+            self._update_enabled_patches_from_ini()
+            patches_widget = self.create_patches_tab()
+            if hasattr(self, "patches_placeholder"):
+                idx = self.stack.indexOf(self.patches_placeholder)
+                if idx >= 0:
+                    self.stack.removeWidget(self.patches_placeholder)
+                    self.patches_placeholder.deleteLater()
+                    self.stack.insertWidget(idx, patches_widget)
+            self.update_patch_count_label()
+        finally:
+            self._suppress_settings_save = previous
+        if hasattr(self, "home_chips"):
+            self.update_home_summary()
 
-    def _build_settings_tab_now(self):
-        if getattr(self, "_settings_built", False):
-            return
-        self._settings_built = True
-        settings_widget = self.create_settings_tab()
-        if hasattr(self, "settings_placeholder"):
-            idx = self.stack.indexOf(self.settings_placeholder)
+    def _install_tab(self, placeholder_name: str, widget: QWidget):
+        placeholder = getattr(self, placeholder_name, None)
+        if placeholder is not None:
+            idx = self.stack.indexOf(placeholder)
             if idx >= 0:
-                self.stack.removeWidget(self.settings_placeholder)
-                self.settings_placeholder.deleteLater()
-                self.stack.insertWidget(idx, settings_widget)
+                self.stack.removeWidget(placeholder)
+                placeholder.deleteLater()
+                self.stack.insertWidget(idx, widget)
+                return
+        self.stack.addWidget(widget)
+
+    def _build_display_tab_now(self):
+        if getattr(self, "_display_built", False):
+            return
+        self._display_built = True
+        previous = getattr(self, "_suppress_settings_save", False)
+        self._suppress_settings_save = True
+        try:
+            self._install_tab("display_placeholder", self.create_display_tab())
+        finally:
+            self._suppress_settings_save = previous
+
+    def _build_mk_tab_now(self):
+        if getattr(self, "_mk_built", False):
+            return
+        self._mk_built = True
+        previous = getattr(self, "_suppress_settings_save", False)
+        self._suppress_settings_save = True
+        try:
+            self._install_tab("mk_placeholder", self.create_mk_tab())
+        finally:
+            self._suppress_settings_save = previous
+
+    def _build_advanced_tab_now(self):
+        if getattr(self, "_advanced_built", False):
+            return
+        self._advanced_built = True
+        previous = getattr(self, "_suppress_settings_save", False)
+        self._suppress_settings_save = True
+        try:
+            self._install_tab("advanced_placeholder", self.create_advanced_tab())
+        finally:
+            self._suppress_settings_save = previous
 
     def load_settings(self) -> dict:
         merged = dict(DEFAULT_SETTINGS)
@@ -137,42 +248,684 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         return merged
 
     def current_config(self) -> dict:
-        if self._settings_built:
+        cfg = dict(self.settings)
+        cfg["eboot"] = self.txt_eboot.text().strip()
+        try:
+            log_filter = self.cmb_log_filter.currentData() or "hide_vk"
+        except AttributeError:
+            log_filter = self._log_filter or "hide_vk"
+        self._log_filter = log_filter
+        cfg["hide_vk"] = log_filter in ("hide_vk", "errors")
+        cfg["log_filter"] = log_filter
+        cfg["log_autoscroll"] = self.chk_autoscroll.isChecked()
+        cfg["enabled_patches"] = sorted(list(self.enabled_patches))
+
+        if self._display_built:
             win_mode = self.cmb_win_mode.currentText()
-            upscaler_choice = self.cmb_upscaler.currentText() if hasattr(self, "cmb_upscaler") else "Off"
-            is_fsr = self.chk_fsr.isChecked() and upscaler_choice != "Off"
-            return {
-                "eboot": self.txt_eboot.text().strip(),
+            upscaler_choice = self.cmb_upscaler.currentText()
+            cfg.update({
                 "fps": self.cmb_fps.currentText(),
                 "res": self.cmb_res.currentText(),
                 "aniso": self.cmb_aniso.currentText(),
                 "prep_workers": self.cmb_prep_workers.currentText(),
                 "anti_aliasing": self.cmb_aa.currentText(),
-                "gpu": self.cmb_gpu.currentData() if hasattr(self, "cmb_gpu") else self.settings.get("gpu", ""),
-                "language": self.cmb_lang.currentData() if hasattr(self, "cmb_lang") else self.settings.get("language", "1"),
-                "mods": self.chk_mods.isChecked(),
-                "hide_vk": self.chk_vk_noise.isChecked(),
-                "feat_upscaler": is_fsr,
+                "gpu": self.cmb_gpu.currentData() or "",
+                "language": self.cmb_lang.currentData() or "1",
+                "feat_upscaler": self.chk_fsr.isChecked() and upscaler_choice != "Off",
                 "upscaler_model": upscaler_choice,
                 "feat_overlay": self.chk_overlay.isChecked(),
-                "feat_hud": self.chk_hud.isChecked(),
                 "feat_fps_patch": self.chk_fps_patch.isChecked(),
                 "window_mode": win_mode,
                 "fullscreen": win_mode == "Fullscreen",
-                "enabled_patches": sorted(list(self.enabled_patches)),
-            }
-        self.settings["eboot"] = self.txt_eboot.text().strip()
-        self.settings["hide_vk"] = self.chk_vk_noise.isChecked()
-        self.settings["enabled_patches"] = sorted(list(self.enabled_patches))
-        return self.settings
+            })
+
+        if self._advanced_built:
+            cfg.update({
+                "mods": self.chk_mods.isChecked(),
+                "timeout": self.txt_timeout.text().strip(),
+                "vblank_hz": self.txt_vblank.text().strip(),
+                "frames_ahead": self.txt_frames_ahead.text().strip(),
+                "dmem_mb": self.txt_dmem.text().strip(),
+                "extra_args": self.txt_extra_args.text().strip(),
+                "sku": self.cmb_sku.currentData() or "full",
+                "mods_dir": self.txt_mods_dir.text().strip(),
+                "mods_config": self.txt_mods_config.text().strip(),
+                "patches_dir": self.txt_patches_dir.text().strip(),
+                "patches_config": self.txt_patches_config.text().strip(),
+                "user_dir": self.txt_user_dir.text().strip(),
+            })
+        else:
+            cfg["mods"] = bool(cfg.get("mods", False))
+
+        return cfg
 
     def save_settings(self):
+        if getattr(self, "_suppress_settings_save", False):
+            return
         data = self.current_config()
         self.settings = data
         try:
             SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            try:
+                self._last_settings_mtime = SETTINGS_FILE.stat().st_mtime
+            except OSError:
+                pass
         except OSError:
             pass
+        if hasattr(self, "home_chips"):
+            self.update_home_summary()
+
+    # ------------------------------------------------------------------
+    # Home dashboard: path validation, setup readiness, launch profile
+    # ------------------------------------------------------------------
+    def on_eboot_path_changed(self):
+        self.update_path_state()
+        if not hasattr(self, "_setup_timer"):
+            return
+        target = self.txt_eboot.text().strip()
+        if not target:
+            self._setup_timer.stop()
+            self._set_setup_display("empty", "Select a game path to begin.")
+            return
+        if not self._path_valid:
+            self._setup_timer.stop()
+            self._set_setup_display(
+                "error",
+                "Path does not contain an eboot.bin.",
+                f"Selected path:\n{target}\n\nNo eboot.bin was found in that folder.",
+            )
+            self._set_setup_checks("fail", "unknown", "unknown")
+            return
+        self._set_setup_display("checking", "Checking setup...")
+        self._setup_timer.start()
+
+    def on_eboot_path_dropped(self, path: str):
+        value = str(path or "").strip().strip('"')
+        if not value:
+            return
+        self.txt_eboot.setText(os.path.normpath(value))
+        self.log(f"Selected game path: {os.path.normpath(value)}")
+
+    def update_path_state(self):
+        target = self.txt_eboot.text().strip()
+        game_dir = resolve_game_dir(target) if target else None
+        self._path_valid = game_dir is not None
+
+        if game_dir is not None:
+            self.lbl_path_status.setText("\u2713")
+            self.lbl_path_status.setStyleSheet(
+                "color: #4ade80; font-size: 14px; font-weight: 700; background: transparent;"
+            )
+            self.lbl_path_hint.setText(f"Game folder: {game_dir}")
+            self.lbl_path_hint.setToolTip(str(game_dir))
+        elif target:
+            self.lbl_path_status.setText("!")
+            self.lbl_path_status.setStyleSheet(
+                "color: #f0b429; font-size: 14px; font-weight: 700; background: transparent;"
+            )
+            self.lbl_path_hint.setText("No eboot.bin found at this path. Drag eboot.bin or the game folder here.")
+            self.lbl_path_hint.setToolTip(target)
+        else:
+            self.lbl_path_status.setText("\u2022")
+            self.lbl_path_status.setStyleSheet(
+                "color: #6a6a78; font-size: 14px; font-weight: 700; background: transparent;"
+            )
+            self.lbl_path_hint.setText("Select eboot.bin or drag the game folder here.")
+            self.lbl_path_hint.setToolTip("")
+
+        if game_dir is not None:
+            self._set_setup_checks("ok", "unknown", "unknown")
+        elif target:
+            self._set_setup_checks("fail", "unknown", "unknown")
+        else:
+            self._set_setup_checks("unknown", "unknown", "unknown")
+
+        running = self._run_started is not None or bool(self.worker and self.worker.isRunning())
+        if running:
+            return
+
+        self.btn_launch.setEnabled(self._path_valid)
+        if self._path_valid:
+            self._setup_kind = "checking"
+            self._set_run_info("checking", "\u25cf Checking setup...")
+        elif target:
+            self._setup_kind = "error"
+            self._set_run_info("error", "\u25cf Invalid game path")
+        else:
+            self._setup_kind = "empty"
+            self._set_run_info("empty", "\u25cf Select a game path")
+
+    def _set_run_info(self, kind: str, text: str):
+        colors = {
+            "ready": "#4ade80",
+            "warn": "#f0b429",
+            "error": "#e65555",
+            "checking": "#f0b429",
+            "running": "#4ade80",
+            "idle": "#6a6a78",
+            "empty": "#6a6a78",
+        }
+        self.lbl_run_info.setText(text)
+        self.lbl_run_info.setStyleSheet(
+            f"color: {colors.get(kind, '#92929e')}; font-size: 12px; font-weight: 600; background: transparent;"
+        )
+
+    def _set_setup_display(self, kind: str, summary: str, details: str = ""):
+        self._setup_kind = kind
+        colors = {
+            "ready": "#4ade80",
+            "warn": "#f0b429",
+            "checking": "#f0b429",
+            "error": "#e65555",
+            "empty": "#6a6a78",
+        }
+        self.lbl_setup_dot.setStyleSheet(
+            f"color: {colors.get(kind, '#6a6a78')}; font-size: 13px; background: transparent;"
+        )
+        self.lbl_setup_summary.setText(summary)
+        self.lbl_setup_summary.setToolTip(summary)
+        self._setup_details_text = details
+        self.btn_setup_details.setVisible(bool(details.strip()))
+        self.btn_setup_details.setText("Details")
+
+        if self._run_started is None:
+            run_labels = {
+                "ready": "\u25cf Ready",
+                "warn": "\u25cf Ready (warnings)",
+                "checking": "\u25cf Checking setup...",
+                "error": "\u25cf Setup needs attention",
+                "empty": "\u25cf Select a game path",
+            }
+            if kind in run_labels:
+                self._set_run_info(kind, run_labels[kind])
+
+    def _set_setup_checks(self, game: str, vulkan: str, avx: str):
+        if not hasattr(self, "lbl_check_game"):
+            return
+        icons = {"ok": "\u2713", "warn": "!", "fail": "\u2715", "unknown": "\u00b7"}
+        colors = {
+            "ok": "#4ade80",
+            "warn": "#f0b429",
+            "fail": "#e65555",
+            "unknown": "#5a5a66",
+        }
+        for label, name, state in (
+            (self.lbl_check_game, "Game files", game),
+            (self.lbl_check_vulkan, "Vulkan / GPU", vulkan),
+            (self.lbl_check_avx, "AVX", avx),
+        ):
+            label.setText(f"{icons.get(state, '\u00b7')} {name}")
+            label.setStyleSheet(
+                f"color: {colors.get(state, '#5a5a66')}; font-size: 11px; background: transparent;"
+            )
+
+    def refresh_setup_status(self):
+        if hasattr(self, "_setup_timer"):
+            self._setup_timer.stop()
+        target = self.txt_eboot.text().strip()
+
+        if not target:
+            self._set_setup_display("empty", "Select a game path to begin.")
+            self._set_setup_checks("unknown", "unknown", "unknown")
+            return
+
+        game_dir = resolve_game_dir(target)
+        if not game_dir:
+            self._set_setup_display(
+                "error",
+                "Path does not contain an eboot.bin.",
+                f"Selected path:\n{target}\n\nNo eboot.bin was found in that folder.",
+            )
+            self._set_setup_checks("fail", "unknown", "unknown")
+            return
+
+        try:
+            ready, err, details = verify_prelaunch(game_dir)
+        except Exception as ex:
+            ready, err, details = False, str(ex), []
+
+        detail_lines = [str(line) for line in (details or [])]
+        if err:
+            detail_lines.extend(["", str(err)])
+        details_text = "\n".join(detail_lines).strip()
+
+        if ready:
+            has_warnings = any(line.lstrip().upper().startswith("[WARN") for line in detail_lines)
+            kind = "warn" if has_warnings else "ready"
+            summary = "Ready to launch (with warnings)." if has_warnings else "Ready to launch."
+        else:
+            first = next((line.strip() for line in str(err or "").splitlines() if line.strip()), "")
+            summary_text = first.rstrip(":").strip() or "Setup needs attention"
+            summary = summary_text if summary_text.endswith((".", ")", "!")) else summary_text + "."
+            kind = "error"
+
+        self._set_setup_display(kind, summary, details_text)
+
+        if "Game File Verification Failed" in str(err or "") or "Missing eboot.bin" in str(err or ""):
+            game_state = "fail"
+        elif any(("[OK] Game executable" in line or "[OK] Game Title" in line) for line in detail_lines):
+            game_state = "ok"
+        else:
+            game_state = "fail" if not ready else "unknown"
+
+        vk_line = next((line for line in detail_lines if "Vulkan runtime" in line), "")
+        if "[OK]" in vk_line:
+            vulkan_state = "ok"
+        elif "[WARN]" in vk_line:
+            vulkan_state = "warn"
+        else:
+            vulkan_state = "unknown"
+
+        avx_line = next((line for line in detail_lines if "CPU Architecture" in line), "")
+        if "[OK]" in avx_line:
+            avx_state = "ok"
+        elif "AVX" in str(err or "") or "Unsupported CPU" in str(err or ""):
+            avx_state = "fail"
+        else:
+            avx_state = "unknown"
+
+        self._set_setup_checks(game_state, vulkan_state, avx_state)
+
+    def show_setup_details(self):
+        details = str(getattr(self, "_setup_details_text", "") or "").strip()
+        if not details:
+            details = self.lbl_setup_summary.text()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Setup Details")
+        dialog.setStyleSheet(STYLE_SHEET)
+        dialog.setMinimumSize(620, 360)
+        dialog.resize(680, 400)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+
+        title = QLabel(self.lbl_setup_summary.text())
+        title.setObjectName("CardTitle")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        text = QPlainTextEdit(details)
+        text.setReadOnly(True)
+        text.setStyleSheet(
+            'background-color: #101014; color: #dcdce0; border: 1px solid #24242d; '
+            'border-radius: 5px; padding: 8px; '
+            'font-family: "Consolas", monospace; font-size: 11px;'
+        )
+        layout.addWidget(text, 1)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        btn_close = QPushButton("Close")
+        btn_close.setObjectName("SecondaryBtn")
+        btn_close.setFixedWidth(96)
+        btn_close.clicked.connect(dialog.accept)
+        row.addWidget(btn_close)
+        layout.addLayout(row)
+        dialog.exec()
+
+    def open_game_folder(self):
+        target = self.txt_eboot.text().strip()
+        game_dir = resolve_game_dir(target) if target else None
+        if not game_dir:
+            QMessageBox.information(
+                self,
+                "Game Folder",
+                "Select a valid eboot.bin or game folder first.",
+            )
+            return
+        try:
+            os.startfile(str(game_dir))
+        except OSError as ex:
+            QMessageBox.critical(self, "Game Folder", f"Could not open the game folder:\n{ex}")
+
+    def update_home_summary(self):
+        if not hasattr(self, "home_chips"):
+            return
+
+        cfg = self.current_config()
+        ini = self.load_bbport_ini()
+
+        def set_chip(key: str, text: str, tip: str):
+            chip = self.home_chips.get(key)
+            if chip is not None:
+                chip.setText(text)
+                chip.setToolTip(tip)
+
+        fps = str(cfg.get("fps", "60"))
+        fps_text = "Uncapped" if fps.lower() == "uncap" else f"{fps} FPS"
+        set_chip("fps", fps_text, "Target framerate - click to open Display & Graphics")
+
+        res = str(cfg.get("res", "")).replace(" (Native)", "").replace("x", "\u00d7")
+        set_chip("res", res or "Resolution", "Render resolution - click to open Display & Graphics")
+
+        window = str(cfg.get("window_mode", "Windowed"))
+        set_chip("window", window, "Window mode - click to open Display & Graphics")
+
+        aa = str(cfg.get("anti_aliasing", ""))
+        model = str(cfg.get("upscaler_model", "Off"))
+        if "TAA" in aa:
+            upscaler = "TAA"
+        elif not cfg.get("feat_upscaler") or model == "Off":
+            upscaler = "No upscaler"
+        else:
+            upscaler = model
+        set_chip("upscaler", upscaler, "Upscaler - click to open Display & Graphics")
+
+        mk_value = str(ini.get("mk_enabled", "1")).strip().lower()
+        mk_on = mk_value not in ("0", "", "false", "off", "no")
+        set_chip("mk", "M&K On" if mk_on else "M&K Off", "Mouse & Keyboard mode")
+
+        patches = list(cfg.get("enabled_patches", []))
+        if ("Disable" in aa or "TAA" in aa) and "Disable AA" not in patches:
+            patches.append("Disable AA")
+        patch_count = len(patches)
+        set_chip(
+            "patches",
+            f"{patch_count} patch" if patch_count == 1 else f"{patch_count} patches",
+            "Enabled patches - click to open Patches",
+        )
+
+        mods = bool(cfg.get("mods"))
+        set_chip("mods", "Mods On" if mods else "Mods Off", "Mods - click to open Advanced Settings")
+
+    def update_run_clock(self):
+        if self._run_started is None:
+            return
+        elapsed = max(0, int(time.monotonic() - self._run_started))
+        hours, rem = divmod(elapsed, 3600)
+        minutes, seconds = divmod(rem, 60)
+        if hours:
+            clock = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        else:
+            clock = f"{minutes:02d}:{seconds:02d}"
+        self._set_run_info("running", f"\u25cf Game Running \u2014 {clock}")
+
+    @staticmethod
+    def _format_duration(seconds) -> str:
+        try:
+            total = max(0, int(seconds))
+        except (TypeError, ValueError):
+            return ""
+        if total < 60:
+            return f"{total}s"
+        minutes, secs = divmod(total, 60)
+        if minutes < 60:
+            return f"{minutes}m {secs:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes:02d}m"
+
+    def update_last_run(self):
+        if not hasattr(self, "lbl_last_run"):
+            return
+        stamp = str(self.settings.get("last_run_time", "") or "")
+        if not stamp:
+            self.lbl_last_run.setText("No launch recorded yet. Launch the game to populate this panel.")
+            self.lbl_last_run.setStyleSheet("color: #7c7c88; font-size: 11px; background: transparent;")
+            self.lbl_last_run.setToolTip("")
+            return
+
+        try:
+            when_dt = datetime.fromisoformat(stamp)
+            days_ago = (datetime.now().date() - when_dt.date()).days
+            if days_ago == 0:
+                when = f"today {when_dt:%H:%M}"
+            elif days_ago == 1:
+                when = f"yesterday {when_dt:%H:%M}"
+            else:
+                when = when_dt.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            when = stamp
+
+        try:
+            rc = int(self.settings.get("last_run_rc"))
+        except (TypeError, ValueError):
+            rc = None
+
+        if rc is None:
+            result = "result unknown"
+        elif rc == 0:
+            result = "exited normally"
+        elif rc < 0:
+            result = "launch failed"
+        else:
+            result = f"exited with code {rc}"
+
+        duration = self._format_duration(self.settings.get("last_run_duration", 0))
+        text = f"Last launch: {when} \u00b7 {result}"
+        if duration:
+            text += f" \u00b7 {duration}"
+
+        self.lbl_last_run.setText(text)
+        if rc == 0:
+            color = "#7fb08a"
+        elif rc is None:
+            color = "#7c7c88"
+        else:
+            color = "#e0a33c"
+        self.lbl_last_run.setStyleSheet(
+            f"color: {color}; font-size: 11px; background: transparent;"
+        )
+        self.lbl_last_run.setToolTip(
+            f"Recorded: {stamp}" + (f"\nDuration: {duration}" if duration else "")
+        )
+
+    def copy_diagnostics(self):
+        try:
+            text = self._build_diagnostics()
+        except Exception as ex:
+            QMessageBox.critical(self, "Diagnostics", f"Could not build diagnostics:\n{ex}")
+            return
+        QApplication.clipboard().setText(text)
+        self.log("[DIAG] Diagnostics copied to the clipboard.")
+        if hasattr(self, "btn_diag"):
+            self.btn_diag.setText("Copied")
+            QTimer.singleShot(1600, lambda: self.btn_diag.setText("Copy Diagnostics"))
+
+    def _build_diagnostics(self) -> str:
+        cfg = self.current_config()
+        game_dir = resolve_game_dir(cfg.get("eboot", ""))
+        lines = [
+            "Bloodborne PC Launcher diagnostics",
+            f"Generated: {datetime.now():%Y-%m-%d %H:%M:%S}",
+            f"Launcher: v{LAUNCHER_VERSION} ({build_stamp() or 'unknown build'})",
+            f"Mode: {'frozen exe' if getattr(sys, 'frozen', False) else 'python source'}",
+            f"OS: {self._os_label()}",
+            f"CPU: {platform.processor() or 'unknown'} ({os.cpu_count() or '?'} logical cores)",
+            f"Game path: {cfg.get('eboot', '') or '(not set)'}",
+            f"Game folder: {game_dir or '(not resolved)'}",
+            f"Vulkan runtime: {'vulkan-1.dll loaded' if self._vulkan_available() else 'not detected'}",
+            "GPU / driver:",
+        ]
+
+        gpu_lines = self._gpu_driver_lines()
+        if gpu_lines:
+            lines.extend(f"  {line}" for line in gpu_lines)
+        else:
+            lines.append("  (not detected)")
+
+        lines.extend([
+            "",
+            "Active configuration:",
+            json.dumps(cfg, indent=2, ensure_ascii=False),
+        ])
+
+        ini = self.load_bbport_ini()
+        if ini:
+            lines.extend([
+                "",
+                "bbport.ini snapshot:",
+                json.dumps(ini, indent=2, ensure_ascii=False),
+            ])
+
+        tail = [str(line) for line in getattr(self, "_log_history", [])[-200:]]
+        if not tail and LOG_FILE.is_file():
+            try:
+                tail = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]
+            except OSError:
+                tail = []
+        if tail:
+            lines.extend(["", f"Last {len(tail)} console lines:", *tail])
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _os_label() -> str:
+        if os.name == "nt":
+            try:
+                version = sys.getwindowsversion()
+                return f"Windows {version.major}.{version.minor}.{version.build}"
+            except Exception:
+                pass
+        return platform.platform()
+
+    @staticmethod
+    def _vulkan_available() -> bool:
+        try:
+            lib = ctypes.CDLL("vulkan-1.dll")
+            handle = getattr(lib, "_handle", None)
+            if os.name == "nt" and handle:
+                ctypes.windll.kernel32.FreeLibrary(ctypes.c_void_p(handle))
+            return True
+        except OSError:
+            return False
+
+    def _gpu_driver_lines(self) -> list[str]:
+        lines = []
+        if os.name == "nt":
+            try:
+                import winreg
+
+                base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as root:
+                    index = 0
+                    while True:
+                        try:
+                            subkey = winreg.EnumKey(root, index)
+                        except OSError:
+                            break
+                        index += 1
+                        if not subkey.isdigit():
+                            continue
+                        try:
+                            with winreg.OpenKey(root, subkey) as adapter:
+                                desc = str(winreg.QueryValueEx(adapter, "DriverDesc")[0]).strip()
+                                version = str(winreg.QueryValueEx(adapter, "DriverVersion")[0]).strip()
+                                if desc:
+                                    lines.append(f"{desc} \u2014 driver {version or 'unknown'}")
+                        except OSError:
+                            continue
+            except Exception:
+                pass
+
+        if not lines:
+            chosen = str(self.settings.get("gpu", "") or "Auto (Vulkan default)")
+            lines.append(f"{chosen} (driver version unavailable)")
+        return lines
+
+    def open_log_file(self):
+        target = LOG_FILE if LOG_FILE.is_file() else LOG_DIR
+        if not target.exists():
+            QMessageBox.information(
+                self,
+                "Engine Log",
+                f"No engine log found yet.\n\nExpected location:\n{LOG_FILE}",
+            )
+            return
+        try:
+            os.startfile(str(target))
+        except OSError as ex:
+            QMessageBox.critical(self, "Engine Log", f"Could not open the log:\n{ex}")
+
+    def save_log(self):
+        if not self._log_history:
+            QMessageBox.information(self, "Console Log", "There is no console output to save yet.")
+            return
+        default_name = str(APP_DIR / f"bblauncher_console_{datetime.now():%Y%m%d_%H%M%S}.log")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Console Output",
+            default_name,
+            "Log files (*.log);;Text files (*.txt);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text("\n".join(self._log_history) + "\n", encoding="utf-8")
+            self.log(f"[LOG] Console output saved to: {path}")
+        except OSError as ex:
+            QMessageBox.critical(self, "Save Console Log", f"Could not save the log:\n{ex}")
+
+    def on_log_filter_changed(self, _index=None):
+        self._log_filter = self.cmb_log_filter.currentData() or "hide_vk"
+        self.save_settings()
+        self.apply_log_filter()
+
+    def on_log_autoscroll_changed(self, _state=None):
+        self.save_settings()
+        if self.chk_autoscroll.isChecked():
+            self.log_view.moveCursor(QTextCursor.End)
+
+    def _line_visible(self, line: str) -> bool:
+        text = str(line)
+        if self._log_filter == "all":
+            return True
+        if self._log_filter == "hide_vk":
+            return VK_NOISE not in text
+
+        low = text.lower()
+        if VK_NOISE in text:
+            return False
+        prefixes = ("[warn", "[error", "[pre-launch", "[cache", "[diag", "process exited", "launch error", "traceback")
+        if low.startswith(prefixes):
+            return True
+        return any(word in low for word in ("error", "warning", "failed", "fatal", "exception", "crash"))
+
+    def apply_log_filter(self):
+        if not hasattr(self, "log_view"):
+            return
+        visible = [str(line) for line in self._log_history if self._line_visible(line)]
+        self.hidden_count = len(self._log_history) - len(visible)
+        self.log_view.clear()
+        if visible:
+            self.log_view.setPlainText("\n".join(visible))
+        if hasattr(self, "chk_autoscroll") and self.chk_autoscroll.isChecked():
+            self.log_view.moveCursor(QTextCursor.End)
+
+    def update_cache_info(self):
+        if not hasattr(self, "lbl_cache_info"):
+            return
+        cache_dir = self._user_dir() / "cache"
+        files = []
+        if cache_dir.is_dir():
+            try:
+                files = [path for path in cache_dir.rglob("*") if path.is_file()]
+            except OSError:
+                files = []
+        total = 0
+        for path in files:
+            try:
+                total += path.stat().st_size
+            except OSError:
+                pass
+        if files:
+            text = f"Shader cache: {self._format_size(total)} \u00b7 {len(files)} files"
+        else:
+            text = "Shader cache: empty"
+        self.lbl_cache_info.setText(text)
+        self.lbl_cache_info.setToolTip(str(cache_dir))
+        if hasattr(self, "btn_cache"):
+            self.btn_cache.setEnabled(bool(files))
+            self.btn_cache.setToolTip(f"Delete compiled shaders from:\n{cache_dir}")
+
+    @staticmethod
+    def _format_size(size: float) -> str:
+        value = float(size)
+        for unit in ("B", "KB", "MB", "GB"):
+            if value < 1024 or unit == "GB":
+                return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+            value /= 1024
+        return f"{value:.1f} GB"
 
     def load_bbport_ini(self) -> dict:
         ini_path = APP_DIR / "bbport.ini"
@@ -189,62 +942,105 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         return values
 
     def save_bbport_ini(self):
-        if not getattr(self, "_settings_built", False):
+        if getattr(self, "_syncing_ini", False):
             return
-        ini_path = APP_DIR / "bbport.ini"
-        res_raw = self.cmb_res.currentText()
-        output_res_val = "1920x1080"
-        for candidate in ("1280x720", "1920x1080", "2560x1440", "3840x2160"):
-            if candidate in res_raw:
-                output_res_val = candidate
-                break
+        if getattr(self, "_suppress_settings_save", False):
+            return
+        # Native mouse look is mandatory: stick emulation was removed from the port.
+        keys_to_update = {"mk_native_mouse": "1"}
 
-        aa_choice = self.cmb_aa.currentText()
-        upscaler_choice = self.cmb_upscaler.currentText() if hasattr(self, "cmb_upscaler") else "Off"
-        is_fsr = (self.chk_fsr.isChecked() if hasattr(self, "chk_fsr") else False) and (upscaler_choice != "Off")
-        is_taa = "TAA" in aa_choice
-        is_upscaler_active = is_fsr or is_taa
-        effect_game_aa = "0" if is_upscaler_active or "Disable" in aa_choice else "1"
+        if self._display_built:
+            res_raw = self.cmb_res.currentText()
+            output_res_val = "1920x1080"
+            for candidate in ("1280x720", "1920x1080", "2560x1440", "3840x2160"):
+                if candidate in res_raw:
+                    output_res_val = candidate
+                    break
 
-        if is_taa:
-            upscaler_val = "taa"
-        elif is_fsr:
-            upscaler_val = "fsr4" if "FSR 4" in upscaler_choice else "fsr31"
-        else:
-            upscaler_val = "off"
+            aa_choice = self.cmb_aa.currentText()
+            upscaler_choice = self.cmb_upscaler.currentText()
+            is_fsr = self.chk_fsr.isChecked() and upscaler_choice != "Off"
+            is_taa = "TAA" in aa_choice
+            is_upscaler_active = is_fsr or is_taa
+            effect_game_aa = "0" if is_upscaler_active or "Disable" in aa_choice else "1"
 
-        prep_choice = self.cmb_prep_workers.currentText()
-        prep_workers_val = "auto"
-        for label, val in PREP_WORKER_CHOICES:
-            if label == prep_choice:
-                prep_workers_val = val
-                break
+            if is_taa:
+                upscaler_val = "taa"
+            elif is_fsr:
+                upscaler_val = self.cmb_upscaler.currentData() or "fsr31"
+                if upscaler_val not in ("fsr31", "fsr4", "fsr411"):
+                    upscaler_val = "fsr31"
+            else:
+                upscaler_val = "off"
 
-        gpu_choice = self.cmb_gpu.currentData() if hasattr(self, "cmb_gpu") else self.settings.get("gpu", "")
-        lang_choice = self.cmb_lang.currentData() if hasattr(self, "cmb_lang") else self.settings.get("language", "1")
+            prep_choice = self.cmb_prep_workers.currentText()
+            prep_workers_val = "auto"
+            for label, val in PREP_WORKER_CHOICES:
+                if label == prep_choice:
+                    prep_workers_val = val
+                    break
 
-        keys_to_update = {
-            "upscaler": upscaler_val,
-            "output_res": output_res_val,
-            "effect_game_aa": effect_game_aa,
-            "prep_workers": prep_workers_val,
-            "gpu": gpu_choice if gpu_choice else "",
-            "language": lang_choice if lang_choice else "1",
-            "mk_enabled": "1" if self.chk_mk_enabled.isChecked() else "0",
-            "mk_native_mouse": "1",
-            "mk_sens_x": f"{self.sl_sens_x.value() / 100:.2f}",
-            "mk_sens_y": f"{self.sl_sens_y.value() / 100:.2f}",
-            "mk_invert_x": "1" if self.chk_inv_x.isChecked() else "0",
-            "mk_invert_y": "1" if self.chk_inv_y.isChecked() else "0",
-            "mk_smoothing": f"{self.sl_smoothing.value() / 100:.2f}",
-            "mk_responsiveness": f"{self.sl_responsiveness.value() / 100:.2f}" if hasattr(self, "sl_responsiveness") else "1.00",
-            "mk_acceleration": f"{self.sl_acceleration.value() / 100:.2f}" if hasattr(self, "sl_acceleration") else "1.00",
-            "mouse_menu": "1" if self.chk_mouse_menu.isChecked() else "0",
-        }
-        if hasattr(self, "keybind_buttons"):
+            keys_to_update.update({
+                "upscaler": upscaler_val,
+                "preset": self.cmb_preset.currentData() or "0",
+                "output_res": output_res_val,
+                "effect_game_aa": effect_game_aa,
+                "prep_workers": prep_workers_val,
+                "gpu": self.cmb_gpu.currentData() or "",
+                "live_resolution": self.cmb_live_res.currentData() or "0",
+                "sharpen": "1" if self.chk_sharpen.isChecked() else "0",
+                "sharpness": f"{self.sl_sharpness.value() / 100:.2f}",
+                "jitter": "1" if self.chk_jitter.isChecked() else "0",
+                "reactive": "1" if self.chk_reactive.isChecked() else "0",
+                "object_motion": "1" if self.chk_object_motion.isChecked() else "0",
+                "reactive_scale": f"{self.sl_reactive_scale.value() / 100:.2f}",
+                "reactive_threshold": f"{self.sl_reactive_threshold.value() / 100:.2f}",
+                "reactive_max": f"{self.sl_reactive_max.value() / 100:.2f}",
+                "fsr4_auto_exposure": "1" if self.chk_fsr4_auto_exposure.isChecked() else "0",
+                "fsr4_invert_jitter": "1" if self.chk_fsr4_invert_jitter.isChecked() else "0",
+                "debug_view": self.cmb_debug_view.currentData() or "0",
+                "show_fps": "1" if self.chk_show_fps.isChecked() else "0",
+                "show_hud": "1" if self.chk_hud.isChecked() else "0",
+                "hud_quadrant": self.cmb_hud_quadrant.currentData() or "0",
+                "hud_opacity": f"{self.sl_hud_opacity.value() / 100:.2f}",
+                "hud_scale": f"{self.sl_hud_scale.value() / 100:.2f}",
+                "model_lod": self.cmb_model_lod.currentData() or "0",
+            })
+            for effect_key, chk in self.effect_checks.items():
+                keys_to_update[effect_key] = "1" if chk.isChecked() else "0"
+
+        if self._mk_built:
+            keys_to_update.update({
+                "mk_enabled": "1" if self.chk_mk_enabled.isChecked() else "0",
+                "mk_sens_x": f"{self.sl_sens_x.value() / 100:.2f}",
+                "mk_sens_y": f"{self.sl_sens_y.value() / 100:.2f}",
+                "mk_invert_x": "1" if self.chk_inv_x.isChecked() else "0",
+                "mk_invert_y": "1" if self.chk_inv_y.isChecked() else "0",
+                "mk_smoothing": f"{self.sl_smoothing.value() / 100:.2f}",
+                "mk_responsiveness": f"{self.sl_responsiveness.value() / 100:.2f}",
+                "mk_acceleration": f"{self.sl_acceleration.value() / 100:.2f}",
+                "mouse_menu": "1" if self.chk_mouse_menu.isChecked() else "0",
+            })
             for k, btn in self.keybind_buttons.items():
                 keys_to_update[k] = btn.current_binding
 
+        if self._advanced_built:
+            keys_to_update["language"] = self.cmb_menu_lang.currentData() or "en"
+
+        if not keys_to_update:
+            return
+        if self._write_ini_values(keys_to_update):
+            changed = self._sync_patches_from_ini(persist=True)
+            if not changed and hasattr(self, "home_chips"):
+                self.update_home_summary()
+
+    def _write_ini_values(self, keys_to_update: dict) -> bool:
+        if not keys_to_update:
+            return False
+        if getattr(self, "_syncing_ini", False) or getattr(self, "_suppress_settings_save", False):
+            return False
+
+        ini_path = APP_DIR / "bbport.ini"
         lines = []
         written = set()
         if ini_path.is_file():
@@ -252,26 +1048,28 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 for line in ini_path.read_text(encoding="utf-8").splitlines():
                     trimmed = line.strip()
                     if trimmed and not trimmed.startswith("#") and "=" in trimmed:
-                        k, _ = trimmed.split("=", 1)
-                        k = k.strip()
-                        if k in keys_to_update:
-                            lines.append(f"{k}={keys_to_update[k]}")
-                            written.add(k)
+                        key, _ = trimmed.split("=", 1)
+                        key = key.strip()
+                        if key in keys_to_update:
+                            lines.append(f"{key}={keys_to_update[key]}")
+                            written.add(key)
                             continue
                     lines.append(line)
             except OSError:
                 pass
 
-        for k, v in keys_to_update.items():
-            if k not in written:
-                lines.append(f"{k}={v}")
+        for key, value in keys_to_update.items():
+            if key not in written:
+                lines.append(f"{key}={value}")
 
         try:
             ini_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             self._last_ini_mtime = ini_path.stat().st_mtime
-            self.log("[M&K] Settings updated successfully in bbport.ini")
+            self.log("[Settings] bbport.ini updated.")
+            return True
         except OSError as ex:
             self.log(f"[ERROR] Could not write to {ini_path}: {ex}")
+            return False
 
     def on_keybind_button_assigned(self, action_key: str, new_val: str):
         if not hasattr(self, "keybind_buttons"):
@@ -296,8 +1094,240 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.save_bbport_ini()
         self.log("[Keybinds] Reset all keybinds to defaults.")
 
+    def browse_path(self, edit, kind: str):
+        start = edit.text().strip() or str(APP_DIR)
+        if kind == "dir":
+            path = QFileDialog.getExistingDirectory(self, "Select directory", start)
+        else:
+            path, _ = QFileDialog.getOpenFileName(self, "Select file", start, "All Files (*)")
+        if path:
+            edit.setText(os.path.normpath(path))
+            self.save_settings()
+
+    def save_advanced(self):
+        self.save_settings()
+        self.save_bbport_ini()
+        self.log("[Settings] Advanced settings saved.")
+
+    def open_bbport_ini(self):
+        ini_path = APP_DIR / "bbport.ini"
+        if not ini_path.is_file():
+            QMessageBox.information(self, "bbport.ini", f"File not found:\n{ini_path}")
+            return
+        try:
+            os.startfile(str(ini_path))
+        except OSError as ex:
+            QMessageBox.critical(self, "bbport.ini", f"Could not open the file:\n{ex}")
+
+    def reload_bbport_ini(self):
+        self._last_ini_mtime = 0
+        self.sync_bbport_ini_to_ui()
+        self.log("[Settings] Reloaded values from bbport.ini.")
+
+    @staticmethod
+    def _ini_bool(opts: dict, key: str, default: bool) -> bool:
+        value = str(opts.get(key, "1" if default else "0")).strip().lower()
+        return value not in ("0", "", "false", "off", "no")
+
+    @staticmethod
+    def _ini_percent(opts: dict, key: str, default: float, minimum: int, maximum: int) -> int:
+        try:
+            value = int(round(float(opts.get(key, str(default))) * 100))
+        except (TypeError, ValueError):
+            value = int(round(default * 100))
+        return max(minimum, min(maximum, value))
+
+    @staticmethod
+    def _set_check(chk, checked: bool):
+        chk.blockSignals(True)
+        chk.setChecked(bool(checked))
+        chk.blockSignals(False)
+
+    @staticmethod
+    def _set_combo_data(combo, value: str):
+        text = str(value).strip()
+        idx = combo.findData(text.lower())
+        if idx < 0:
+            idx = combo.findData(text)
+        if idx >= 0 and combo.currentIndex() != idx:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+
+    @staticmethod
+    def _set_slider(slider, label, value: int):
+        value = max(slider.minimum(), min(slider.maximum(), value))
+        slider.blockSignals(True)
+        slider.setValue(value)
+        slider.blockSignals(False)
+        label.setText(f"{value / 100:.2f}")
+
+    @staticmethod
+    def _patch_value_for_state(active_value: str, enabled: bool) -> str:
+        if enabled:
+            return active_value
+        return "1" if active_value == "0" else "0"
+
+    def _set_effect_checkbox(self, key: str, value: str):
+        if not self._display_built:
+            return
+        chk = getattr(self, "effect_checks", {}).get(key)
+        if chk is None:
+            return
+        self._set_check(chk, str(value).strip() == "1")
+
+    def _update_enabled_patches_from_ini(self, ini_opts: dict | None = None) -> bool:
+        if ini_opts is None:
+            ini_opts = self.load_bbport_ini()
+        changed = False
+        for name, (key, active_value) in EFFECT_PATCH_MAP.items():
+            if key not in ini_opts:
+                continue
+            effect_on = self._ini_bool(ini_opts, key, active_value == "1")
+            enabled = effect_on if active_value == "1" else not effect_on
+            if enabled and name not in self.enabled_patches:
+                self.enabled_patches.add(name)
+                changed = True
+            elif not enabled and name in self.enabled_patches:
+                self.enabled_patches.discard(name)
+                changed = True
+        return changed
+
+    def _sync_patches_from_ini(self, ini_opts: dict | None = None, persist: bool = False) -> bool:
+        changed = self._update_enabled_patches_from_ini(ini_opts)
+        self.sync_patches_to_ui()
+        if changed:
+            if persist:
+                self.save_settings()
+            elif hasattr(self, "home_chips"):
+                self.update_home_summary()
+        return changed
+
+    def _apply_patch_states_to_ini(self):
+        updates = {
+            key: self._patch_value_for_state(active_value, name in self.enabled_patches)
+            for name, (key, active_value) in EFFECT_PATCH_MAP.items()
+        }
+        if not updates:
+            return
+        if self._write_ini_values(updates):
+            for key, value in updates.items():
+                self._set_effect_checkbox(key, value)
+
+    def _sync_display_from_ini(self, ini_opts: dict):
+        ini_upscaler = ini_opts.get("upscaler", "off").strip().lower()
+        if ini_upscaler in ("fsr3", "fsr31"):
+            upscaler_value = "fsr31"
+        elif ini_upscaler == "fsr4":
+            upscaler_value = "fsr4"
+        elif ini_upscaler == "fsr411":
+            upscaler_value = "fsr411"
+        else:
+            upscaler_value = "off"
+        self._set_combo_data(self.cmb_upscaler, upscaler_value)
+        self._set_check(self.chk_fsr, upscaler_value != "off")
+        self._set_combo_data(self.cmb_preset, ini_opts.get("preset", "1"))
+        self._set_combo_data(self.cmb_live_res, ini_opts.get("live_resolution", "0").strip().lower())
+        self._set_combo_data(self.cmb_hud_quadrant, ini_opts.get("hud_quadrant", "0"))
+        self._set_combo_data(self.cmb_debug_view, ini_opts.get("debug_view", "0"))
+        self._set_combo_data(self.cmb_model_lod, ini_opts.get("model_lod", "0"))
+
+        ini_pw = ini_opts.get("prep_workers", "auto").strip().lower()
+        for label, val in PREP_WORKER_CHOICES:
+            if val == ini_pw or (ini_pw == "auto" and val == "auto"):
+                self.cmb_prep_workers.blockSignals(True)
+                self.cmb_prep_workers.setCurrentText(label)
+                self.cmb_prep_workers.blockSignals(False)
+                break
+
+        ini_res = ini_opts.get("output_res", "").strip()
+        if ini_res:
+            for idx_res in range(self.cmb_res.count()):
+                if ini_res in self.cmb_res.itemText(idx_res):
+                    self.cmb_res.blockSignals(True)
+                    self.cmb_res.setCurrentIndex(idx_res)
+                    self.cmb_res.blockSignals(False)
+                    break
+
+        for chk, key, default in (
+            (self.chk_sharpen, "sharpen", True),
+            (self.chk_jitter, "jitter", True),
+            (self.chk_reactive, "reactive", False),
+            (self.chk_object_motion, "object_motion", False),
+            (self.chk_fsr4_auto_exposure, "fsr4_auto_exposure", False),
+            (self.chk_fsr4_invert_jitter, "fsr4_invert_jitter", False),
+            (self.chk_show_fps, "show_fps", False),
+            (self.chk_hud, "show_hud", True),
+        ):
+            self._set_check(chk, self._ini_bool(ini_opts, key, default))
+
+        self._set_slider(self.sl_sharpness, self.lbl_sharpness_val, self._ini_percent(ini_opts, "sharpness", 0.30, 0, 200))
+        self._set_slider(self.sl_reactive_scale, self.lbl_reactive_scale_val, self._ini_percent(ini_opts, "reactive_scale", 1.00, 0, 1600))
+        self._set_slider(self.sl_reactive_threshold, self.lbl_reactive_threshold_val, self._ini_percent(ini_opts, "reactive_threshold", 0.20, 0, 100))
+        self._set_slider(self.sl_reactive_max, self.lbl_reactive_max_val, self._ini_percent(ini_opts, "reactive_max", 0.90, 0, 100))
+        self._set_slider(self.sl_hud_opacity, self.lbl_hud_opacity_val, self._ini_percent(ini_opts, "hud_opacity", 0.75, 10, 100))
+        self._set_slider(self.sl_hud_scale, self.lbl_hud_scale_val, self._ini_percent(ini_opts, "hud_scale", 1.00, 50, 250))
+
+        effect_defaults = {key: default for key, _label, default in EFFECT_CHOICES}
+        for effect_key, chk in self.effect_checks.items():
+            self._set_check(chk, self._ini_bool(ini_opts, effect_key, effect_defaults.get(effect_key, False)))
+
+    def _sync_mk_from_ini(self, ini_opts: dict):
+        self._set_check(self.chk_mk_enabled, self._ini_bool(ini_opts, "mk_enabled", True))
+        self._set_check(self.chk_inv_x, self._ini_bool(ini_opts, "mk_invert_x", False))
+        self._set_check(self.chk_inv_y, self._ini_bool(ini_opts, "mk_invert_y", False))
+        self._set_check(self.chk_mouse_menu, self._ini_bool(ini_opts, "mouse_menu", True))
+
+        self._set_slider(self.sl_sens_x, self.lbl_sens_x_val, self._ini_percent(ini_opts, "mk_sens_x", 3.20, 10, 1000))
+        self._set_slider(self.sl_sens_y, self.lbl_sens_y_val, self._ini_percent(ini_opts, "mk_sens_y", 3.26, 10, 1000))
+        self._set_slider(self.sl_smoothing, self.lbl_smoothing_val, self._ini_percent(ini_opts, "mk_smoothing", 0.25, 0, 80))
+        self._set_slider(self.sl_responsiveness, self.lbl_responsiveness_val, self._ini_percent(ini_opts, "mk_responsiveness", 1.00, 50, 250))
+        self._set_slider(self.sl_acceleration, self.lbl_acceleration_val, self._ini_percent(ini_opts, "mk_acceleration", 1.30, 100, 200))
+
+        for k, btn in self.keybind_buttons.items():
+            if k in ini_opts:
+                btn.set_binding(ini_opts[k])
+
+    def _sync_external_patch_settings(self):
+        if not self._patches_built:
+            return
+        try:
+            if not SETTINGS_FILE.is_file():
+                return
+            mtime = SETTINGS_FILE.stat().st_mtime
+        except OSError:
+            return
+        if mtime == getattr(self, "_last_settings_mtime", 0):
+            return
+        self._last_settings_mtime = mtime
+        try:
+            loaded = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(loaded, dict):
+            return
+
+        external = set(loaded.get("enabled_patches", []) or [])
+        changed = False
+        for patch in self.all_xml_patches:
+            name = str(patch.get("name", ""))
+            if not name or name in EFFECT_PATCH_MAP:
+                continue
+            should_enable = name in external
+            if should_enable and name not in self.enabled_patches:
+                self.enabled_patches.add(name)
+                changed = True
+            elif not should_enable and name in self.enabled_patches:
+                self.enabled_patches.discard(name)
+                changed = True
+        if changed:
+            self.settings["enabled_patches"] = sorted(self.enabled_patches)
+            self.sync_patches_to_ui()
+            self.update_home_summary()
+
     def sync_bbport_ini_to_ui(self):
-        if not getattr(self, "_settings_built", False):
+        self._sync_external_patch_settings()
+        if not (self._display_built or self._mk_built or self._advanced_built or self._patches_built):
             return
         ini_path = APP_DIR / "bbport.ini"
         if not ini_path.is_file():
@@ -308,97 +1338,42 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 return
             self._last_ini_mtime = mtime
             ini_opts = self.load_bbport_ini()
-            widgets = [self.sl_sens_x, self.sl_sens_y, self.sl_smoothing,
-                       self.chk_mk_enabled, self.chk_inv_x, self.chk_inv_y, self.chk_mouse_menu]
-            if hasattr(self, "sl_responsiveness"): widgets.append(self.sl_responsiveness)
-            if hasattr(self, "sl_acceleration"): widgets.append(self.sl_acceleration)
-            for w in widgets:
-                w.blockSignals(True)
-
-            self.chk_mk_enabled.setChecked(ini_opts.get("mk_enabled", "1") != "0")
-
-            sx = int(float(ini_opts.get("mk_sens_x", "1.50")) * 100)
-            self.sl_sens_x.setValue(max(10, min(1000, sx)))
-            self.lbl_sens_x_val.setText(f"{self.sl_sens_x.value() / 100:.2f}")
-
-            sy = int(float(ini_opts.get("mk_sens_y", "1.50")) * 100)
-            self.sl_sens_y.setValue(max(10, min(1000, sy)))
-            self.lbl_sens_y_val.setText(f"{self.sl_sens_y.value() / 100:.2f}")
-
-            sm = int(float(ini_opts.get("mk_smoothing", "0.00")) * 100)
-            self.sl_smoothing.setValue(max(0, min(80, sm)))
-            self.lbl_smoothing_val.setText(f"{self.sl_smoothing.value() / 100:.2f}")
-
-            if hasattr(self, "sl_responsiveness"):
-                resp = int(float(ini_opts.get("mk_responsiveness", "1.00")) * 100)
-                self.sl_responsiveness.setValue(max(50, min(250, resp)))
-                self.lbl_responsiveness_val.setText(f"{self.sl_responsiveness.value() / 100:.2f}")
-
-            if hasattr(self, "sl_acceleration"):
-                acc = int(float(ini_opts.get("mk_acceleration", "1.00")) * 100)
-                self.sl_acceleration.setValue(max(100, min(200, acc)))
-                self.lbl_acceleration_val.setText(f"{self.sl_acceleration.value() / 100:.2f}")
-
-            self.chk_inv_x.setChecked(ini_opts.get("mk_invert_x", "0") != "0")
-            self.chk_inv_y.setChecked(ini_opts.get("mk_invert_y", "0") != "0")
-            self.chk_mouse_menu.setChecked(ini_opts.get("mouse_menu", "1") != "0")
-
-            if hasattr(self, "cmb_prep_workers"):
-                ini_pw = ini_opts.get("prep_workers", "auto").strip().lower()
-                for label, val in PREP_WORKER_CHOICES:
-                    if val == ini_pw or (ini_pw == "auto" and val == "auto"):
-                        self.cmb_prep_workers.blockSignals(True)
-                        self.cmb_prep_workers.setCurrentText(label)
-                        self.cmb_prep_workers.blockSignals(False)
-                        break
-
-            for w in widgets:
-                w.blockSignals(False)
-
-            if hasattr(self, "chk_fsr") and hasattr(self, "cmb_upscaler"):
-                ini_upscaler = ini_opts.get("upscaler", "off").strip().lower()
-                self.chk_fsr.blockSignals(True)
-                self.cmb_upscaler.blockSignals(True)
-                if ini_upscaler in ("fsr3", "fsr31"):
-                    self.chk_fsr.setChecked(True)
-                    self.cmb_upscaler.setCurrentText("FSR 3.1")
-                elif ini_upscaler in ("fsr4", "fsr411"):
-                    self.chk_fsr.setChecked(True)
-                    self.cmb_upscaler.setCurrentText("FSR 4")
-                else:
-                    self.chk_fsr.setChecked(False)
-                    self.cmb_upscaler.setCurrentText("Off")
-                self.chk_fsr.blockSignals(False)
-                self.cmb_upscaler.blockSignals(False)
-
-            if hasattr(self, "cmb_res"):
-                ini_res = ini_opts.get("output_res", "").strip()
-                if ini_res:
-                    for idx_res in range(self.cmb_res.count()):
-                        if ini_res in self.cmb_res.itemText(idx_res):
-                            self.cmb_res.blockSignals(True)
-                            self.cmb_res.setCurrentIndex(idx_res)
-                            self.cmb_res.blockSignals(False)
-                            break
-
-            if hasattr(self, "keybind_buttons"):
-                for k, btn in self.keybind_buttons.items():
-                    if k in ini_opts:
-                        btn.set_binding(ini_opts[k])
+            self._syncing_ini = True
+            try:
+                if self._display_built:
+                    self._sync_display_from_ini(ini_opts)
+                if self._mk_built:
+                    self._sync_mk_from_ini(ini_opts)
+                if self._advanced_built:
+                    self._set_combo_data(self.cmb_menu_lang, ini_opts.get("language", "en").strip().lower())
+                if self._patches_built:
+                    self._sync_patches_from_ini(ini_opts, persist=True)
+            finally:
+                self._syncing_ini = False
         except Exception:
-            pass
-
+            self._syncing_ini = False
+        if hasattr(self, "home_chips"):
+            self.update_home_summary()
 
     def on_patch_toggled(self, name: str, state: int):
-        if state:
+        enabled = bool(state)
+        if enabled:
             self.enabled_patches.add(name)
         else:
             self.enabled_patches.discard(name)
+
+        mapped = EFFECT_PATCH_MAP.get(name)
+        if mapped:
+            key, active_value = mapped
+            value = self._patch_value_for_state(active_value, enabled)
+            if self._write_ini_values({key: value}):
+                self._set_effect_checkbox(key, value)
+
         self.update_patch_count_label()
         self.save_settings()
 
     def update_patch_count_label(self):
-        if self._patches_built:
+        if self._patches_built and hasattr(self, "lbl_patch_count"):
             self.lbl_patch_count.setText(f"{len(self.enabled_patches)} / {len(self.all_xml_patches)} enabled")
 
     def sync_patches_to_ui(self):
@@ -428,11 +1403,8 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.patch_list_widget.setUpdatesEnabled(True)
 
     def apply_recommended_patches(self):
-        self.enabled_patches = {
-            "Skip Intro",
-            "Performance Patch (perf increase)",
-            "Disable Motion Blur (perf increase)",
-        }
+        self.enabled_patches = {"Skip Intro"}
+        self._apply_patch_states_to_ini()
         self.sync_patches_to_ui()
         self.save_settings()
         self.log("[PATCHES] Recommended defaults applied.")
@@ -443,26 +1415,32 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
     def log_batch(self, lines: list[str]):
         if not lines:
             return
+        raw_lines = [str(line) for line in lines]
         if self.log_fh:
             try:
-                self.log_fh.write("\n".join(lines) + "\n")
+                self.log_fh.write("\n".join(raw_lines) + "\n")
                 self.log_fh.flush()
             except OSError:
                 pass
 
-        if self.chk_vk_noise.isChecked():
-            filtered = [ln for ln in lines if VK_NOISE not in ln]
-            self.hidden_count += len(lines) - len(filtered)
-            lines = filtered
+        self._log_history.extend(raw_lines)
+        if len(self._log_history) > 5000:
+            del self._log_history[:-5000]
 
-        if lines:
-            self.log_view.appendPlainText("\n".join(lines))
-            self.log_view.moveCursor(QTextCursor.End)
+        visible = [line for line in raw_lines if self._line_visible(line)]
+        self.hidden_count += len(raw_lines) - len(visible)
+
+        if visible and hasattr(self, "log_view"):
+            self.log_view.appendPlainText("\n".join(visible))
+            if self.chk_autoscroll.isChecked():
+                self.log_view.moveCursor(QTextCursor.End)
 
     def copy_log(self):
         QApplication.clipboard().setText(self.log_view.toPlainText())
 
     def clear_log(self):
+        self._log_history.clear()
+        self.hidden_count = 0
         self.log_view.clear()
 
     def browse_eboot(self):
@@ -496,6 +1474,13 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             self.log(f"[PRE-LAUNCH ERROR] {err}")
             QMessageBox.critical(self, "Verification Failed", err)
 
+    def _user_dir(self) -> Path:
+        value = self.txt_user_dir.text().strip() if self._advanced_built else str(self.settings.get("user_dir", "")).strip()
+        base = Path(value) if value else Path("user")
+        if not base.is_absolute():
+            base = APP_DIR / base
+        return base
+
     def reset_shader_cache(self):
         import shutil
 
@@ -503,9 +1488,11 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             QMessageBox.warning(self, "Busy", "Terminate game execution before resetting the shader cache.")
             return
 
-        cache_dir = shader_cache_dir()
+        self.save_settings()
+        cache_dir = self._user_dir() / "cache"
         files = [p for p in cache_dir.rglob("*") if p.is_file()] if cache_dir.is_dir() else []
         if not files:
+            self.update_cache_info()
             QMessageBox.information(self, "Cache Clear", "The shader cache is already empty.")
             return
 
@@ -521,6 +1508,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 self.log(f"[CACHE] Shader cache purged ({len(files)} files removed).")
             except OSError as ex:
                 QMessageBox.critical(self, "Error", f"Could not purge cache directory: {ex}")
+            self.update_cache_info()
 
     def blocked_by_running_instance(self) -> bool:
         found = running_instances()
@@ -554,6 +1542,20 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if self.worker and self.worker.isRunning():
             return
 
+        target = self.txt_eboot.text().strip()
+        if not target:
+            self.update_path_state()
+            self.log("[PRE-LAUNCH] Select eboot.bin or the game folder first.")
+            self.txt_eboot.setFocus()
+            return
+
+        game_dir = resolve_game_dir(target)
+        if not game_dir:
+            self.update_path_state()
+            self.log(f"[PRE-LAUNCH] eboot.bin not found in: {target}")
+            self.txt_eboot.setFocus()
+            return
+
         if self.blocked_by_running_instance():
             return
 
@@ -561,19 +1563,13 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.save_bbport_ini()
 
         cfg = self.current_config()
-        target = cfg["eboot"]
-        if not target:
-            QMessageBox.critical(self, "Error", "Select eboot.bin or the game directory first.")
-            return
-
-        game_dir = resolve_game_dir(target)
-        if not game_dir:
-            QMessageBox.critical(self, "Invalid Path", f"eboot.bin not found in:\n{target}")
-            return
-
-        ready, err, _ = verify_prelaunch(game_dir)
+        ready, err, details = verify_prelaunch(game_dir)
         if not ready:
-            QMessageBox.critical(self, "Verification Failed", err)
+            self.refresh_setup_status()
+            for line in details or []:
+                self.log(f"  {line}")
+            first = next((line.strip() for line in str(err or "").splitlines() if line.strip()), "Setup is not ready.")
+            self.log(f"[PRE-LAUNCH ERROR] {first}")
             return
 
         env = os.environ.copy()
@@ -585,22 +1581,18 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
         aa_mode = cfg.get("anti_aliasing", "Native FXAA (PS4 Default)")
         upscaler_choice = cfg.get("upscaler_model", "Off")
+        upscaler_map = {label: value for label, value in UPSCALER_CHOICES}
         if "TAA" in aa_mode:
             env["BB_UPSCALER"] = "taa"
         elif not cfg.get("feat_upscaler", False) or upscaler_choice == "Off":
             env["BB_UPSCALER"] = "off"
         else:
-            env["BB_UPSCALER"] = "fsr4" if "FSR 4" in upscaler_choice else "fsr31"
+            env["BB_UPSCALER"] = upscaler_map.get(upscaler_choice, "fsr31")
 
         if not cfg["feat_overlay"]:
             env["BB_OVERLAY"] = "0"
         else:
             env.pop("BB_OVERLAY", None)
-
-        if cfg["feat_hud"]:
-            env["BB_HUD"] = "1"
-        else:
-            env.pop("BB_HUD", None)
 
         if not cfg["feat_fps_patch"]:
             env["BB_FPS_PATCH"] = "0"
@@ -616,13 +1608,17 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 output_res_str = candidate
                 break
         env["BB_OUTPUT_RES"] = output_res_str
-        if output_res_str != "1920x1080":
-            env["BB_RENDER_RES"] = output_res_str
 
         win_mode_val = cfg["window_mode"].lower()
         env["BB_WINDOW_MODE"] = win_mode_val
         env["BB_FULLSCREEN"] = "1" if win_mode_val != "windowed" else "0"
-        env.setdefault("BB_FRAMES_AHEAD", "2")
+        frames_ahead = str(cfg.get("frames_ahead", "")).strip()
+        env["BB_FRAMES_AHEAD"] = frames_ahead or "2"
+        vblank = str(cfg.get("vblank_hz", "")).strip()
+        if vblank:
+            env["BB_VBLANK_HZ"] = vblank
+        else:
+            env.pop("BB_VBLANK_HZ", None)
 
         aniso_mapping = {c[0]: c[1] for c in ANISO_CHOICES}
         env["BB_ANISO"] = aniso_mapping.get(cfg["aniso"], "16")
@@ -645,6 +1641,22 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         lang_code = cfg.get("language", "1")
         if lang_code:
             env["BB_LANGUAGE"] = str(lang_code)
+
+        for cfg_key, env_key in (
+            ("timeout", "BB_TIMEOUT"),
+            ("dmem_mb", "BB_DMEM_MB"),
+            ("user_dir", "BB_USER_DIR"),
+            ("mods_dir", "BB_MODS_DIR"),
+            ("mods_config", "BB_MODS_CONFIG"),
+            ("patches_dir", "BB_PATCHES_DIR"),
+            ("patches_config", "BB_PATCHES_CONFIG"),
+            ("sku", "BB_CONTENT_SKU"),
+        ):
+            value = str(cfg.get(cfg_key, "")).strip()
+            if value:
+                env[env_key] = value
+            else:
+                env.pop(env_key, None)
 
         active_patches = list(cfg["enabled_patches"])
         if ("Disable" in aa_mode or "TAA" in aa_mode) and "Disable AA" not in active_patches:
@@ -670,11 +1682,19 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             "=" * 60,
         ])
 
-        cmd = ["cmd.exe", "/d", "/c", RUN_BAT.name] if os.name == "nt" else [str(RUN_BAT)]
+        extra_args = str(cfg.get("extra_args", "")).strip()
+        if os.name == "nt":
+            bat_cmd = RUN_BAT.name + (f" {extra_args}" if extra_args else "")
+            cmd = ["cmd.exe", "/d", "/c", bat_cmd]
+        else:
+            cmd = [str(RUN_BAT)]
 
         self.save_settings()
-        if self._settings_built:
-            self.save_bbport_ini()
+        self.save_bbport_ini()
+
+        self._run_started = time.monotonic()
+        self.run_timer.start()
+        self.update_run_clock()
 
         self.worker = ProcessWorker(cmd, env, APP_DIR)
         self.worker.batch_emitted.connect(self.log_batch)
@@ -689,11 +1709,22 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
     def stop_game(self):
         if self.worker and self.worker.isRunning():
             self.log("Terminating process tree...")
+            self._set_run_info("warn", "\u25cf Stopping...")
             self.worker.terminate_proc()
 
     def on_process_finished(self, rc: int):
+        duration = 0
+        if self._run_started is not None:
+            duration = max(0, int(time.monotonic() - self._run_started))
+        self._run_started = None
+        self.run_timer.stop()
+
+        self.settings["last_run_time"] = datetime.now().isoformat(timespec="seconds")
+        self.settings["last_run_rc"] = rc
+        self.settings["last_run_duration"] = duration
+
         if self.hidden_count:
-            self.log(f"({self.hidden_count} Vulkan warning lines hidden)")
+            self.log(f"({self.hidden_count} console lines hidden by the active filter)")
         self.log(f"Process exited with code: {rc}")
 
         guard = get_bb_guard()
@@ -711,10 +1742,20 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 pass
             self.log_fh = None
 
-        self.btn_launch.setEnabled(True)
+        self.btn_launch.setEnabled(self._path_valid)
         self.btn_stop.setEnabled(False)
         self.lbl_status.setText("\u25cf Engine Idle")
         self.lbl_status.setStyleSheet("color: #6a6a78; font-size: 11px; padding: 0 20px; background: transparent;")
+        if self._path_valid and self._setup_kind in ("warn", "error"):
+            label = "\u25cf Ready (warnings)" if self._setup_kind == "warn" else "\u25cf Setup needs attention"
+            self._set_run_info(self._setup_kind, label)
+        elif self._path_valid:
+            self._set_run_info("idle", "\u25cf Engine Idle")
+        else:
+            self._set_run_info("empty", "\u25cf Select a game path")
+
+        self.save_settings()
+        self.update_last_run()
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():

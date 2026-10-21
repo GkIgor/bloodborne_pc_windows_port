@@ -28,6 +28,17 @@ LOG_KEEP = 20
 SETTINGS_FILE = APP_DIR / "bblauncher_settings.json"
 PATCHES_XML = APP_DIR / "patches" / "Bloodborne.xml"
 DEFAULT_GAME = Path(os.environ.get("BB_GAME_DIR", "../CUSA03173"))
+LAUNCHER_VERSION = "0.6.4"
+
+
+def build_stamp() -> str:
+    """Return the launcher build date (exe when frozen, source file otherwise)."""
+    try:
+        target = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__)
+        return datetime.fromtimestamp(target.stat().st_mtime).strftime("%Y-%m-%d")
+    except OSError:
+        return ""
+
 
 FPS_CHOICES = ["uncap", "60", "90", "30"]
 RES_CHOICES = ["1920x1080 (Native)", "1280x720", "2560x1440", "3840x2160"]
@@ -44,6 +55,57 @@ UPSCALER_CHOICES = [
     ("Off", "off"),
     ("FSR 3.1", "fsr31"),
     ("FSR 4", "fsr4"),
+    ("FSR 4.1.1", "fsr411"),
+]
+PRESET_CHOICES = [
+    ("Native AA (no upscaling)", "0"),
+    ("Quality", "1"),
+    ("Balanced", "2"),
+    ("Performance", "3"),
+    ("Ultra Performance", "4"),
+]
+LIVE_RES_CHOICES = [
+    ("Off - startup patch (recommended)", "0"),
+    ("Auto - strong discrete GPUs", "auto"),
+    ("On - apply changes live", "1"),
+]
+DEBUG_VIEW_CHOICES = [
+    ("Off", "0"),
+    ("Reactive mask", "1"),
+    ("Motion vectors", "2"),
+]
+HUD_QUADRANT_CHOICES = [
+    ("Top Left", "0"),
+    ("Top Right", "1"),
+    ("Bottom Left", "2"),
+    ("Bottom Right", "3"),
+]
+MODEL_LOD_CHOICES = [
+    ("Highest (-2)", "-2"),
+    ("Higher (-1)", "-1"),
+    ("Game default (0)", "0"),
+    ("Lower (1)", "1"),
+    ("Lowest (2)", "2"),
+]
+MENU_LANGUAGE_CHOICES = [
+    ("English", "en"),
+    ("Russian", "ru"),
+]
+CONTENT_SKU_CHOICES = [
+    ("Full game", "full"),
+    ("Trial", "trial"),
+]
+# bbport.ini effect switches read by patches.py. (key, label, default on)
+EFFECT_CHOICES = [
+    ("effect_chromatic_aberration", "Chromatic Aberration", False),
+    ("effect_dof", "Depth of Field (DoF)", False),
+    ("effect_motion_blur", "Motion Blur", False),
+    ("effect_ssao", "SSAO Shading", True),
+    ("effect_dynamic_shadows", "Dynamic Light Shadows", True),
+    ("effect_ssr", "Screen Space Reflections (SSR)", False),
+    ("skip_intro", "Skip Intro Videos", True),
+    ("debug_camera", "Free Debug Camera", False),
+    ("debug_menu", "Debug Menu (needs font files)", False),
 ]
 PREP_WORKER_CHOICES = [
     ("Auto (dynamic threads)", "auto"),
@@ -105,21 +167,39 @@ DEFAULT_SETTINGS = {
     "eboot": "",
     "fps": "60",
     "res": RES_CHOICES[0],
-    "aniso": "16x",
+    "aniso": "2x",
     "prep_workers": PREP_WORKER_CHOICES[0][0],
     "anti_aliasing": AA_CHOICES[0],
     "gpu": "",
     "language": "1",
     "mods": False,
-    "hide_vk": True,
+    "hide_vk": False,
     "feat_upscaler": False,
     "upscaler_model": UPSCALER_CHOICES[0][0],
     "feat_overlay": True,
-    "feat_hud": False,
+    "feat_hud": True,
     "feat_fps_patch": True,
     "window_mode": "Borderless",
     "fullscreen": False,
     "enabled_patches": ["Skip Intro"],
+    # run.bat / environment options (Advanced Settings tab). Empty means "run.bat default".
+    "timeout": "",
+    "vblank_hz": "",
+    "frames_ahead": "2",
+    "dmem_mb": "",
+    "extra_args": "",
+    "sku": "full",
+    "mods_dir": "",
+    "mods_config": "",
+    "patches_dir": "",
+    "patches_config": "",
+    "user_dir": "",
+    # Home dashboard / console
+    "log_filter": "all",
+    "log_autoscroll": True,
+    "last_run_time": "",
+    "last_run_rc": None,
+    "last_run_duration": 0,
 }
 
 DEFAULT_KEYBINDS = [
