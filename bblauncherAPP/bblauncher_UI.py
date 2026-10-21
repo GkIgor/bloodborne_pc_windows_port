@@ -48,6 +48,7 @@ class KeybindButton(QPushButton):
         self.action_key = action_key
         self.current_binding = binding_text
         self.listening = False
+        self._pending_shift = None
         self.setObjectName("KeybindBtn")
         self.setFixedHeight(30)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -70,6 +71,7 @@ class KeybindButton(QPushButton):
 
     def start_listening(self):
         self.listening = True
+        self._pending_shift = None
         self.update_style()
         self.grabKeyboard()
         self.grabMouse()
@@ -89,7 +91,11 @@ class KeybindButton(QPushButton):
         key = event.key()
         modifiers = event.modifiers()
 
-        if key in (Qt.Key_Shift, Qt.Key_Meta):
+        # Shift alone binds on release; Shift held through a click becomes a mouse chord instead.
+        if key == Qt.Key_Shift:
+            self._pending_shift = "Right Shift" if event.nativeScanCode() == 0x36 else "Left Shift"
+            return
+        if key == Qt.Key_Meta:
             return
 
         if key == Qt.Key_Escape:
@@ -108,11 +114,22 @@ class KeybindButton(QPushButton):
         self.update_style()
         self.key_assigned.emit(self.action_key, name)
 
+    def keyReleaseEvent(self, event: QKeyEvent):
+        if self.listening and event.key() == Qt.Key_Shift and not event.isAutoRepeat() and self._pending_shift:
+            name = self._pending_shift
+            self.stop_listening()
+            self.current_binding = name
+            self.update_style()
+            self.key_assigned.emit(self.action_key, name)
+            return
+        super().keyReleaseEvent(event)
+
     def mousePressEvent(self, event: QMouseEvent):
         if not self.listening:
             super().mousePressEvent(event)
             return
 
+        self._pending_shift = None
         btn = event.button()
         modifiers = event.modifiers()
         is_shift = bool(modifiers & Qt.ShiftModifier)
