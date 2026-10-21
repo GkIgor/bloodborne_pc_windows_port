@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/time.h>
@@ -155,38 +156,54 @@ static ABI int32_t get_pagesize(void) { return PAGE; }
 static ABI int32_t get_pid(void) { return 1000; }
 static ABI int32_t yield(void) { host_yield(); return 0; }
 static ABI void raise_exception(uint32_t code,uint64_t argument) {
-    /* The renderer's own debug assertions on blur-kernel sample counts (Yebis, GPUMath.cpp 3199 and
-     * GPUTextureUtil.cpp 18141: "nBaseSamples >= 3", "nSamples >= 2"; a game-data value that
-     * got small, seen at +0xbbc429 and +0xc33efe). The code after the check goes on with the
-     * value, so a retail build just continued: logged, and the game goes on.
-     * BB_GAME_ASSERT_STOP=1 stops as before. */
-    {
-        const uint64_t base=0x800000000ull, hi=base+0x50d96dcull;
-        /* The call goes through an import stub: the first game address up the stack is the site. */
-        const uint64_t *frame=(const uint64_t *)__builtin_frame_address(0);
-        uint64_t at=0;
-        for (int i=0;i<64 && !at;++i) if (frame[i]>=base && frame[i]<hi) at=frame[i]-base;
-        static int stop=-1, told;
-        if (stop<0) { const char *e=getenv("BB_GAME_ASSERT_STOP"); stop=e && e[0]=='1'; }
-        if (!stop && code==0xa0020007u && ((at>=0xbbc3e0 && at<0xbbc700) || (at>=0xc33000 && at<0xc34200))) {
-            if (told++<5) printf("Runtime: the game's blur-kernel assertion at +0x%llx ignored (BB_GAME_ASSERT_STOP=1: stop)\n",(unsigned long long)at);
-            return;
-        }
+    /* sceKernelDebugRaiseException is the game's assert/abort mechanism (0xa0020007 is the
+     * common assert code; Yebis also uses it for blur-kernel sample counts). On a retail
+     * build the caller's check is already done and execution continues, so the default is
+     * to log and return. Previously every other code outside two hard-coded Yebis windows
+     * called exit(23) with no dump at all - that is what the "code 23" reports were.
+     * BB_GAME_ASSERT_STOP=1 keeps the old stop behaviour (with a dump) for debugging. */
+    static int stop = -1;
+    if (stop < 0) { const char *e = getenv("BB_GAME_ASSERT_STOP"); stop = e && e[0] == '1'; }
+
+    uint64_t image_base = 0, image_size = 0;
+    runtime_guest_image_range(&image_base, &image_size);
+    /* The import stub is called from guest code. Both run on the host stack, so the first
+     * return address in the loaded image is the raising site. Bounded to the current stack
+     * frame's caller area, which is always mapped. */
+    uint64_t at = 0;
+    const uint64_t *stack = (const uint64_t *)__builtin_frame_address(0);
+#ifdef _WIN32
+    /* enter_on_stack points the TEB stack bounds (gs:0x8/0x10) at the guest stack, so this is
+     * its top. Read the field directly: WIN32_LEAN_AND_MEAN hides struct _TEB. */
+    const uintptr_t stack_hi = (uintptr_t)__readgsqword(0x08);
+#else
+    const uintptr_t stack_hi = (uintptr_t)stack + 0x1000;
+#endif
+    for (int i = 0; i < 64 && !at; ++i) {
+        if ((uintptr_t)(stack + i) + sizeof(*stack) > stack_hi) break;
+        uint64_t v = stack[i];
+        if (image_base && v >= image_base && v < image_base + image_size) at = v - image_base;
     }
-    fprintf(stderr,"STOP: guest raised debug exception code=0x%x argument=0x%llx\n",code,(unsigned long long)argument);
-    /* Who raised it: the caller and the game's return addresses further up this thread's stack. */
-    const uint64_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
-    const uint64_t caller=(uint64_t)__builtin_return_address(0);
-    fprintf(stderr,"STOP: called from %s0x%llx; game code up the stack:",
-            caller>=text_lo && caller<text_hi ? "+" : "host ",
-            (unsigned long long)(caller>=text_lo && caller<text_hi ? caller-text_lo : caller));
-    const uint64_t *stack=(const uint64_t *)__builtin_frame_address(0);
-    for (int i=0,found=0;i<256 && found<12;++i)
-        if (stack[i]>=text_lo && stack[i]<text_hi) { fprintf(stderr," +0x%llx",(unsigned long long)(stack[i]-text_lo)); ++found; }
-    fprintf(stderr,"\n");
+
+    static _Atomic unsigned told;
+    unsigned seen = __atomic_add_fetch(&told, 1, __ATOMIC_RELAXED);
+    if (seen <= 20) {
+        fprintf(stderr,
+                "Runtime: guest raised debug exception code=0x%x argument=0x%llx"
+                " at guest offset 0x%llx; %s\n",
+                code, (unsigned long long)argument, (unsigned long long)at,
+                stop ? "stopping (BB_GAME_ASSERT_STOP=1)" : "continuing (retail behaviour)");
+        if (seen == 20)
+            fprintf(stderr, "Runtime: further guest assertions are recorded in their crash dump only\n");
+        fflush(stderr);
+    }
+#ifdef _WIN32
+    runtime_crash_dump_assert(code, argument, at);
+#endif
+    if (!stop) return;
     runtime_report();
     fflush(NULL);
-    exit(23);
+    exit(142);
 }
 static ABI __attribute__((noreturn)) void hard_exit(int status) {
     printf("Runtime: guest requested _exit(%d)\n",status);

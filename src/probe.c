@@ -17,6 +17,9 @@
 #include <mmsystem.h>
 #include "win32_compat.h"
 #include "win32_exception.h"
+/* Instruction decoding for the non-BMI1 LZCNT sweep and crash-dump RIP annotation. Zydis is
+ * already a link dependency of bbgpu (Zydis::Zydis is PUBLIC), so no new runtime dependency. */
+#include <Zydis/Zydis.h>
 #if defined(__GNUC__) || defined(__clang__)
 #include <cpuid.h>
 #endif
@@ -45,6 +48,15 @@ static uint64_t module_count;
 static int entered_game;
 static int gpu_enabled;
 static uint64_t image_size;
+/* Diagnostics must use the real loaded image extent (all linked modules included), not the
+ * eboot-only size from an older log. 0 until the image is mapped. */
+void runtime_guest_image_range(uint64_t *base, uint64_t *size) {
+    if (base) *base = (uint64_t)(uintptr_t)image;
+    if (size) *size = image_size;
+}
+static int is_guest_address(uintptr_t addr) {
+    return image && image_size && addr >= (uintptr_t)image && addr < (uintptr_t)image + image_size;
+}
 static void **resolved_targets;
 static uint64_t *import_call_counts;
 static uint8_t *is_unbound;
@@ -1072,6 +1084,7 @@ __asm__(
 "enter_on_stack:\n"
 "   push %rbp\n"
 "   mov %rsp, %rbp\n"
+"   push %rbx\n"
 "   push %r12\n"
 "   push %r13\n"
 "   push %r14\n"
@@ -1080,32 +1093,34 @@ __asm__(
 "   mov %gs:0x10, %r13\n"
 "   mov %rcx, %r14\n" /* save entry */
 "   mov %rdx, %r15\n" /* save arg0 */
-"   mov %r8, %r11\n"  /* save arg1 */
+"   mov %r8, %rbx\n"  /* save arg1: caller shadow space is clobbered by the calls below */
 "   mov %r9, %rsp\n"
 "   and $-16, %rsp\n"
 "   mov %rsp, %gs:0x8\n"
 "   sub $0x800000, %r9\n"
 "   mov %r9, %gs:0x10\n"
 "   sub $0x20, %rsp\n"
-"   mov %r11, 0x18(%rsp)\n" /* preserve arg1 across call */
 "   call runtime_win_has_fsgsbase\n"
 "   test %eax, %eax\n"
 "   jz 1f\n"
 "   call runtime_thread_get_tcb\n"
+"   test %rax, %rax\n"
+"   jz 1f\n"
 "   wrfsbase %rax\n"
 "1:\n"
 "   mov %r14, %r11\n"
 "   mov %r15, %rdi\n"
-"   mov 0x18(%rsp), %rsi\n"
+"   mov %rbx, %rsi\n"
 "   call *%r11\n"
 "   add $0x20, %rsp\n"
 "   mov %r12, %gs:0x8\n"
 "   mov %r13, %gs:0x10\n"
-"   lea -0x20(%rbp), %rsp\n"
+"   lea -0x28(%rbp), %rsp\n"
 "   pop %r15\n"
 "   pop %r14\n"
 "   pop %r13\n"
 "   pop %r12\n"
+"   pop %rbx\n"
 "   pop %rbp\n"
 "   ret\n"
 );
@@ -1123,13 +1138,17 @@ static void veh_write(const char *msg) {
  * no lock: it terminates the process a few seconds after the first fatal exception. */
 static HANDLE g_crash_event;
 static volatile LONG g_crash_thread;
+/* Classification of the fatal path, published before the dump so that the reaper still exits
+ * with the right code if the dump blocks. 0 means "not classified" (generic 139). */
+static volatile LONG g_crash_exit_code;
 static int g_crash_test_hang;
 
 static DWORD WINAPI crash_reaper(LPVOID param) {
     (void)param;
     WaitForSingleObject(g_crash_event, INFINITE);
     Sleep(5000);
-    TerminateProcess(GetCurrentProcess(), 128 + 11);
+    LONG code = InterlockedCompareExchange(&g_crash_exit_code, 0, 0);
+    TerminateProcess(GetCurrentProcess(), (UINT)(code ? code : 128 + 11));
     return 0;
 }
 
@@ -1171,6 +1190,12 @@ static void resolve_host_address(uintptr_t addr, char *out_buf, size_t out_buf_s
         snprintf(out_buf, out_buf_sz, "NULL");
         return;
     }
+    if (addr < 0x10000) {
+        /* A near-NULL value: 0x10/0x40/... are offsets into a struct whose base was NULL,
+         * not host addresses. */
+        snprintf(out_buf, out_buf_sz, "NULL+0x%" PRIxPTR, addr);
+        return;
+    }
     HMODULE hMod = NULL;
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -1185,7 +1210,104 @@ static void resolve_host_address(uintptr_t addr, char *out_buf, size_t out_buf_s
             return;
         }
     }
-    snprintf(out_buf, out_buf_sz, "host %p", (void *)addr);
+    snprintf(out_buf, out_buf_sz, "non-module 0x%" PRIxPTR, addr);
+}
+
+/* Full address classification for stack/heap dumps: guest code, guest stack/heap (the low
+ * mapping range used by runtime_low_map), a real host module, or a near-NULL value. */
+static void describe_pointer(uintptr_t val, char *out, size_t out_sz) {
+    if (!val) { snprintf(out, out_sz, "NULL"); return; }
+    if (val < 0x10000) { snprintf(out, out_sz, "NULL+0x%" PRIxPTR, val); return; }
+    if (is_guest_address(val)) {
+        uintptr_t off = val - (uintptr_t)image;
+        for (uint64_t m = 0; m < module_count; ++m) {
+            if (off >= modules[m].base && off < modules[m].base + modules[m].size) {
+                snprintf(out, out_sz, "guest module %" PRIu64 " +0x%" PRIxPTR, m, off - modules[m].base);
+                return;
+            }
+        }
+        snprintf(out, out_sz, "guest eboot.bin +0x%" PRIxPTR, off);
+        return;
+    }
+    if (val >= 0x0800000000ull && val < 0x1000000000ull) {
+        snprintf(out, out_sz, "guest stack/heap %p", (void *)val);
+        return;
+    }
+    resolve_host_address(val, out, out_sz);
+}
+
+/* Decode at most 16 bytes at addr with Zydis. The caller must have verified that the range is
+ * readable (Zydis reads directly; an unmapped page would fault the crash handler itself). */
+static int decode_instruction_text(uintptr_t addr, char *out, size_t out_sz) {
+    if (!addr || IsBadReadPtr((const void *)addr, 16)) return 0;
+    ZydisDecoder decoder;
+    if (ZYAN_FAILED(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)))
+        return 0;
+    ZydisDecodedInstruction insn;
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+    if (ZYAN_FAILED(ZydisDecoderDecodeFull(&decoder, (const void *)addr, 16, &insn, operands)))
+        return 0;
+    ZydisFormatter formatter;
+    if (ZYAN_FAILED(ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL)))
+        return 0;
+    if (ZYAN_FAILED(ZydisFormatterFormatInstruction(&formatter, &insn, operands,
+                                                    insn.operand_count_visible, out, out_sz,
+                                                    (ZyanU64)addr, NULL)))
+        return 0;
+    return 1;
+}
+
+/* Copy a guest string for diagnostics. Reads byte-by-byte with an accessibility check: an
+ * assert's format string can itself be the NULL/garbage pointer that caused the abort. */
+static void copy_guest_string(uintptr_t ptr, char *out, size_t out_sz) {
+    if (!out_sz) return;
+    out[0] = 0;
+    if (!ptr) { snprintf(out, out_sz, "<NULL>"); return; }
+    if (IsBadReadPtr((const void *)ptr, 1)) { snprintf(out, out_sz, "<%p unreadable>", (void *)ptr); return; }
+    size_t i = 0;
+    while (i + 1 < out_sz && !IsBadReadPtr((const void *)(ptr + i), 1)) {
+        char ch = ((const char *)ptr)[i];
+        if (!ch) break;
+        out[i++] = (ch == '\n' || ch == '\t' || (ch >= 0x20 && ch < 0x7f)) ? ch : '.';
+    }
+    out[i] = 0;
+}
+
+/* The game's panic/assert printer at image+0x20b55b0 is called with
+ *   rdi = first string (source file/expression), esi = assert id, rdx = second string,
+ *   al  = number of vector registers used by the variadic arguments.
+ * A stub at the entry records these before the printer decides to print, return silently
+ * (mode 2) or write to address 0 and abort. */
+static volatile LONG g_assert_hook_calls;
+static volatile uint64_t g_last_assert_id, g_last_assert_s1, g_last_assert_s2;
+
+static void guest_assert_hook(uint64_t s1, uint64_t id, uint64_t s2) {
+    LONG seen = InterlockedIncrement(&g_assert_hook_calls);
+    g_last_assert_id = id;
+    g_last_assert_s1 = s1;
+    g_last_assert_s2 = s2;
+    if (seen > 20) return; /* keep the first 20; the dump always has the latest */
+    char a[256], b[512];
+    copy_guest_string((uintptr_t)s1, a, sizeof(a));
+    copy_guest_string((uintptr_t)s2, b, sizeof(b));
+    fprintf(stderr, "[GAME ASSERT] id=0x%llx  \"%s\"  \"%s\"  (s1=%p s2=%p, thread '%s' TID %lu)\n",
+            (unsigned long long)id, a, b, (void *)(uintptr_t)s1, (void *)(uintptr_t)s2,
+            runtime_thread_current() ? runtime_thread_current()->name : "none",
+            (unsigned long)GetCurrentThreadId());
+    if (seen == 20) fprintf(stderr, "[GAME ASSERT] further assertions are recorded in the crash dump only\n");
+    fflush(stderr);
+}
+
+static void guest_assert_write_last(FILE *f) {
+    if (!g_assert_hook_calls) return;
+    char a[256], b[512];
+    copy_guest_string((uintptr_t)g_last_assert_s1, a, sizeof(a));
+    copy_guest_string((uintptr_t)g_last_assert_s2, b, sizeof(b));
+    fprintf(f, "\n--- LAST GUEST ASSERTION (captured at 0x20b55b0) ---\n");
+    fprintf(f, "Assert id: 0x%llx   (assert printer calls this run: %ld)\n",
+            (unsigned long long)g_last_assert_id, (long)g_assert_hook_calls);
+    fprintf(f, "String 1:  \"%s\"  [%p]\n", a, (void *)(uintptr_t)g_last_assert_s1);
+    fprintf(f, "String 2:  \"%s\"  [%p]\n", b, (void *)(uintptr_t)g_last_assert_s2);
 }
 
 static void dump_loaded_modules(FILE *f) {
@@ -1212,42 +1334,69 @@ static void resolve_host_address(uintptr_t addr, char *out_buf, size_t out_buf_s
 static void dump_loaded_modules(FILE *f) { (void)f; }
 #endif
 
+static const char *g_crash_dump_path_override = NULL;
+static const char *g_crash_dump_note = NULL;
+static int g_crash_dump_append = 0;
+/* Set for a guest assert that continues execution: GPU queries can take a lock the asserting
+ * thread may already hold, so they are skipped (a fatal crash may query them). */
+static int g_crash_dump_guest_assert = 0;
+
 static void write_crash_dump(EXCEPTION_POINTERS *ep, void *fault_addr, uintptr_t rip, DWORD code) {
     char crash_path[MAX_PATH];
     SYSTEMTIME st;
     GetLocalTime(&st);
     CreateDirectoryA("out", NULL);
-    snprintf(crash_path, sizeof(crash_path), "out/crash_%04d%02d%02d_%02d%02d%02d.log",
-             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    FILE *f = fopen(crash_path, "w");
-    if (!f) f = fopen("crash.log", "w");
+    if (g_crash_dump_path_override && g_crash_dump_path_override[0]) {
+        snprintf(crash_path, sizeof(crash_path), "%s", g_crash_dump_path_override);
+    } else {
+        snprintf(crash_path, sizeof(crash_path), "out/crash_%04d%02d%02d_%02d%02d%02d.log",
+                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    }
+    FILE *f = fopen(crash_path, g_crash_dump_append ? "a" : "w");
+    if (!f) f = fopen("crash.log", g_crash_dump_append ? "a" : "w");
     if (!f) return;
 
-    uintptr_t off = (rip >= (uintptr_t)image && rip < (uintptr_t)image + (image_size ? image_size : 0x20000000))
-                    ? (rip - (uintptr_t)image) : 0;
+    const int guest_rip = is_guest_address(rip);
+    uintptr_t off = guest_rip ? (rip - (uintptr_t)image) : 0;
     fprintf(f, "================================================================================\n");
     fprintf(f, "=== BLOODBORNE CRASH DUMP ===\n");
     fprintf(f, "================================================================================\n\n");
     fprintf(f, "Exception Code: 0x%08lx\n", code);
+    if (g_crash_dump_note && g_crash_dump_note[0]) fprintf(f, "%s\n", g_crash_dump_note);
+    char fault_desc[256];
+    describe_pointer((uintptr_t)fault_addr, fault_desc, sizeof(fault_desc));
+    const char *addr_label = g_crash_dump_guest_assert ? "Raising site" : "Fault Address";
 #ifdef _WIN32
     if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord && ep->ExceptionRecord->NumberParameters >= 2) {
         ULONG_PTR access_type = ep->ExceptionRecord->ExceptionInformation[0];
         const char *type_str = (access_type == 0) ? "READ" : (access_type == 1) ? "WRITE" : (access_type == 8) ? "EXECUTE (DEP)" : "UNKNOWN";
-        fprintf(f, "Fault Address:  %p (%s violation)\n", fault_addr, type_str);
+        fprintf(f, "%s:  %p (%s violation) [%s]\n", addr_label, fault_addr, type_str, fault_desc);
     } else {
-        fprintf(f, "Fault Address:  %p\n", fault_addr);
+        fprintf(f, "%s:  %p [%s]\n", addr_label, fault_addr, fault_desc);
     }
 #else
-    fprintf(f, "Fault Address:  %p\n", fault_addr);
+    fprintf(f, "%s:  %p [%s]\n", addr_label, fault_addr, fault_desc);
 #endif
 
     char rip_resolved[512];
-    if (off) {
+    if (guest_rip)
         snprintf(rip_resolved, sizeof(rip_resolved), "guest eboot.bin offset 0x%" PRIxPTR, off);
-        fprintf(f, "Faulting RIP:   %p (%s)\n\n", (void *)rip, rip_resolved);
-    } else {
+    else
         resolve_host_address(rip, rip_resolved, sizeof(rip_resolved));
-        fprintf(f, "Faulting RIP:   %p (%s)\n\n", (void *)rip, rip_resolved);
+    fprintf(f, "Faulting RIP:   %p (%s)\n", (void *)rip, rip_resolved);
+
+    /* The instruction itself, decoded: a raw register/stack dump cannot tell a NULL write
+     * from a mis-decoded guest trap. Zydis reads at most 16 bytes; the range is checked. */
+    fprintf(f, "\n--- INSTRUCTION AT RIP ---\n");
+    if (rip && !IsBadReadPtr((const void *)rip, 16)) {
+        fprintf(f, "  Bytes:");
+        for (int i = 0; i < 16; ++i) fprintf(f, " %02x", ((const unsigned char *)rip)[i]);
+        fprintf(f, "\n");
+        char text[256];
+        if (decode_instruction_text(rip, text, sizeof(text))) fprintf(f, "  %s\n\n", text);
+        else fprintf(f, "  (instruction not decoded)\n\n");
+    } else {
+        fprintf(f, "  (RIP is not readable)\n\n");
     }
 
     CONTEXT *c = ep->ContextRecord;
@@ -1264,51 +1413,77 @@ static void write_crash_dump(EXCEPTION_POINTERS *ep, void *fault_addr, uintptr_t
     fprintf(f, "RIP=%016llx EFLAGS=%08lx FS_BASE=%p GS_SELECTOR=0x%x\n\n",
             (unsigned long long)c->Rip, (unsigned long)c->EFlags, cur_fs, (unsigned int)c->SegGs);
 
-    fprintf(f, "--- STACK WALK (16 FRAMES) ---\n");
-    uintptr_t rsp = c->Rsp;
-    if (rsp && rsp < (1ULL << 46)) {
-        uintptr_t *stack_ptr = (uintptr_t *)rsp;
-        if (!IsBadReadPtr(stack_ptr, 16 * sizeof(uintptr_t))) {
-            for (int i = 0; i < 16; ++i) {
-                uintptr_t val = stack_ptr[i];
-                char loc[256];
-                if (val >= (uintptr_t)image && val < (uintptr_t)image + (image_size ? image_size : 0x20000000)) {
-                    uintptr_t val_off = val - (uintptr_t)image;
-                    int found_mod = 0;
-                    for (uint64_t m = 0; m < module_count; ++m) {
-                        if (val_off >= modules[m].base && val_off < modules[m].base + modules[m].size) {
-                            snprintf(loc, sizeof(loc), "module %" PRIu64 " +0x%" PRIxPTR, m, val_off - modules[m].base);
-                            found_mod = 1;
-                            break;
-                        }
-                    }
-                    if (!found_mod) snprintf(loc, sizeof(loc), "guest eboot.bin +0x%" PRIxPTR, val_off);
-                } else {
-                    resolve_host_address(val, loc, sizeof(loc));
-                }
-                fprintf(f, "  [frame +0x%02x] %016llx (%s)\n", i * 8, (unsigned long long)val, loc);
-            }
+    fprintf(f, "\n--- HOST STACK (unwound from this handler) ---\n");
+    {
+        /* A real unwind, not a raw qword dump. The faulting RIP is guest code (no unwind
+         * data), so this only reaches the host frames below enter_on_stack: still the only
+         * reliable way to see which host path dispatched into the guest. */
+        void *frames[32];
+        USHORT count = RtlCaptureStackBackTrace(0, 32, frames, NULL);
+        if (!count) fprintf(f, "  (no host frames)\n");
+        for (USHORT i = 0; i < count; ++i) {
+            char loc[512];
+            describe_pointer((uintptr_t)frames[i], loc, sizeof(loc));
+            fprintf(f, "  [host %2u] %p (%s)\n", (unsigned)i, frames[i], loc);
         }
     }
 
-    fprintf(f, "\n--- GUEST RBP FRAME CHAIN ---\n");
-    uintptr_t rbp = c->Rbp;
-    for (int frame = 0; frame < 16 && rbp && rbp < (1ULL << 46); ++frame) {
-        if (IsBadReadPtr((void *)rbp, 16)) break;
-        uintptr_t *rbp_ptr = (uintptr_t *)rbp;
-        uintptr_t next_rbp = rbp_ptr[0];
-        uintptr_t ret_addr = rbp_ptr[1];
-        if (!ret_addr) break;
-        char loc[256];
-        if (ret_addr >= (uintptr_t)image && ret_addr < (uintptr_t)image + (image_size ? image_size : 0x20000000)) {
-            uintptr_t val_off = ret_addr - (uintptr_t)image;
-            snprintf(loc, sizeof(loc), "guest eboot.bin +0x%" PRIxPTR, val_off);
-        } else {
-            resolve_host_address(ret_addr, loc, sizeof(loc));
+    /* enter_on_stack repoints the thread's TEB stack bounds at the guest stack, so during
+     * guest execution these are the *guest* bounds (and the RBP chain below is in range). */
+    const NT_TIB *tib = (const NT_TIB *)NtCurrentTeb();
+    const uintptr_t stack_low = (uintptr_t)tib->StackLimit;
+    const uintptr_t stack_high = (uintptr_t)tib->StackBase;
+    const int context_is_guest = is_guest_address(c->Rip);
+
+    fprintf(f, "\n--- %sRBP FRAME CHAIN ---\n", context_is_guest ? "GUEST " : "HOST ");
+    {
+        uintptr_t rbp = c->Rbp;
+        int printed = 0;
+        int valid = rbp >= stack_low && rbp < stack_high && !(rbp & 7);
+        if (!valid)
+            fprintf(f, "  (RBP %p outside thread stack [%p, %p))\n", (void *)rbp,
+                    (void *)stack_low, (void *)stack_high);
+        for (int frame = 0; frame < 24 && valid; ++frame) {
+            if (rbp + 16 > stack_high || IsBadReadPtr((const void *)rbp, 16)) break;
+            const uintptr_t *fp = (const uintptr_t *)rbp;
+            uintptr_t next_rbp = fp[0];
+            uintptr_t ret_addr = fp[1];
+            if (!ret_addr) break;
+            char loc[512];
+            describe_pointer(ret_addr, loc, sizeof(loc));
+            fprintf(f, "  [rbp %2d] ret=%016llx (%s)\n", frame, (unsigned long long)ret_addr, loc);
+            ++printed;
+            /* A frame pointer chain must move towards the stack base in aligned steps. A
+             * single stale/garbage RBP would otherwise walk into arbitrary memory. */
+            if (next_rbp <= rbp || next_rbp >= stack_high || (next_rbp & 7)) break;
+            rbp = next_rbp;
         }
-        fprintf(f, "  [rbp frame %2d] ret=%016llx (%s)\n", frame, (unsigned long long)ret_addr, loc);
-        if (next_rbp <= rbp) break;
-        rbp = next_rbp;
+        if (!printed)
+            fprintf(f, "  (no valid %s frame chain)\n", context_is_guest ? "guest" : "host");
+    }
+
+    fprintf(f, "\n--- GUEST CODE POINTERS ON THE STACK (scan) ---\n");
+    {
+        /* Guest code has no unwind data, so scan a bounded window of the stack for values in
+         * the loaded image. This is only a candidate list (data pointers share the range), but
+         * it recovers the caller chain when RBP is not a frame pointer. */
+        uintptr_t rsp = c->Rsp;
+        int shown = 0;
+        if (rsp >= stack_low && rsp < stack_high) {
+            uintptr_t end = rsp + 0x8000;
+            if (end > stack_high) end = stack_high;
+            for (uintptr_t p = rsp; p + 8 <= end && shown < 24; p += 8) {
+                if (IsBadReadPtr((const void *)p, 8)) break;
+                uintptr_t val = *(const uintptr_t *)p;
+                if (!is_guest_address(val)) continue;
+                char loc[512];
+                describe_pointer(val, loc, sizeof(loc));
+                fprintf(f, "  [rsp+0x%04" PRIxPTR "] %016" PRIxPTR " (%s)\n",
+                        p - rsp, val, loc);
+                ++shown;
+            }
+        }
+        if (!shown) fprintf(f, "  (none found)\n");
     }
 
     fprintf(f, "\n--- LAST 32 IMPORTS OF FAULTING THREAD ---\n");
@@ -1328,20 +1503,22 @@ static void write_crash_dump(EXCEPTION_POINTERS *ep, void *fault_addr, uintptr_t
     }
 
     runtime_memory_dump_recent_ops(f);
-    if (gpu_enabled) bbgpu_dump_breadcrumbs(f);
+    if (gpu_enabled && !g_crash_dump_guest_assert) bbgpu_dump_breadcrumbs(f);
 
     char gpu_vendor[128] = "Unknown Vendor";
     char gpu_model[256] = "Unknown GPU";
     char gpu_driver[128] = "Unknown Driver";
     char gpu_api[64] = "Unknown API";
-    if (gpu_enabled) {
+    if (gpu_enabled && !g_crash_dump_guest_assert) {
         bbgpu_get_device_info(gpu_vendor, sizeof(gpu_vendor),
                               gpu_model, sizeof(gpu_model),
                               gpu_driver, sizeof(gpu_driver),
                               gpu_api, sizeof(gpu_api));
     }
     fprintf(f, "\n--- GPU & DRIVER TELEMETRY ---\n");
-    if (gpu_enabled && strcmp(gpu_model, "Unknown GPU") != 0) {
+    if (g_crash_dump_guest_assert) {
+        fprintf(f, "GPU State:     skipped for a continuing assert (the asserting thread may hold a GPU lock)\n");
+    } else if (gpu_enabled && strcmp(gpu_model, "Unknown GPU") != 0) {
         fprintf(f, "GPU Model:     %s\n", gpu_model);
         fprintf(f, "GPU Vendor:    %s\n", gpu_vendor);
         fprintf(f, "Driver:        %s\n", gpu_driver);
@@ -1352,11 +1529,112 @@ static void write_crash_dump(EXCEPTION_POINTERS *ep, void *fault_addr, uintptr_t
 
     dump_loaded_modules(f);
 
+    fprintf(f, "\n--- HOST MEMORY ---\n");
+    {
+        MEMORYSTATUSEX ms;
+        memset(&ms, 0, sizeof(ms));
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms)) {
+            fprintf(f, "Physical: %llu MiB total, %llu MiB available\n",
+                    (unsigned long long)(ms.ullTotalPhys >> 20),
+                    (unsigned long long)(ms.ullAvailPhys >> 20));
+            fprintf(f, "Commit:   %llu MiB in use of %llu MiB limit, %llu MiB available\n",
+                    (unsigned long long)((ms.ullTotalPageFile - ms.ullAvailPageFile) >> 20),
+                    (unsigned long long)(ms.ullTotalPageFile >> 20),
+                    (unsigned long long)(ms.ullAvailPageFile >> 20));
+        } else {
+            fprintf(f, "  (GlobalMemoryStatusEx failed, error %lu)\n", (unsigned long)GetLastError());
+        }
+    }
+
+    runtime_memory_report_to(f);
+    guest_assert_write_last(f);
+
     fflush(f);
     fclose(f);
     char note[256];
     snprintf(note, sizeof(note), "Crash details written to %s\n", crash_path);
     veh_write(note);
+}
+
+/* Assert/diagnostic dump, called from raise_exception() for guest debug exceptions. The game
+ * can assert repeatedly (issue #148 did); the first 50 assertions get their own timestamped
+ * full dump, later ones append a compact record to one file instead of creating thousands of
+ * files or repeating the expensive dump. Re-entrancy is guarded because the dump path itself
+ * could assert. */
+static volatile LONG g_assert_dump_active = 0;
+static volatile LONG g_assert_dump_count = 0;
+static char g_assert_dump_repeat[MAX_PATH];
+
+const char *runtime_crash_dump_assert(uint32_t code, uint64_t argument, uint64_t guest_offset) {
+    static char last_path[MAX_PATH];
+    if (InterlockedCompareExchange(&g_assert_dump_active, 1, 0) != 0) return NULL;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    CreateDirectoryA("out", NULL);
+    LONG count = InterlockedIncrement(&g_assert_dump_count);
+    if (count <= 50) {
+        snprintf(last_path, sizeof(last_path), "out/assert_%04d%02d%02d_%02d%02d%02d_%ld.log",
+                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, (long)count);
+    } else {
+        if (!g_assert_dump_repeat[0])
+            snprintf(g_assert_dump_repeat, sizeof(g_assert_dump_repeat), "out/assert_repeat.log");
+        snprintf(last_path, sizeof(last_path), "%s", g_assert_dump_repeat);
+        /* A per-frame assert must not pay for a full context/stack/GPU dump every time. */
+        FILE *rf = fopen(g_assert_dump_repeat, "a");
+        if (rf) {
+            char s1[192], s2[384];
+            copy_guest_string((uintptr_t)g_last_assert_s1, s1, sizeof(s1));
+            copy_guest_string((uintptr_t)g_last_assert_s2, s2, sizeof(s2));
+            fprintf(rf, "[%04d-%02d-%02d %02d:%02d:%02d] code=0x%x argument=0x%llx guest=0x%llx "
+                        "assert=0x%llx s1=\"%s\" s2=\"%s\"\n",
+                    st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                    code, (unsigned long long)argument, (unsigned long long)guest_offset,
+                    (unsigned long long)g_last_assert_id, s1, s2);
+            if (count == 51)
+                fprintf(rf, "(further assertions use this compact form; full dumps are capped at 50)\n");
+            fclose(rf);
+        }
+        InterlockedExchange(&g_assert_dump_active, 0);
+        return last_path;
+    }
+
+    CONTEXT ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.ContextFlags = CONTEXT_FULL;
+    RtlCaptureContext(&ctx);
+
+    EXCEPTION_RECORD record;
+    memset(&record, 0, sizeof(record));
+    record.ExceptionCode = 0xE0000001; /* application-defined: guest assertion */
+    record.ExceptionAddress = (PVOID)(uintptr_t)ctx.Rip;
+    EXCEPTION_POINTERS pointers;
+    pointers.ExceptionRecord = &record;
+    pointers.ContextRecord = &ctx;
+
+    char note[768];
+    snprintf(note, sizeof(note),
+             "Guest debug exception: code=0x%x argument=0x%llx\n"
+             "Raising guest offset: 0x%llx%s\n"
+             "(context below is the host state inside the runtime; the guest registers are in\n"
+             " the thread's last import record and the guest stack scan)",
+             code, (unsigned long long)argument, (unsigned long long)guest_offset,
+             guest_offset ? "" : " (site not found on the stack)");
+    void *site = guest_offset ? (void *)((uintptr_t)image + guest_offset) : NULL;
+
+    g_crash_dump_path_override = last_path;
+    g_crash_dump_append = 0;
+    g_crash_dump_note = note;
+    g_crash_dump_guest_assert = 1;
+    write_crash_dump(&pointers, site, ctx.Rip, code);
+    g_crash_dump_guest_assert = 0;
+    g_crash_dump_note = NULL;
+    g_crash_dump_path_override = NULL;
+    g_crash_dump_append = 0;
+
+    InterlockedExchange(&g_assert_dump_active, 0);
+    return last_path;
 }
 
 #ifdef _WIN32
@@ -1406,6 +1684,9 @@ static int emulate_lzcnt_site(CONTEXT *ctx, uintptr_t rip) {
     key.addr = rip;
     LzcntPatchSite *site = (LzcntPatchSite *)bsearch(&key, s_lzcnt_sites, s_num_lzcnt_sites, sizeof(LzcntPatchSite), compare_lzcnt_sites);
     if (!site) return 0;
+    /* Refuse a site whose recorded encoding is impossible; advancing by a wrong length would
+     * resume in the middle of the next instruction. */
+    if (site->len < 4 || site->len > 10) return 0;
 
     DWORD64 *regs[16] = {
         &ctx->Rax, &ctx->Rcx, &ctx->Rdx, &ctx->Rbx,
@@ -1414,13 +1695,25 @@ static int emulate_lzcnt_site(CONTEXT *ctx, uintptr_t rip) {
         &ctx->R12, &ctx->R13, &ctx->R14, &ctx->R15
     };
 
+    /* Encodings in the linked image include redundant/size prefixes (F3 F3, 66 F3, 49 F3 49,
+     * 47 F3 48, ...), so the instruction does not necessarily start with F3. Skip legacy
+     * prefixes and REX (the last REX before the opcode wins), then require 0F BD. */
     const unsigned char *b = site->orig;
-    int idx = 1;
-    int rex = 0;
-    if ((b[idx] & 0xF0) == 0x40) rex = b[idx++];
-    idx += 2; // skip 0x0F, 0xBD
+    int idx = 0, rex = 0, opsize = 4;
+    for (; idx + 2 < site->len; ++idx) {
+        unsigned char c = b[idx];
+        if (c == 0x0F) break;
+        if ((c & 0xF0) == 0x40) { rex = c; continue; }
+        if (c == 0x66) { opsize = 2; continue; }
+        if (c == 0x67 || c == 0xF0 || c == 0xF2 || c == 0xF3 ||
+            c == 0x2E || c == 0x36 || c == 0x3E || c == 0x26 || c == 0x64 || c == 0x65)
+            continue;
+        return 0; /* not a prefix: not the encoding that was recorded */
+    }
+    if (idx + 2 >= site->len || b[idx] != 0x0F || b[idx + 1] != 0xBD) return 0;
+    if ((rex >> 3) & 1) opsize = 8; /* REX.W overrides a 66 prefix */
+    idx += 2; /* skip 0F BD */
     unsigned char modrm = b[idx++];
-    int w = (rex >> 3) & 1;
     int r_bit = rex ? ((rex >> 2) & 1) : 0;
     int x_bit = rex ? ((rex >> 1) & 1) : 0;
     int b_bit = rex ? (rex & 1) : 0;
@@ -1466,98 +1759,129 @@ static int emulate_lzcnt_site(CONTEXT *ctx, uintptr_t rip) {
             cur += 4;
             ea += disp;
         }
-        if (IsBadReadPtr((const void *)ea, w ? 8 : 4)) return 0;
-        src_val = w ? *(const uint64_t *)ea : *(const uint32_t *)ea;
+        if (IsBadReadPtr((const void *)ea, (size_t)opsize)) return 0;
+        src_val = (opsize == 8) ? *(const uint64_t *)ea :
+                  (opsize == 4) ? (uint64_t)*(const uint32_t *)ea :
+                                  (uint64_t)*(const uint16_t *)ea;
     }
 
-    if (w) {
-        uint64_t res = 0;
-        if (src_val == 0) {
-            res = 64;
-            ctx->EFlags |= 0x01;  // CF = 1
-            ctx->EFlags &= ~0x40; // ZF = 0
-        } else {
-            unsigned long bit_idx = 0;
-            _BitScanReverse64(&bit_idx, src_val);
-            res = 63 - bit_idx;
-            ctx->EFlags &= ~0x01; // CF = 0
-            if (res == 0) ctx->EFlags |= 0x40;  // ZF = 1
-            else          ctx->EFlags &= ~0x40; // ZF = 0
-        }
-        *regs[dest_idx] = res;
+    unsigned bits = (unsigned)opsize * 8;
+    uint64_t mask = (opsize == 8) ? ~UINT64_C(0) : ((UINT64_C(1) << bits) - 1);
+    src_val &= mask;
+
+    /* LZCNT clears OF/SF/AF/PF; CF and ZF carry the result. The old emulation left the
+     * caller's OF/SF/AF/PF in place, unlike the instruction it replaces. */
+    ctx->EFlags &= ~(0x800 | 0x80 | 0x10 | 0x04);
+
+    uint64_t res;
+    if (src_val == 0) {
+        res = bits;
+        ctx->EFlags |= 0x01;  /* CF = 1 */
+        ctx->EFlags &= ~0x40; /* ZF = 0 */
     } else {
-        uint32_t val32 = (uint32_t)src_val;
-        uint32_t res = 0;
-        if (val32 == 0) {
-            res = 32;
-            ctx->EFlags |= 0x01;  // CF = 1
-            ctx->EFlags &= ~0x40; // ZF = 0
-        } else {
-            unsigned long bit_idx = 0;
-            _BitScanReverse(&bit_idx, val32);
-            res = 31 - bit_idx;
-            ctx->EFlags &= ~0x01; // CF = 0
-            if (res == 0) ctx->EFlags |= 0x40;  // ZF = 1
-            else          ctx->EFlags &= ~0x40; // ZF = 0
-        }
-        *regs[dest_idx] = (uint64_t)res;
+        unsigned long bit_idx = 0;
+        _BitScanReverse64(&bit_idx, src_val);
+        res = (uint64_t)bits - 1 - (uint64_t)bit_idx;
+        ctx->EFlags &= ~0x01; /* CF = 0 */
+        if (res == 0) ctx->EFlags |= 0x40;  /* ZF = 1 */
+        else          ctx->EFlags &= ~0x40; /* ZF = 0 */
     }
+    if (opsize == 2)
+        *regs[dest_idx] = (*regs[dest_idx] & ~UINT64_C(0xFFFF)) | res; /* 16-bit write keeps the upper bits */
+    else
+        *regs[dest_idx] = res; /* a 32-bit write zero-extends; a 64-bit write is full width */
     ctx->Rip += site->len;
     return 1;
 }
 
+/* Replace every decoded LZCNT with UD2 and remember its exact length. The previous byte scan
+ * assumed LZCNT was always `F3 [REX] 0F BD modrm` with no displacement/SIB and patched only
+ * the first two bytes, leaving the rest of the instruction to execute as garbage. The linked
+ * image has 541 raw F3/0F BD patterns: 406 real LZCNT instructions (some with extra prefixes)
+ * and 135 that are bytes inside other instructions. A linear Zydis sweep derives the true
+ * length and only real LZCNT instructions are patched; raw patterns inside other instructions
+ * are data and are reported instead of patched. */
 static void patch_non_bmi1(unsigned char *img, uint64_t total_size, Segment *segs, uint64_t num_segs) {
-    uint32_t bsr_patched = 0;
-    uint32_t ud2_patched = 0;
+    uint32_t patched = 0, skipped = 0;
+
+    ZydisDecoder decoder;
+    if (ZYAN_FAILED(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
+        fprintf(stderr, "Non-BMI1 CPU: Zydis decoder init failed; LZCNT traps were NOT installed\n");
+        return;
+    }
 
     for (uint64_t s = 0; s < num_segs; ++s) {
-        if (!(segs[s].flags & 1)) continue; // only executable segments
+        if (!(segs[s].flags & 1)) continue; /* executable segments only */
         uint64_t seg_start = segs[s].address;
         uint64_t seg_end = seg_start + segs[s].size;
         if (seg_end > total_size) seg_end = total_size;
-        if (seg_end < 16) continue;
+        if (seg_end <= seg_start) continue;
 
-        uint64_t idx = seg_start;
-        while (idx + 15 < seg_end) {
-            if (img[idx] == 0xF3) {
-                int rex = 0;
-                int lzcnt_len = 0;
-                unsigned char b1 = img[idx + 1];
-                unsigned char b2 = img[idx + 2];
-                unsigned char modrm = 0;
-                if (b1 == 0x0F && b2 == 0xBD) {
-                    rex = 0;
-                    modrm = img[idx + 3];
-                    lzcnt_len = 4;
-                } else if ((b1 & 0xF0) == 0x40 && b2 == 0x0F && img[idx + 3] == 0xBD) {
-                    rex = b1;
-                    modrm = img[idx + 4];
-                    lzcnt_len = 5;
-                }
-
-                if (lzcnt_len > 0) {
-                    if (s_num_lzcnt_sites < MAX_LZCNT_SITES && lzcnt_len <= 10) {
-                        LzcntPatchSite *site = &s_lzcnt_sites[s_num_lzcnt_sites++];
-                        site->addr = (uintptr_t)(img + idx);
-                        site->len = (uint8_t)lzcnt_len;
-                        memcpy(site->orig, img + idx, lzcnt_len);
-                        img[idx] = 0x0F;
-                        img[idx + 1] = 0x0B;
-                        ud2_patched++;
-                    }
-                    idx += lzcnt_len;
-                    continue;
+        uint64_t pos = seg_start;
+        while (pos < seg_end) {
+            ZydisDecodedInstruction insn;
+            if (ZYAN_FAILED(ZydisDecoderDecodeInstruction(&decoder, NULL, img + pos, seg_end - pos, &insn))) {
+                ++pos; /* invalid byte: resynchronise at the next one */
+                continue;
+            }
+            uint8_t len = insn.length;
+            if (len < 4 || len > 10 || pos + len > seg_end) {
+                ++pos;
+                continue;
+            }
+            if (insn.mnemonic == ZYDIS_MNEMONIC_LZCNT) {
+                if (s_num_lzcnt_sites < MAX_LZCNT_SITES) {
+                    LzcntPatchSite *site = &s_lzcnt_sites[s_num_lzcnt_sites++];
+                    site->addr = (uintptr_t)(img + pos);
+                    site->len = len;
+                    memcpy(site->orig, img + pos, len);
+                    img[pos] = 0x0F;
+                    img[pos + 1] = 0x0B;
+                    ++patched;
+                } else {
+                    ++skipped;
                 }
             }
-            idx++;
+            pos += len;
         }
     }
 
-    if (s_num_lzcnt_sites > 1) {
-        qsort(s_lzcnt_sites, s_num_lzcnt_sites, sizeof(LzcntPatchSite), compare_lzcnt_sites);
+    /* Anything that still looks like `F3 [REX] 0F BD` was not reached by the sweep, i.e. it is
+     * not on a decoded instruction boundary. Patching such a byte would corrupt data or split a
+     * different instruction, so leave it and say so. */
+    uint32_t unconfirmed = 0;
+    for (uint64_t s = 0; s < num_segs; ++s) {
+        if (!(segs[s].flags & 1)) continue;
+        uint64_t seg_start = segs[s].address;
+        uint64_t seg_end = seg_start + segs[s].size;
+        if (seg_end > total_size) seg_end = total_size;
+        for (uint64_t p = seg_start; p + 5 < seg_end; ++p) {
+            int candidate = (img[p] == 0xF3 && img[p + 1] == 0x0F && img[p + 2] == 0xBD) ||
+                            (img[p] == 0xF3 && (img[p + 1] & 0xF0) == 0x40 &&
+                             img[p + 2] == 0x0F && img[p + 3] == 0xBD);
+            if (!candidate) continue;
+            int covered = 0;
+            for (uint32_t i = 0; i < s_num_lzcnt_sites; ++i) {
+                uintptr_t a = s_lzcnt_sites[i].addr;
+                uintptr_t q = (uintptr_t)(img + p);
+                if (q >= a && q < a + s_lzcnt_sites[i].len) { covered = 1; break; }
+            }
+            if (covered) continue;
+            if (unconfirmed < 8)
+                fprintf(stderr, "Non-BMI1 CPU: LZCNT byte pattern at guest offset 0x%" PRIx64
+                                " is not on an instruction boundary; left unpatched\n", p);
+            ++unconfirmed;
+        }
     }
 
-    printf("Non-BMI1 CPU optimizations applied: %u LZCNT UD2 traps installed\n", ud2_patched);
+    if (s_num_lzcnt_sites > 1)
+        qsort(s_lzcnt_sites, s_num_lzcnt_sites, sizeof(LzcntPatchSite), compare_lzcnt_sites);
+
+    printf("Non-BMI1 CPU optimizations applied: %u LZCNT UD2 traps installed (exact lengths from Zydis)\n", patched);
+    if (skipped)
+        fprintf(stderr, "Non-BMI1 CPU: %u LZCNT sites skipped (site table full, increase MAX_LZCNT_SITES)\n", skipped);
+    if (unconfirmed)
+        fprintf(stderr, "Non-BMI1 CPU: %u raw LZCNT byte patterns ignored (not decoded instructions)\n", unconfirmed);
 }
 
 static int emulate_bmi1(CONTEXT *ctx) {
@@ -1799,21 +2123,61 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
         uintptr_t rip = ep->ContextRecord->Rip;
         GuestThread *cur = runtime_thread_current();
 
+        /* The panic printer's abort is a deliberate write to address 0 (0x20b56d2:
+         * mov dword ptr [0], 0xdeadba). Classify it before any recovery guard so it cannot be
+         * mistaken for a memory bug, and keep the last captured assertion in the dump. */
+        if (image && image_size > 0x20b56d2 + 4 && rip == (uintptr_t)image + 0x20b56d2 &&
+            !IsBadReadPtr((const void *)rip, 4) &&
+            ((const unsigned char *)rip)[0] == 0xc7 &&
+            ((const unsigned char *)rip)[1] == 0x04 &&
+            ((const unsigned char *)rip)[2] == 0x25) {
+            InterlockedExchange(&g_crash_exit_code, 141);
+            crash_begin();
+            write_crash_dump(ep, fault_addr, rip, code);
+            veh_write("[GAME ASSERT] Deliberate abort trap at guest offset 0x20b56d2 "
+                      "(the last assertion that reached 0x20b55b0 is in the crash dump)\n");
+            if (g_crash_test_hang) Sleep(INFINITE);
+            TerminateProcess(GetCurrentProcess(), 141);
+        }
+
+        /* fs:-relative access faulted. With FSGSBASE, rebase FS and retry, but only when the
+         * base is actually wrong: if FS already equals the guest TCB, rebasing cannot help and
+         * a retry would loop forever. Without FSGSBASE the only emulatable form is the 9-byte
+         * `mov rax, fs:[0]`; anything else fails loudly instead of retrying. */
         unsigned char *ip = (unsigned char *)rip;
-        if (rip >= 0x10000 && !IsBadReadPtr((const void *)rip, 1) && ip[0] == 0x64) {
+        if (rip >= 0x10000 && !IsBadReadPtr((const void *)rip, 9) && ip[0] == 0x64) {
             void *tcb = runtime_thread_get_tcb();
-            if (tcb) {
-                if (runtime_win_has_fsgsbase()) {
-                    __asm__ __volatile__("wrfsbase %0" : : "r"(tcb));
-                }
-                if (ip[1] == 0x48 && ip[2] == 0x8b && ip[3] == 0x04 && ip[4] == 0x25 &&
-                    ip[5] == 0x00 && ip[6] == 0x00 && ip[7] == 0x00 && ip[8] == 0x00) {
-                    ep->ContextRecord->Rax = *(DWORD64 *)tcb;
-                    ep->ContextRecord->Rip += 9;
-                }
+            int fixed = 0;
+            if (tcb && runtime_win_has_fsgsbase() && runtime_win_read_fsbase() != tcb) {
+                __asm__ __volatile__("wrfsbase %0" : : "r"(tcb));
+                fixed = 1;
+            }
+            if (tcb && ip[1] == 0x48 && ip[2] == 0x8b && ip[3] == 0x04 && ip[4] == 0x25 &&
+                ip[5] == 0x00 && ip[6] == 0x00 && ip[7] == 0x00 && ip[8] == 0x00) {
+                ep->ContextRecord->Rax = *(DWORD64 *)tcb;
+                ep->ContextRecord->Rip += 9;
+                fixed = 1;
+            }
+            if (fixed) {
                 if (cur) cur->exception_count++;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
+            static volatile LONG fs_guard_warned;
+            if (InterlockedExchange(&fs_guard_warned, 1) == 0) {
+                char buf[768];
+                snprintf(buf, sizeof(buf),
+                    "[FS GUARD] Thread '%s' (TID %lu) at guest offset 0x%llx: fs-relative access "
+                    "at %p cannot be emulated (CPU lacks FSGSBASE and this is not the 9-byte "
+                    "mov rax, fs:[0] form). This CPU is not fully supported; failing instead of "
+                    "retrying the fault.\n",
+                    cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId(),
+                    image && is_guest_address(rip) ? (unsigned long long)(rip - (uintptr_t)image) : 0,
+                    fault_addr);
+                veh_write(buf);
+                fprintf(stderr, "%s", buf);
+                fflush(stderr);
+            }
+            /* fall through to the fatal path (no infinite retry) */
         }
         if (gpu_enabled && bbgpu_handle_fault(ep, fault_addr)) {
             if (cur) cur->exception_count++;
@@ -1827,7 +2191,7 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
             uintptr_t rsp = ep->ContextRecord->Rsp;
             if (rsp >= 0x10000 && !IsBadReadPtr((const void *)rsp, 8)) {
                 uintptr_t ret_candidate = *(DWORD64 *)rsp;
-                if (ret_candidate >= (uintptr_t)image && ret_candidate < (uintptr_t)image + (image_size ? image_size : 0x20000000)) {
+                if (is_guest_address(ret_candidate)) {
                     uintptr_t ret_off = ret_candidate - (uintptr_t)image;
                     if (ret_off == 0x1436c05 || ret_off == 0x1436e1a) {
                         char buf[512];
@@ -1847,7 +2211,7 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
                 }
             }
         }
-        if (rip >= (uintptr_t)image && rip < (uintptr_t)image + (image_size ? image_size : 0x20000000)) {
+        if (is_guest_address(rip)) {
             uintptr_t off = rip - (uintptr_t)image;
 
             // Issue #140 / Discord 231500: Graphics worker job dispatch NULL or culled batch
@@ -1980,14 +2344,24 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
          * creation. Its first-chance AV belongs to Windows' own SEH handler.
          * Keep GPU page tracking and speculative guest recovery ahead of it. */
         if (win_fault_is_read_probe(rip)) return EXCEPTION_CONTINUE_SEARCH;
+        const int guest_code = is_guest_address(rip);
+        /* A guest NULL dereference is the classic symptom of an allocation that returned 0
+         * (issues #148/#151/#155). A distinct exit code lets the launcher tell it apart from a
+         * random host fault, and the dump now records allocation failures and the last assert. */
+        const int guest_null = guest_code && (uintptr_t)fault_addr < 0x10000;
+        InterlockedExchange(&g_crash_exit_code, guest_null ? 140 : 128 + 11);
         crash_begin();
         write_crash_dump(ep, fault_addr, rip, code);
-        char line[512];
-        if (rip - (uintptr_t)image < 0x10000000)
-            snprintf(line, sizeof(line), "Guest fault (signal 11) at guest offset 0x%llx, address %p\n",
-                     (unsigned long long)(rip - (uintptr_t)image), fault_addr);
+        char fault_loc[256];
+        describe_pointer((uintptr_t)fault_addr, fault_loc, sizeof(fault_loc));
+        char line[768];
+        if (guest_code)
+            snprintf(line, sizeof(line),
+                     "Guest fault (signal 11) at guest offset 0x%llx, address %p [%s]\n",
+                     (unsigned long long)(rip - (uintptr_t)image), fault_addr, fault_loc);
         else
-            snprintf(line, sizeof(line), "Fault at RIP %p, address %p\n", (void *)rip, fault_addr);
+            snprintf(line, sizeof(line), "Fault at RIP %p, address %p [%s]\n",
+                     (void *)rip, fault_addr, fault_loc);
         veh_write(line);
         snprintf(line, sizeof(line), "RAX=%p RBX=%p RCX=%p RDX=%p RSI=%p RDI=%p RBP=%p RSP=%p\n",
                  (void *)ep->ContextRecord->Rax, (void *)ep->ContextRecord->Rbx,
@@ -2000,7 +2374,7 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
         veh_write(line);
         if (gpu_enabled) bbgpu_dump_guest_writes(ep);
         if (g_crash_test_hang) Sleep(INFINITE);
-        TerminateProcess(GetCurrentProcess(), 128 + 11);
+        TerminateProcess(GetCurrentProcess(), guest_null ? 140 : 128 + 11);
     } else if (code == EXCEPTION_ILLEGAL_INSTRUCTION) {
         if (!runtime_win_has_bmi1() && emulate_bmi1(ep->ContextRecord)) {
             GuestThread *cur = runtime_thread_current();
@@ -2008,10 +2382,11 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         uintptr_t rip = ep->ContextRecord->Rip;
+        InterlockedExchange(&g_crash_exit_code, 128 + 4);
         crash_begin();
         write_crash_dump(ep, (void *)rip, rip, code);
         char line[512];
-        if (rip - (uintptr_t)image < 0x10000000)
+        if (is_guest_address(rip))
             snprintf(line, sizeof(line), "Fatal exception 0x%08lx at guest offset 0x%llx, address %p\n",
                      (unsigned long)code, (unsigned long long)(rip - (uintptr_t)image), (void *)rip);
         else
@@ -2023,10 +2398,11 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
                code == 0xC0000409 /* STATUS_STACK_BUFFER_OVERRUN */ ||
                code == 0xC0000374 /* STATUS_HEAP_CORRUPTION */) {
         uintptr_t rip = ep->ContextRecord->Rip;
+        InterlockedExchange(&g_crash_exit_code, 128 + 4);
         crash_begin();
         write_crash_dump(ep, (void *)rip, rip, code);
         char line[512];
-        if (rip - (uintptr_t)image < 0x10000000)
+        if (is_guest_address(rip))
             snprintf(line, sizeof(line), "Fatal exception 0x%08lx at guest offset 0x%llx, address %p\n",
                      (unsigned long)code, (unsigned long long)(rip - (uintptr_t)image), (void *)rip);
         else
@@ -2342,7 +2718,11 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     timeBeginPeriod(1);
     if (!runtime_win_has_fsgsbase()) {
-        fprintf(stderr, "Info: Host CPU lacks FSGSBASE instructions (wrfsbase/rdfsbase); using Windows TLS fallback.\n");
+        fprintf(stderr,
+            "Warning: host CPU lacks FSGSBASE (wrfsbase/rdfsbase). This CPU is NOT fully\n"
+            "         supported: only the single 9-byte `mov rax, fs:[0]` initial-TLS access can\n"
+            "         be emulated. Any other fs:-relative guest access stops at the [FS GUARD]\n"
+            "         diagnostic instead of retrying forever. Use a Haswell/Excavator-or-newer CPU.\n");
     }
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
     AddVectoredExceptionHandler(1, win_veh_handler);
@@ -2661,6 +3041,93 @@ int main(int argc, char **argv) {
         memcpy(jmp_over + 1, &rel, 4);
         memcpy(image + 0xbbc3e0, jmp_over, sizeof(jmp_over));
         printf("Guest hooks: blur-kernel sample count clamp on (GPUTexUtil_GetRecursiveSampleParameters +0xbbc3e0)\n");
+    } while (0);
+
+    /* Panic/assert printer hook at 0x20b55b0. It is called with rdi=first string, esi=assert
+     * id, rdx=second string and al=number of vector arguments, then either prints, returns
+     * silently (mode 2) or aborts by writing to address 0. Recording the id and both strings
+     * turns an otherwise silent failure (issue #148: id 0x104 and no output) into evidence.
+     * thunks live in host VirtualAlloc memory that may be outside rel32 range, so the entry
+     * uses a 14-byte absolute indirect jump padded to the 17-byte prologue boundary; the stub
+     * replays those 17 bytes and resumes at 0x20b55c2. */
+    do {
+        const uint64_t assert_entry = 0x20b55b0, assert_resume = 0x20b55c2;
+        static const unsigned char expected[17] = {
+            0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53,
+            0x48, 0x81, 0xec, 0x00, 0x01, 0x00
+        };
+        if (size < assert_entry + sizeof(expected)) {
+            printf("Guest hooks: assert hook not installed (image too small)\n");
+            break;
+        }
+        if (memcmp(image + assert_entry, expected, sizeof(expected)) != 0) {
+            printf("Guest hooks: assert hook not installed (unmatched 0x20b55b0 signature)\n");
+            break;
+        }
+
+        unsigned char *t = thunks + (import_count + 2) * 32;
+        unsigned char *p = t;
+        /* Preserve every argument register and XMM0-7: the printer saves all eight vector
+         * registers when al != 0, so clobbering them would corrupt its variadic arguments. */
+        *p++ = 0x50;                                        /* push rax */
+        *p++ = 0x51;                                        /* push rcx */
+        *p++ = 0x52;                                        /* push rdx */
+        *p++ = 0x41; *p++ = 0x50;                           /* push r8  */
+        *p++ = 0x41; *p++ = 0x51;                           /* push r9  */
+        *p++ = 0x41; *p++ = 0x52;                           /* push r10 */
+        *p++ = 0x41; *p++ = 0x53;                           /* push r11 */
+        *p++ = 0x48; *p++ = 0x81; *p++ = 0xec;
+        *p++ = 0x80; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; /* sub rsp, 0x80 */
+        for (int i = 0; i < 8; ++i) {                       /* movaps [rsp+i*16], xmm_i */
+            *p++ = 0x0f; *p++ = 0x29; *p++ = (unsigned char)(0x44 | (i << 3));
+            *p++ = 0x24; *p++ = (unsigned char)(i * 16);
+        }
+        *p++ = 0x48; *p++ = 0x83; *p++ = 0xec; *p++ = 0x20; /* sub rsp, 0x20 (shadow space) */
+        *p++ = 0x49; *p++ = 0x89; *p++ = 0xd0;              /* mov r8, rdx  (string 2) */
+        *p++ = 0x48; *p++ = 0x89; *p++ = 0xf2;              /* mov rdx, rsi (assert id) */
+        *p++ = 0x48; *p++ = 0x89; *p++ = 0xf9;              /* mov rcx, rdi (string 1) */
+        /* Hook parameters are therefore (rcx=string 1, rdx=assert id, r8=string 2), which
+         * matches guest_assert_hook(uint64_t s1, uint64_t id, uint64_t s2). */
+        uint64_t hook = (uint64_t)(uintptr_t)guest_assert_hook;
+        *p++ = 0x48; *p++ = 0xb8; memcpy(p, &hook, 8); p += 8; /* movabs rax, hook */
+        *p++ = 0xff; *p++ = 0xd0;                           /* call rax */
+        *p++ = 0x48; *p++ = 0x83; *p++ = 0xc4; *p++ = 0x20; /* add rsp, 0x20 */
+        for (int i = 0; i < 8; ++i) {                       /* movaps xmm_i, [rsp+i*16] */
+            *p++ = 0x0f; *p++ = 0x28; *p++ = (unsigned char)(0x44 | (i << 3));
+            *p++ = 0x24; *p++ = (unsigned char)(i * 16);
+        }
+        *p++ = 0x48; *p++ = 0x81; *p++ = 0xc4;
+        *p++ = 0x80; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; /* add rsp, 0x80 */
+        *p++ = 0x41; *p++ = 0x5b;                           /* pop r11 */
+        *p++ = 0x41; *p++ = 0x5a;                           /* pop r10 */
+        *p++ = 0x41; *p++ = 0x59;                           /* pop r9  */
+        *p++ = 0x41; *p++ = 0x58;                           /* pop r8  */
+        *p++ = 0x5a;                                        /* pop rdx */
+        *p++ = 0x59;                                        /* pop rcx */
+        *p++ = 0x58;                                        /* pop rax */
+        memcpy(p, image + assert_entry, sizeof(expected));   /* replay the prologue */
+        p += sizeof(expected);
+        uint64_t resume = (uint64_t)(uintptr_t)(image + assert_resume);
+        *p++ = 0xff; *p++ = 0x25; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+        memcpy(p, &resume, 8);
+        p += 8;
+
+        if ((size_t)(p - t) > 6 * 32) {
+            printf("Guest hooks: assert hook stub too large (%zu bytes); not installed\n",
+                   (size_t)(p - t));
+            break;
+        }
+
+        unsigned char entry_patch[17] = {0xff, 0x25, 0x00, 0x00, 0x00, 0x00};
+        uint64_t thunk_addr = (uint64_t)(uintptr_t)t;
+        memcpy(entry_patch + 6, &thunk_addr, 8);
+        entry_patch[14] = 0x90;
+        entry_patch[15] = 0x90;
+        entry_patch[16] = 0x90;
+        memcpy(image + assert_entry, entry_patch, sizeof(entry_patch));
+        FlushInstructionCache(GetCurrentProcess(), image + assert_entry, sizeof(entry_patch));
+        printf("Guest hooks: assert/panic hook on at 0x20b55b0 (stub %zu bytes at %p)\n",
+               (size_t)(p - t), (void *)t);
     } while (0);
 
     protect(thunks, round_page((import_count + 16) * 32), 5);

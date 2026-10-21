@@ -307,3 +307,28 @@ This document details the optimizations, fixes, and refactoring applied to ensur
   1. Automated executable symbol stripping (`strip -s`) in both `build.bat` and GitHub Actions CI workflow, reducing `bbport.exe` and `bb-probe.exe` binary footprint from ~260 MB to ~12.4 MB (~95% reduction).
   2. Filtered out protected Windows system DLLs from being bundled during release staging.
   3. Added comprehensive license notice staging for all MSYS2 packages, bundled third-party libraries, and the Python launcher runtime.
+
+---
+
+## 19. Crash Root-Cause Fixes: Allocation Failures, Assert Diagnostics, Non-BMI1 Lengths, TLS (Issues #148, #149, #151, #155)
+
+- **Files**: `src/probe.c`, `src/runtime_kernel.c`, `src/runtime_memory.c`, `src/runtime.h`.
+- **Root cause summary**:
+  1. The startup crashes (#148/#155/#151) were guest code dereferencing the NULL result of a failed allocation. The allocator's panic (`0x20b55b0`, id `0x104`/`0x148`) was silent because the printer's mode global is 2, and the failure reason was never recorded anywhere.
+  2. The non-BMI1 LZCNT trap used a raw byte scan: it patched 135 `F3/0F BD` patterns that are data inside other instructions, missed 8 LZCNT instructions with redundant prefixes (`F3 F3`, `66 F3`, `49 F3 49`, ...), and advanced a fixed 4/5 bytes, so the 18 LZCNT instructions with a memory operand resumed in the middle of the next instruction.
+  3. `enter_on_stack` kept its second argument in caller shadow space (`RSP+0x18`), which the two intervening calls are allowed to clobber, and executed `wrfsbase` even when the TCB lookup returned NULL.
+  4. The VEH FS guard returned `EXCEPTION_CONTINUE_EXECUTION` whenever a TCB existed, even when rebasing could not fix the fault, which could retry forever.
+  5. "Code 23" was `exit(23)` in `raise_exception` with no dump; "code 139" was the generic VEH exit. Neither identified the actual failure.
+- **Changes**:
+  1. **Allocation failures are recorded and reported** (`runtime_memory.c`): every pool/section, direct allocate, direct map, flexible map, reserve, low map and batch-map failure now records operation, size, parameters, result and host error; the first 16 are printed, totals and the last failure appear in `runtime_report()` and in every crash dump.
+  2. **Panic/assert printer hook** (`probe.c`): a 17-byte absolute entry patch at `0x20b55b0` jumps to a stub that preserves all argument/XMM registers, logs `rdi`/`esi`/`rdx` (first string, assert id, second string), then replays the original prologue and resumes at `0x20b55c2`. The absolute jump is used because thunks are host `VirtualAlloc` memory that can be outside `rel32` range.
+  3. **`raise_exception` policy** (`runtime_kernel.c`): logs the code, argument and raising guest offset (real image range), writes an assert dump, and **continues by default** (retail behaviour). `BB_GAME_ASSERT_STOP=1` restores stopping, now with a dump and exit code 142 instead of 23. The previous hard-coded Yebis address windows are gone.
+  4. **Assert dumps** (`runtime_crash_dump_assert`): the first 50 assertions produce full `out/assert_<timestamp>_<n>.log` files; later ones append a compact one-line record to `out/assert_repeat.log`, so a per-frame assert cannot create thousands of files or repeat an expensive dump.
+  5. **Exact LZCNT patching** (`patch_non_bmi1`): a Zydis linear sweep over executable segments patches every decoded `LZCNT` (406 in the linked image, including `66 F3`, `F3 F3`, `49 F3 49`, `47 F3 48` forms) with its true length. The 135 raw `F3/0F BD` byte patterns that lie *inside other instructions* are data and are reported, not patched. `emulate_lzcnt_site` parses any prefix combination, handles 16/32/64-bit operand size correctly (16-bit writes preserve the upper register bits) and clears OF/SF/AF/PF as the instruction does.
+  6. **`enter_on_stack`**: arg1 now lives in callee-saved `%rbx` (with matching push/pop and adjusted epilogue), and `wrfsbase` is skipped when the TCB is NULL.
+  7. **VEH FS guard**: rebases FS only when the current base differs from the guest TCB, so a second fault cannot loop; if the CPU lacks FSGSBASE and the fault is not the 9-byte `mov rax, fs:[0]` form, it logs one `[FS GUARD]` diagnostic and fails instead of retrying. Startup now prints a clear "this CPU is not fully supported" warning.
+  8. **Crash-dump quality** (`write_crash_dump`): the fault address is classified (`NULL+0x..`, guest code/module, guest stack/heap, host module), the first 16 bytes at RIP are decoded with Zydis, the old raw 16-qword "stack walk" is replaced by a real `RtlCaptureStackBackTrace` host unwind plus a bounds-validated guest RBP chain and a filtered guest-code stack scan, and the dump includes guest memory accounting, host physical/commit memory and the last captured assertion.
+  9. **Distinct exit codes**: guest NULL dereference (fault address `< 0x10000` in guest code) exits 140; the deliberate panic abort trap at `0x20b56d2` (`mov dword ptr [0], 0xdeadba`) is classified and exits 141; `BB_GAME_ASSERT_STOP=1` exits 142; illegal instructions exit 132. Generic guest faults keep 139. The watchdog reaper now terminates with the classified code, so a dump that blocks can no longer turn a classified crash back into 139.
+- **Deliberately not changed**:
+  - **TZCNT (`F3 0F BC`) is not trapped.** On non-BMI1 CPUs it decodes and executes as `BSF` with identical results and flags for nonzero input, so adding a trap would add risk without fixing a defect.
+  - **Full `fs:`-relative decoding is not emulated on non-FSGSBASE CPUs.** Emulating every addressing form of every `fs:` instruction is a large, risky change; the port instead fails with a precise diagnostic. CPUs without FSGSBASE remain unsupported beyond the initial-TLS form.

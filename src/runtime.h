@@ -48,6 +48,16 @@ void runtime_memory_report(void);
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 int runtime_memory_vma_info(uintptr_t address, int *prot, int *type, uintptr_t *end);
 void runtime_memory_dump_recent_ops(void *file_handle);
+/* Guest-memory accounting for crash dumps: allocations, mappings and *failures*. A guest NULL
+ * dereference after a failed allocation was otherwise impossible to tell from a genuine bug. */
+void runtime_memory_report_to(void *file_handle);
+/* Guest image extent (probe.c): 0/0 until the image is mapped. Used instead of hard-coded
+ * eboot sizes when classifying guest addresses in diagnostics. */
+void runtime_guest_image_range(uint64_t *base, uint64_t *size);
+#ifdef _WIN32
+/* Writes an assert/diagnostic dump for a guest-raised debug exception (probe.c). */
+const char *runtime_crash_dump_assert(uint32_t code, uint64_t argument, uint64_t guest_offset);
+#endif
 const char *runtime_import_name(const char *name);
 uintptr_t runtime_rwlock_resolve(const char *name);
 void runtime_rwlock_report(void);
