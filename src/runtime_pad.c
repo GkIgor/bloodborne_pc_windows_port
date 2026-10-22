@@ -162,7 +162,9 @@ static void sample_host(PadData *d) {
     if (!k) return;
 
     // Souls PC Mouse & Keyboard integration
-    const int mk_enabled = bbgpu_get_mk_config(NULL, NULL, NULL, NULL, NULL, NULL);
+    float sens_x = 1.0f, sens_y = 1.0f;
+    int inv_x = 0, inv_y = 0;
+    const int mk_enabled = bbgpu_get_mk_config(&sens_x, &sens_y, &inv_x, &inv_y, NULL, NULL);
 
     // Mouse Buttons (only active while mouse is captured in relative mode)
     const int mouse_is_captured = bbgpu_mouse_captured();
@@ -219,6 +221,28 @@ static void sample_host(PadData *d) {
         else if (is_action_down(binds[BB_ACTION_MOVE_RIGHT], k, lmb, rmb, mmb, x1, x2, chords)) d->left_x = stick_hi;
         if (is_action_down(binds[BB_ACTION_MOVE_FORWARD], k, lmb, rmb, mmb, x1, x2, chords)) d->left_y = stick_lo;
         else if (is_action_down(binds[BB_ACTION_MOVE_BACKWARD], k, lmb, rmb, mmb, x1, x2, chords)) d->left_y = stick_hi;
+
+        // Mouse as right stick whenever the native camera hook doesn't own it (lock-on target switching):
+        // each delta is an impulse that decays over LOOK_TAU_US.
+        #define LOOK_TAU_US 60000.0f
+        static float look_x = 0.0f, look_y = 0.0f;
+        static uint64_t look_last_us = 0;
+        const float dt = (look_last_us && d->timestamp > look_last_us) ? (float)(d->timestamp - look_last_us) : 0.0f;
+        look_last_us = d->timestamp;
+        if (!mouse_is_captured || native_camera_owns_mouse()) {
+            look_x = look_y = 0.0f;
+        } else {
+            float mouse_dx = 0.0f, mouse_dy = 0.0f;
+            bbgpu_consume_mouse_delta(&mouse_dx, &mouse_dy);
+            const float decay = dt >= LOOK_TAU_US ? 0.0f : 1.0f - dt / LOOK_TAU_US;
+            const float gain = 127.0f / (1000.0f * LOOK_TAU_US / 1e6f);
+            look_x = look_x * decay + mouse_dx * gain * (inv_x ? -sens_x : sens_x);
+            look_y = look_y * decay + mouse_dy * gain * (inv_y ? -sens_y : sens_y);
+            if (look_x < -127.0f) look_x = -127.0f; else if (look_x > 127.0f) look_x = 127.0f;
+            if (look_y < -127.0f) look_y = -127.0f; else if (look_y > 127.0f) look_y = 127.0f;
+            if (fabsf(look_x) >= 0.5f) d->right_x = (uint8_t)(128 + (int)look_x);
+            if (fabsf(look_y) >= 0.5f) d->right_y = (uint8_t)(128 + (int)look_y);
+        }
     } else {
         // Fallback layout when M&K mode is disabled
         static const struct { SDL_Scancode key; uint32_t ps; } keys[]={

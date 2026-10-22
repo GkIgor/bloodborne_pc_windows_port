@@ -54,6 +54,8 @@ void runtime_memory_report_to(void *file_handle);
 /* Guest image extent (probe.c): 0/0 until the image is mapped. Used instead of hard-coded
  * eboot sizes when classifying guest addresses in diagnostics. */
 void runtime_guest_image_range(uint64_t *base, uint64_t *size);
+/* 1 while the native camera hook (probe.c) turns the camera from the mouse; 0 when locked on or inactive. */
+int native_camera_owns_mouse(void);
 #ifdef _WIN32
 /* Writes an assert/diagnostic dump for a guest-raised debug exception (probe.c). */
 const char *runtime_crash_dump_assert(uint32_t code, uint64_t argument, uint64_t guest_offset);
