@@ -276,6 +276,13 @@ add_dependencies(camera-motion-test host_shaders)
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
     shim/bbport_settings.cpp)
 target_include_directories(upscaler-support-test PRIVATE shim)
+# bbport_settings.cpp includes and calls SDL3 for the key names.
+target_link_libraries(upscaler-support-test PRIVATE PkgConfig::SDL3)
+if (WIN32 AND TARGET SDL3::SDL3)
+    add_custom_command(TARGET upscaler-support-test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL3::SDL3>
+                $<TARGET_FILE_DIR:upscaler-support-test>)
+endif()
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
 add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp

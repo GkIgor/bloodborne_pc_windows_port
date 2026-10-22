@@ -25,12 +25,15 @@ int StringToKeyCode(const char* name);
 void ResetKeybindsToDefaults();
 
 enum Upscaler : int { UpscalerOff = 0, UpscalerFsr3 = 1, UpscalerFsr4 = 2, UpscalerFsr411 = 3,
-                      UpscalerTaa = 4, UpscalerCount };
+                      UpscalerTaa = 4, UpscalerDlss = 5, UpscalerCount };
 /// FSR 4 v07 or FSR 4.1.1: the same inputs, settings and placement in the frame.
 inline bool IsFsr4(int upscaler) {
     return upscaler == UpscalerFsr4 || upscaler == UpscalerFsr411;
 }
 enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
+/// NVIDIA's DLSS render-preset hint (NVSDK_NGX_DLSS_Hint_Render_Preset): 0 = the driver's
+/// choice, 10 = J (less ghosting), 11 = K (the transformer model, recommended).
+enum DlssModel : int { DlssModelDefault = 0, DlssModelJ = 10, DlssModelK = 11 };
 enum DebugView : int { DebugNone = 0, DebugReactive = 1, DebugMotion = 2, DebugViewCount };
 enum HudQuadrant : int { HudTopLeft = 0, HudTopRight = 1, HudBottomLeft = 2, HudBottomRight = 3, HudQuadrantCount };
 /// Language of the in-game menu (bbport.ini `language=en|ru`, BB_LANG overrides).
@@ -66,6 +69,7 @@ inline constexpr int OutputDefault = 1; ///< 1920x1080, the game's own size
 struct Values {
     std::atomic<int> upscaler{UpscalerOff};
     std::atomic<int> preset{NativeAA};
+    std::atomic<int> dlss_preset{DlssModelDefault};
     std::atomic<bool> sharpen{true};
     std::atomic<float> sharpness{0.65f};
     std::atomic<bool> jitter{true};
@@ -111,6 +115,9 @@ struct Values {
     /// Why FSR 4 cannot run (assets, device features), or null. Set by the renderer.
     std::atomic<const char*> fsr4_problem{nullptr};
     std::atomic<bool> fsr4_supported{false}, fsr411_supported{false};
+    /// DLSS (gpu/dlss_bridge, NVIDIA RTX) is ready, or why not (null before the device exists).
+    std::atomic<bool> dlss_supported{false};
+    std::atomic<const char*> dlss_problem{nullptr};
 
     /// Startup settings for the explicit BB_RENDER_RES compatibility patch only.
     int startup_preset = NativeAA;
@@ -136,6 +143,8 @@ void Load();
 void Reload();
 /// Checks the loaded choice before the first frame; unsupported FSR 4 uses FSR 3.1.
 void ConfigureUpscalerSupport(bool fsr4, bool fsr411);
+/// The DLSS bridge/NGX state: unsupported DLSS uses FSR 3.1, like unsupported FSR 4.
+void ConfigureDlssSupport(bool available, const char* problem);
 /// Startup-patched scene dimensions cannot change until run.sh prepares a new image.
 bool FixedRenderSession();
 int RenderPreset();

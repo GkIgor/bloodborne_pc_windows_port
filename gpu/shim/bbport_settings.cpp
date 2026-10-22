@@ -108,6 +108,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         }
     } else if (key == "preset") {
         v.preset = std::clamp(i, 0, PresetCount - 1);
+    } else if (key == "dlss_preset") {
+        v.dlss_preset = i == DlssModelJ || i == DlssModelK ? i : DlssModelDefault;
     } else if (key == "sharpen") {
         v.sharpen = i != 0;
     } else if (key == "sharpness") {
@@ -232,6 +234,7 @@ void Load() {
         {"BB_REACTIVE", "reactive"},              {"BB_REACTIVE_SCALE", "reactive_scale"},
         {"BB_REACTIVE_THRESHOLD", "reactive_threshold"}, {"BB_REACTIVE_MAX", "reactive_max"},
         {"BB_UPSCALE_PRESET", "preset"},            {"BB_OBJECT_MOTION", "object_motion"},
+        {"BB_DLSS_PRESET", "dlss_preset"},
         {"BB_HUD", "show_hud"},                     {"BB_HUD_QUADRANT", "hud_quadrant"},
         {"BB_HUD_OPACITY", "hud_opacity"},          {"BB_HUD_SCALE", "hud_scale"},
         {"BB_PREP_WORKERS", "prep_workers"},
@@ -285,6 +288,20 @@ void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
     }
 }
 
+void ConfigureDlssSupport(bool available, const char* problem) {
+    auto& v = Get();
+    v.dlss_supported = available;
+    static std::string kept;
+    kept = problem ? problem : "";
+    v.dlss_problem = available || kept.empty() ? nullptr : kept.c_str();
+    if (v.upscaler == UpscalerDlss && !available) {
+        std::printf("Upscaler: DLSS unavailable (%s); falling back to FSR 3.1\n",
+                    kept.empty() ? "the DLSS bridge or NVIDIA's DLSS library is missing"
+                                 : kept.c_str());
+        v.upscaler = UpscalerFsr3;
+    }
+}
+
 bool FixedRenderSession() {
     const char* size = std::getenv("BB_RENDER_RES");
     return size && size[0];
@@ -314,13 +331,17 @@ void Save() {
     }
     std::fprintf(file,
                  "# bbport settings (in-game menu: Insert / L3+R3)\n"
-                 "upscaler=%s\npreset=%d\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
+                 "# upscaler: off | fsr31 | fsr4 | fsr411 | taa | dlss"
+                 " (dlss needs bbport_dlss.dll and nvngx_dlss.dll, else FSR 3.1)\n"
+                 "# dlss_preset: 0 = driver default, 10 = J (less ghosting), 11 = K (transformer)\n"
+                 "upscaler=%s\npreset=%d\ndlss_preset=%d\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
                  "reactive=%d\nobject_motion=%d\nreactive_scale=%.2f\nreactive_threshold=%.2f\nreactive_max=%.2f\n"
                  "debug_view=%d\nshow_fps=%d\nshow_hud=%d\nhud_quadrant=%d\nhud_opacity=%.2f\nhud_scale=%.2f\n"
                  "fsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n"
                  "mk_enabled=%d\nmk_sens_x=%.2f\nmk_sens_y=%.2f\nmk_invert_x=%d\nmk_invert_y=%d\nmk_smoothing=%.2f\nmk_responsiveness=%.2f\nmk_acceleration=%.2f\n"
                  "mouse_menu=%d\n",
-                 UpscalerName(v.upscaler), v.preset.load(), int(v.sharpen.load()),
+                 UpscalerName(v.upscaler), v.preset.load(), v.dlss_preset.load(),
+                 int(v.sharpen.load()),
                  v.sharpness.load(), int(v.jitter.load()), int(v.reactive.load()),
                  int(v.object_motion.load()),
                  v.reactive_scale.load(), v.reactive_threshold.load(), v.reactive_max.load(),
@@ -366,7 +387,8 @@ const char* PresetName(int preset) {
 }
 
 const char* UpscalerName(int upscaler) {
-    static constexpr const char* names[UpscalerCount] = {"off", "fsr31", "fsr4", "fsr411", "taa"};
+    static constexpr const char* names[UpscalerCount] = {"off", "fsr31", "fsr4", "fsr411", "taa",
+                                                         "dlss"};
     return names[std::clamp(upscaler, 0, UpscalerCount - 1)];
 }
 

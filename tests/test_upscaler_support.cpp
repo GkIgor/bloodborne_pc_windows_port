@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
+#include <string>
 #include <unistd.h>
 #ifdef _WIN32
 #include <windows.h>
@@ -73,6 +74,15 @@ int main() {
             }
         }
     }
+    // A saved DLSS choice must not survive a machine without the bridge or an RTX GPU.
+    s.upscaler = UpscalerDlss;
+    ConfigureDlssSupport(false, "test: no DLSS here");
+    assert(s.upscaler == UpscalerFsr3 && !s.dlss_supported.load());
+    assert(s.dlss_problem.load() && std::string(s.dlss_problem.load()) == "test: no DLSS here");
+    s.upscaler = UpscalerDlss;
+    ConfigureDlssSupport(true, nullptr);
+    assert(s.upscaler == UpscalerDlss && s.dlss_supported.load());
+    assert(s.dlss_problem.load() == nullptr);
     s.startup_preset = Quality;
     s.startup_upscaler = UpscalerFsr3;
     s.upscaler = UpscalerFsr3;

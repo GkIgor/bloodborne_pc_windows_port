@@ -753,6 +753,12 @@ public:
                !BbToggle::Disabled(BbToggle::ThreadedRecording);
     }
 
+    /// True when the caller holds the raw command buffer (after CommandBuffer(), until the next
+    /// KickRecording()/Finish()): Finish() would submit it and replace it under the caller.
+    [[nodiscard]] bool IsDirectRecording() const noexcept {
+        return direct_mode;
+    }
+
     /// Makes room for `bytes` of RecordData() plus the command that uses them in the current
     /// chunk: data and command must share a chunk, which is recycled once executed.
     void ReserveRecordData(size_t bytes) {

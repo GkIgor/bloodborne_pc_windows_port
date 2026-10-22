@@ -196,6 +196,12 @@ goto stage_dlls_done
 if not errorlevel 1 echo staged > "out\.dlls_staged"
 :stage_dlls_done
 
+rem Optional: the DLSS bridge (bbport_dlss.dll). NVIDIA's Windows NGX SDK is MSVC-only, so this
+rem one DLL is built with MSVC while everything else stays MinGW-w64. Without Visual Studio or
+rem the vendored SDK the step is skipped and DLSS falls back to FSR 3.1 at run time.
+rem BB_DLSS_BRIDGE=0 skips it explicitly.
+call :build_dlss_bridge
+
 echo Build complete: out\bbport.exe
 
 if not "%~1"=="--test" goto build_done
@@ -251,3 +257,58 @@ if errorlevel 1 exit /b 1
 
 echo ALL TESTS PASSED!
 :build_done
+exit /b 0
+
+rem ---------------------------------------------------------------------------------------------
+rem The DLSS bridge: gpu/dlss_bridge -> out/bbport_dlss.dll (MSVC, optionally Ninja).
+rem ---------------------------------------------------------------------------------------------
+:build_dlss_bridge
+if /i "%BB_DLSS_BRIDGE%"=="0" exit /b 0
+if not exist "gpu\dlss_bridge\bbport_dlss_bridge.cpp" exit /b 0
+if not exist "gpu\dlss_bridge\third_party\nvngx-sdk\lib\Windows_x86_64\x64\nvsdk_ngx_s.lib" (
+    echo [INFO] No vendored NGX SDK: skipping the DLSS bridge; DLSS uses FSR 3.1.
+    exit /b 0
+)
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" (
+    echo [INFO] Visual Studio not found: skipping the DLSS bridge; DLSS uses FSR 3.1.
+    exit /b 0
+)
+set "VSINSTALL="
+for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+if not defined VSINSTALL (
+    echo [INFO] MSVC tools not found: skipping the DLSS bridge; DLSS uses FSR 3.1.
+    exit /b 0
+)
+
+echo Building the DLSS bridge (bbport_dlss.dll, MSVC)...
+call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat" >nul
+if errorlevel 1 (
+    echo [WARN] vcvars64.bat failed: DLSS will use FSR 3.1.
+    exit /b 0
+)
+set "DLSS_CMAKE_MAKE="
+where ninja.exe >nul 2>nul
+if errorlevel 1 if defined W64DEVKIT_DIR if exist "%W64DEVKIT_DIR%\bin\ninja.exe" (
+    set "DLSS_CMAKE_MAKE=-DCMAKE_MAKE_PROGRAM=%W64DEVKIT_DIR%/bin/ninja.exe"
+)
+cmake -S gpu\dlss_bridge -B out\dlss-bridge -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+      -DCMAKE_CXX_COMPILER=cl %DLSS_CMAKE_MAKE% ^
+      -DDLSS_SDK_ROOT="%CD%\gpu\dlss_bridge\third_party\nvngx-sdk" ^
+      -DVULKAN_INCLUDE="%VULKAN_SDK%\include"
+if errorlevel 1 (
+    echo [WARN] DLSS bridge configuration failed: DLSS will use FSR 3.1.
+    exit /b 0
+)
+cmake --build out\dlss-bridge
+if errorlevel 1 (
+    echo [WARN] DLSS bridge build failed: DLSS will use FSR 3.1.
+    exit /b 0
+)
+copy /Y "out\dlss-bridge\bbport_dlss.dll" "out\bbport_dlss.dll" >nul
+if errorlevel 1 (
+    echo [WARN] Could not copy bbport_dlss.dll next to bbport.exe.
+    exit /b 0
+)
+echo DLSS bridge: out\bbport_dlss.dll
+exit /b 0

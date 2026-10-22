@@ -56,6 +56,7 @@ UPSCALER_CHOICES = [
     ("FSR 3.1", "fsr31"),
     ("FSR 4", "fsr4"),
     ("FSR 4.1.1", "fsr411"),
+    ("DLSS (NVIDIA RTX)", "dlss"),
 ]
 PRESET_CHOICES = [
     ("Native AA (no upscaling)", "0"),

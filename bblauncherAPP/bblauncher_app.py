@@ -968,7 +968,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 upscaler_val = "taa"
             elif is_fsr:
                 upscaler_val = self.cmb_upscaler.currentData() or "fsr31"
-                if upscaler_val not in ("fsr31", "fsr4", "fsr411"):
+                if upscaler_val not in ("fsr31", "fsr4", "fsr411", "dlss"):
                     upscaler_val = "fsr31"
             else:
                 upscaler_val = "off"
@@ -1222,6 +1222,8 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             upscaler_value = "fsr4"
         elif ini_upscaler == "fsr411":
             upscaler_value = "fsr411"
+        elif ini_upscaler == "dlss":
+            upscaler_value = "dlss"
         else:
             upscaler_value = "off"
         self._set_combo_data(self.cmb_upscaler, upscaler_value)

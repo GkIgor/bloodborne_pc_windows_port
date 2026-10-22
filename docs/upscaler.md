@@ -1,5 +1,53 @@
 # Temporal upscaling and frame generation — frame analysis and plan
 
+## NVIDIA DLSS Super Resolution (optional MSVC bridge, 2026-10-22)
+
+`upscaler=dlss` / `BB_UPSCALER=dlss` runs DLSS Super Resolution through
+`bbport_dlss.dll`, a small MIT-licensed bridge in `gpu/dlss_bridge` adapted from
+`IFreemz/shadPS4-Bloodborne-DLSS-FSR`. The port itself contains no NVIDIA code: the
+bridge is loaded at run time with `LoadLibraryA`, and the port keeps FSR 3.1 when it
+(or NVIDIA's `nvngx_dlss.dll`) is absent. `BB_DLSS=0` disables DLSS explicitly.
+
+DLSS receives the same temporal inputs as FSR 3.1: HDR scene colour, hardware depth,
+current-to-previous motion vectors (render pixels, same sign as the FSR path), Halton
+camera jitter, frame time, reset flag and sharpness. `preset=0` (Native AA) creates a
+DLAA feature; the other presets pick the DLSS quality mode from the render/output
+ratio. There is no reactive mask and no exposure input, exactly like the upstream
+port. The feature is released and recreated when the render/output size or the
+quality/preset/HDR set changes, after the scheduler has waited for the submitted work;
+`NVSDK_NGX_VULKAN_Shutdown` runs from `~Instance` before the `VkDevice` is destroyed.
+
+`dlss_preset=0|10|11` (overlay: a row under Preset when DLSS is selected) sets NVIDIA's
+render-preset hint: 0 leaves the driver's choice, 10 is preset J (less ghosting, more
+flicker) and 11 is preset K (the transformer model, the default on recent drivers). The
+hint is part of the feature description, so changing it releases and recreates the
+feature with the same wait as a resize. At start the port logs the directory and the
+version of the `nvngx_dlss.dll` it loaded.
+
+NVIDIA's DLSS indicator (the active mode and runtime version drawn in a screen corner) is
+a driver setting, not an SDK call: set the DWORD
+`HKCU\Software\NVIDIA Corporation\Global\NGXCore\ShowDlssIndicator` to `1` (`0` turns it
+off), for example with
+`reg add "HKCU\Software\NVIDIA Corporation\Global\NGXCore" /v ShowDlssIndicator /t REG_DWORD /d 1 /f`.
+
+NVIDIA's Windows NGX SDK is MSVC-only (`nvsdk_ngx_s.lib` uses the MSVC CRT and C++ EH
+metadata; MinGW's `ld` cannot link it). `build.bat` therefore builds this single DLL
+with Visual Studio (found with `vswhere`, Ninja + `cl`) and copies it to `out/`; the
+rest of the port remains MinGW-w64. `BB_DLSS_BRIDGE=0` skips the step. Only the SDK's
+public headers and import library are vendored (`.downloads/DLSS` is not required);
+`licenses/NVIDIA-DLSS-LICENSE.txt` is shipped. NVIDIA's ~59 MB runtime
+`nvngx_dlss.dll` is **not** committed here, although the RTX SDKs license does allow
+shipping it with the application; place it next to `bb-probe.exe` or in
+`<user>/dlss/` (a release may bundle it together with the NVIDIA license).
+
+On a GTX 1650 (no Tensor cores, so DLSS itself cannot run) the bridge loads, NGX asks
+for `VK_KHR_get_physical_device_properties2` and rejects the GPU with `0xbad00001`;
+the port logs the reason, sets `dlss_supported=false` and switches a saved
+`upscaler=dlss` choice to FSR 3.1 before the first frame, with no asserts or
+validation errors. `upscaler-support-test` covers that fallback plus the
+supported/`dlss_problem` states. The DLSS success path could not be exercised on this
+machine.
+
 ## Native TAA and missing FSR 4 assets (2026-10-01)
 
 `upscaler=taa` / `BB_UPSCALER=taa` is a separate native-resolution temporal AA

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <tuple>
+
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -11,6 +13,7 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "bbport_settings.h"
@@ -199,7 +202,11 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
                VK_VERSION_MAJOR(TargetVulkanApiVersion), VK_VERSION_MINOR(TargetVulkanApiVersion),
                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion));
 
-    CreateDevice();
+    if (!CreateDevice()) {
+        if (Dlss* dlss = Dlss::Get()) {
+            dlss->Disable("device creation failed");
+        }
+    }
     BbSettings::ConfigureUpscalerSupport(IsFsr4Int8Supported(), IsFsr411Supported());
     CollectPhysicalMemoryInfo();
     CollectImageFormatInfo();
@@ -207,6 +214,9 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
 }
 
 Instance::~Instance() {
+    if (Dlss* dlss = Dlss::Get()) {
+        dlss->Shutdown(); // NGX before the VkDevice and its images go away
+    }
     ImGui::Core::Shutdown(GetDevice());
     vmaDestroyAllocator(allocator);
 }
@@ -259,7 +269,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    std::vector<const char*> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -644,7 +654,33 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>();
     }
 
-    auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+    // DLSS (optional bridge library) needs its own device extensions on NVIDIA GPUs.
+    const std::size_t own_extensions = enabled_extensions.size();
+    Dlss* dlss = Dlss::Get();
+    if (dlss) {
+        dlss->AppendDeviceExtensions(*instance, physical_device, enabled_extensions);
+    }
+    const auto create = [&] {
+        device_chain.get<vk::DeviceCreateInfo>().enabledExtensionCount =
+            static_cast<u32>(enabled_extensions.size());
+        device_chain.get<vk::DeviceCreateInfo>().ppEnabledExtensionNames =
+            enabled_extensions.data();
+        return physical_device.createDeviceUnique(device_chain.get());
+    };
+    auto [device_result, dev] = create();
+    if (device_result != vk::Result::eSuccess && enabled_extensions.size() > own_extensions) {
+        // The driver advertises NGX's extensions but the device does not start with them:
+        // DLSS is optional, so retry without them and fall back to FSR 3.1.
+        LOG_WARNING(Render_Vulkan, "Device creation with the DLSS extensions failed ({}): "
+                    "again without them", vk::to_string(device_result));
+        if (dlss) {
+            dlss->Disable("the Vulkan device does not start with NGX's extensions");
+        }
+        enabled_extensions.resize(own_extensions);
+        auto retried = create();
+        device_result = retried.result;
+        dev = std::move(retried.value);
+    }
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
         return false;
@@ -652,6 +688,10 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+
+    if (dlss) {
+        dlss->Initialize(*instance, physical_device, *device);
+    }
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);

@@ -372,13 +372,16 @@ void Menu() {
     ImGui::SeparatorText(Tr("Temporal upscaler", "Временной апскейлер"));
     const char* const upscalers[] = {Tr("Off", "Выкл"), "FSR 3.1", "FSR 4 (INT8)",
                                      "FSR 4.1.1 (INT8)",
-                                     Tr("TAA (native anti-aliasing)", "TAA (нативное сглаживание)")};
-    static const char* later[] = {"DLSS", "XeSS"};
+                                     Tr("TAA (native anti-aliasing)", "TAA (нативное сглаживание)"),
+                                     "DLSS (NVIDIA RTX)"};
+    static_assert(sizeof(upscalers) / sizeof(upscalers[0]) == BbSettings::UpscalerCount);
+    static const char* later[] = {"XeSS"};
     int upscaler = s.upscaler;
     if (ImGui::BeginCombo(Tr("Upscaler", "Апскейлер"), upscalers[upscaler])) {
         for (int i = 0; i < BbSettings::UpscalerCount; ++i) {
             const bool supported = i == BbSettings::UpscalerFsr4 ? s.fsr4_supported.load()
-                : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load() : true;
+                : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
+                : i == BbSettings::UpscalerDlss ? s.dlss_supported.load() : true;
             ImGui::BeginDisabled(!supported);
             if (ImGui::Selectable(upscalers[i], i == upscaler)) {
                 Store(s.upscaler, i, true);
@@ -398,6 +401,20 @@ void Menu() {
             ImGui::TextDisabled("%s", Tr("— in development", "— в работе"));
         }
         ImGui::EndCombo();
+    }
+    if (s.upscaler == BbSettings::UpscalerDlss) {
+        Hint(Tr("NVIDIA DLSS Super Resolution (RTX GPUs; Native AA is DLAA). Needs the DLSS bridge "
+                "and NVIDIA's library next to the game; otherwise FSR 3.1 is used.",
+                "NVIDIA DLSS Super Resolution (видеокарты RTX; Native AA — это DLAA). Нужны мост "
+                "DLSS и библиотека NVIDIA рядом с игрой; без них используется FSR 3.1."));
+    }
+    if (const char* problem = s.dlss_problem.load();
+        problem && s.upscaler == BbSettings::UpscalerDlss) {
+        char line[192];
+        std::snprintf(line, sizeof(line), "DLSS: %s", problem);
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "%s", line);
+        ImGui::PopTextWrapPos();
     }
     if (const char* problem = s.fsr4_problem.load()) {
         ImGui::PushTextWrapPos();
@@ -456,6 +473,38 @@ void Menu() {
         ImGui::EndCombo();
     }
     ImGui::EndDisabled();
+    if (s.upscaler == BbSettings::UpscalerDlss) {
+        static constexpr int models[] = {BbSettings::DlssModelDefault, BbSettings::DlssModelK,
+                                         BbSettings::DlssModelJ};
+        static constexpr const char* names_en[] = {"Driver default",
+                                                   "K (transformer, recommended)",
+                                                   "J (transformer, less ghosting)"};
+        static constexpr const char* names_ru[] = {"По умолчанию (драйвер)",
+                                                   "K (transformer, рекомендуется)",
+                                                   "J (transformer, меньше шлейфов)"};
+        const int current = s.dlss_preset.load();
+        int selected = 0;
+        for (int i = 0; i < 3; ++i) {
+            if (models[i] == current) {
+                selected = i;
+            }
+        }
+        if (ImGui::BeginCombo(Tr("DLSS model preset", "Пресет модели DLSS"),
+                              Tr(names_en[selected], names_ru[selected]))) {
+            for (int i = 0; i < 3; ++i) {
+                if (ImGui::Selectable(Tr(names_en[i], names_ru[i]), i == selected)) {
+                    Store(s.dlss_preset, models[i], true);
+                }
+            }
+            ImGui::EndCombo();
+        }
+        Hint(Tr("NVIDIA's render-preset hint: K is the transformer model (best quality, the "
+                "driver default on recent versions), J is similar with less ghosting but more "
+                "flicker. The change applies from the next frame.",
+                "Подсказка NVIDIA о пресете рендера: K — transformer-модель (лучшее качество, "
+                "по умолчанию в новых драйверах), J похож, но меньше шлейфов и больше мерцания. "
+                "Изменение применяется со следующего кадра."));
+    }
     if (taa) {
         ImGui::TextWrapped("%s", Tr("TAA smooths the scene at the output resolution, without the FSR "
                                     "model or upscaling. The saved FSR preset is restored when you "

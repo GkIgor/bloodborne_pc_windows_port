@@ -36,7 +36,8 @@ MAX_LOG_LINES = 5000
 # Choices: (label, value). The first entry is the default. Labels are translated when shown.
 UI_LANGUAGES = [("Как в системе", ""), ("Русский", "ru"), ("English", "en")]
 UPSCALERS = [("FSR 4", "fsr4"), ("FSR 4.1.1", "fsr411"), ("FSR 3", "fsr3"),
-             ("TAA (нативное сглаживание)", "taa"), ("Выключен", "off")]
+             ("TAA (нативное сглаживание)", "taa"), ("DLSS (NVIDIA RTX)", "dlss"),
+             ("Выключен", "off")]
 PRESETS = [("Native AA", 0), ("Quality (x1.5)", 1), ("Balanced (x1.7)", 2),
            ("Performance (x2)", 3), ("Ultra Performance (x3)", 4)]
 OUTPUT_RES = [("1280×720 (Steam Deck)", "1280x720"), ("1920×1080", "1920x1080"), ("2560×1440", "2560x1440"), ("3840×2160", "3840x2160")]
@@ -549,6 +550,8 @@ class LauncherWindow(Adw.ApplicationWindow):
                 tr("{}. Установите полный набор fsr4_411 в {}.").format(problem, directory))
         else:
             hint = tr("Сглаживание в разрешении вывода без модели FSR") if value == "taa" else None
+            if value == "dlss":
+                hint = tr("Нужны bbport_dlss.dll и nvngx_dlss.dll рядом с игрой; иначе FSR 3.1")
         self.preset_row.set_sensitive(value not in ("taa", "off"))
         self.sharpen_row.set_sensitive(value != "off")
         self.sharpness_row.set_sensitive(value != "off")
