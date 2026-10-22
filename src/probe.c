@@ -106,6 +106,12 @@ int native_camera_is_active(void) {
     return g_native_camera_hook_installed && !g_native_camera_disabled && bbgpu_get_mk_native_mouse();
 }
 
+static volatile int g_native_cam_locked_on = 0;
+
+int native_camera_owns_mouse(void) {
+    return native_camera_is_active() && !g_native_cam_locked_on;
+}
+
 extern void bbgpu_get_mk_tuning(float *responsiveness, float *acceleration);
 void (ABI *orig_cam_update)(void *cam, void *r14, void *r15) = NULL;
 
@@ -167,8 +173,19 @@ void host_native_mouse_inject(void *cam, void *rsi_ctx, float dt) {
         fflush(stdout);
     }
 
+    /* While locked on the pad turns mouse flicks into right-stick input (target switching). */
+    static float s_smooth_dx = 0.0f;
+    static float s_smooth_dy = 0.0f;
+    static int s_was_locked = 0;
+    g_native_cam_locked_on = lock_on_byte != 0;
+    if (lock_on_byte != 0) s_was_locked = 1;
     if (lock_on_byte != 0 || !captured) {
         return;
+    }
+    if (s_was_locked) {
+        s_was_locked = 0;
+        s_smooth_dx = s_smooth_dy = 0.0f;
+        bbgpu_consume_mouse_delta(NULL, NULL);
     }
 
     float sens_x = 1.0f, sens_y = 1.0f, dz = 0.0f, sm = 0.0f;
@@ -193,8 +210,6 @@ void host_native_mouse_inject(void *cam, void *rsi_ctx, float dt) {
     }
 
     /* Mouse smoothing (EMA filter): 0.0 = raw 1:1, higher = smoothed */
-    static float s_smooth_dx = 0.0f;
-    static float s_smooth_dy = 0.0f;
     const float s_factor = (sm < 0.0f) ? 0.0f : (sm > 0.85f ? 0.85f : sm);
     if (s_factor > 0.0f) {
         s_smooth_dx = s_smooth_dx * s_factor + dx * (1.0f - s_factor);
