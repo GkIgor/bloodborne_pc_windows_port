@@ -114,6 +114,8 @@ int native_camera_owns_mouse(void) {
 
 extern void bbgpu_get_mk_tuning(float *responsiveness, float *acceleration);
 void (ABI *orig_cam_update)(void *cam, void *r14, void *r15) = NULL;
+/* Aim camera (monocular): the camera manager runs it instead of the follow camera in modes 1 and 2. */
+void (ABI *orig_aim_cam_update)(void *cam, void *r14) = NULL;
 
 /* Turn speeds (rad/s) for stick input below full tilt: pitch base/max, yaw base/max. */
 static const unsigned k_cam_speed_offs[4] = { 0x20c, 0x214, 0x210, 0x218 };
@@ -123,6 +125,9 @@ static float g_saved_speed[4];
 /* The pad leaves the stick buffer untouched in some states (loading), so our last offset is removed if still there. */
 static float *g_stick_buf;
 static float g_stick_added[2], g_stick_left[2];
+
+/* Mouse smoothing (EMA) state shared by the follow and aim cameras. */
+static float s_smooth_dx, s_smooth_dy;
 
 /* Right-stick buffer the camera update reads (rsi_ctx->0x58->0x280, or ->0x80, + 0x40): x = pitch, y = yaw. */
 static float *camera_stick_buf(void *rsi_ctx) {
@@ -134,6 +139,17 @@ static float *camera_stick_buf(void *rsi_ctx) {
     if (rax_val <= 0x10000) return NULL;
     return (float*)(rax_val + 0x40);
 }
+
+static void remove_stick_offset(float *stick) {
+    if (stick && stick == g_stick_buf && stick[0] == g_stick_left[0] && stick[1] == g_stick_left[1]) {
+        stick[0] -= g_stick_added[0];
+        stick[1] -= g_stick_added[1];
+    }
+    g_stick_buf = NULL;
+}
+
+static int mouse_look_delta(float delta[2]);
+static void follow_cam_apply_delta(uintptr_t cam_addr, float *stick, float dt, const float delta[2]);
 
 void host_native_mouse_inject(void *cam, void *rsi_ctx, float dt) {
     g_native_cam_fire_count++;
@@ -155,11 +171,7 @@ void host_native_mouse_inject(void *cam, void *rsi_ctx, float dt) {
         for (int i = 0; i < 4; ++i) *(float*)(cam_addr + k_cam_speed_offs[i]) = g_saved_speed[i];
     g_boosted_cam = 0;
     float *stick = camera_stick_buf(rsi_ctx);
-    if (stick && stick == g_stick_buf && stick[0] == g_stick_left[0] && stick[1] == g_stick_left[1]) {
-        stick[0] -= g_stick_added[0];
-        stick[1] -= g_stick_added[1];
-    }
-    g_stick_buf = NULL;
+    remove_stick_offset(stick);
     if (!native_camera_is_active()) return;
 
     const uint8_t lock_on_byte = *(volatile uint8_t*)(cam_addr + 0x260);
@@ -174,8 +186,6 @@ void host_native_mouse_inject(void *cam, void *rsi_ctx, float dt) {
     }
 
     /* While locked on the pad turns mouse flicks into right-stick input (target switching). */
-    static float s_smooth_dx = 0.0f;
-    static float s_smooth_dy = 0.0f;
     static int s_was_locked = 0;
     g_native_cam_locked_on = lock_on_byte != 0;
     if (lock_on_byte != 0) s_was_locked = 1;
@@ -188,10 +198,16 @@ void host_native_mouse_inject(void *cam, void *rsi_ctx, float dt) {
         bbgpu_consume_mouse_delta(NULL, NULL);
     }
 
+    float delta[2];
+    if (mouse_look_delta(delta)) follow_cam_apply_delta(cam_addr, stick, dt, delta);
+}
+
+/* Consumes the pending mouse motion as camera {pitch, yaw} deltas in radians; 0 when there is none. */
+static int mouse_look_delta(float delta[2]) {
     float sens_x = 1.0f, sens_y = 1.0f, dz = 0.0f, sm = 0.0f;
     int inv_x = 0, inv_y = 0;
     const int mk_enabled = bbgpu_get_mk_config(&sens_x, &sens_y, &inv_x, &inv_y, &dz, &sm);
-    if (!mk_enabled) return;
+    if (!mk_enabled) return 0;
 
     float responsiveness = 1.0f, acceleration = 1.0f;
     bbgpu_get_mk_tuning(&responsiveness, &acceleration);
@@ -223,13 +239,16 @@ void host_native_mouse_inject(void *cam, void *rsi_ctx, float dt) {
         s_smooth_dy = 0.0f;
     }
 
-    if (dx == 0.0f && dy == 0.0f) return;
+    if (dx == 0.0f && dy == 0.0f) return 0;
 
     /* Scaled delta for camera angles and stick vector injection */
     const float base_sens = 0.0015f * responsiveness;
-    const float delta_yaw   = (inv_x ? -1.0f : 1.0f) * dx * sens_x * base_sens;
-    const float delta_pitch = (inv_y ? -1.0f : 1.0f) * dy * sens_y * base_sens;
+    delta[1] = (inv_x ? -1.0f : 1.0f) * dx * sens_x * base_sens;
+    delta[0] = (inv_y ? -1.0f : 1.0f) * dy * sens_y * base_sens;
+    return 1;
+}
 
+static void follow_cam_apply_delta(uintptr_t cam_addr, float *stick, float dt, const float delta[2]) {
     /* The engine rebuilds pitch/yaw from the camera position each update, so only the stick moves it.
      * Above |stick| 0.998 it turns at a fixed rate that ramps up while held and resets on reversal;
      * below, it turns by stick * speed * dt. Use a half-tilt stick and set speed so that equals the delta;
@@ -239,7 +258,6 @@ void host_native_mouse_inject(void *cam, void *rsi_ctx, float dt) {
 
     for (int i = 0; i < 4; ++i) g_saved_speed[i] = *(float*)(cam_addr + k_cam_speed_offs[i]);
     g_boosted_cam = cam_addr;
-    const float delta[2] = { delta_pitch, delta_yaw };
     for (int axis = 0; axis < 2; ++axis) {
         g_stick_added[axis] = 0.0f;
         if (delta[axis] == 0.0f) continue;
@@ -252,6 +270,28 @@ void host_native_mouse_inject(void *cam, void *rsi_ctx, float dt) {
     g_stick_buf = stick;
     g_stick_left[0] = stick[0];
     g_stick_left[1] = stick[1];
+}
+
+/* The aim camera keeps its own {pitch, yaw} at +0x148 and adds stick * speed (+0xfc, +0x100) * dt
+ * each update, then wraps and clamps them; it reads the stick only while +0x188 is set. */
+void host_aim_mouse_inject(void *cam, void *rsi_ctx) {
+    const uintptr_t cam_addr = (uintptr_t)cam;
+    if (cam_addr < 0x10000) return;
+    remove_stick_offset(camera_stick_buf(rsi_ctx));
+    if (!native_camera_is_active() || !bbgpu_mouse_captured()) return;
+
+    float delta[2];
+    if (!mouse_look_delta(delta)) return;
+    if (*(volatile uint8_t*)(cam_addr + 0x188) == 0) return;
+
+    /* The game slows the stick by current/max field of view while zoomed; match it. */
+    float zoom = *(float*)(cam_addr + 0x50) / *(float*)(cam_addr + 0x134);
+    if (!(zoom > 0.0f && zoom <= 4.0f)) zoom = 1.0f;
+
+    float *angles = (float*)(cam_addr + 0x148);
+    const float *speed = (const float*)(cam_addr + 0xfc);
+    for (int axis = 0; axis < 2; ++axis)
+        angles[axis] += (speed[axis] < 0.0f ? -delta[axis] : delta[axis]) * zoom;
 }
 
 __attribute__((naked)) void guest_camera_update_thunk(void) {
@@ -320,6 +360,48 @@ __attribute__((naked)) void guest_camera_update_thunk(void) {
         "pop %%rax\n\t"
         "popfq\n\t"
         "jmp *orig_cam_update(%%rip)\n\t"
+        : : : "memory"
+    );
+}
+
+/* SysV guest -> Win64 host: keeps the guest argument registers (rdi, rsi, rdx, rcx, r8, r9, xmm0-7)
+ * that Win64 lets the host clobber or that the aim update reads (rdi=cam, rsi=ctx, xmm0=dt). */
+__attribute__((naked)) void guest_aim_camera_update_thunk(void) {
+    __asm__ __volatile__(
+        "push %%rdi\n\t"
+        "push %%rsi\n\t"
+        "push %%rdx\n\t"
+        "push %%rcx\n\t"
+        "push %%r8\n\t"
+        "push %%r9\n\t"
+        "sub $168, %%rsp\n\t" /* 32 shadow + 8 x 16 xmm + 8 to align */
+        "movdqu %%xmm0,  32(%%rsp)\n\t"
+        "movdqu %%xmm1,  48(%%rsp)\n\t"
+        "movdqu %%xmm2,  64(%%rsp)\n\t"
+        "movdqu %%xmm3,  80(%%rsp)\n\t"
+        "movdqu %%xmm4,  96(%%rsp)\n\t"
+        "movdqu %%xmm5, 112(%%rsp)\n\t"
+        "movdqu %%xmm6, 128(%%rsp)\n\t"
+        "movdqu %%xmm7, 144(%%rsp)\n\t"
+        "mov %%rdi, %%rcx\n\t"
+        "mov %%rsi, %%rdx\n\t"
+        "call host_aim_mouse_inject\n\t"
+        "movdqu  32(%%rsp), %%xmm0\n\t"
+        "movdqu  48(%%rsp), %%xmm1\n\t"
+        "movdqu  64(%%rsp), %%xmm2\n\t"
+        "movdqu  80(%%rsp), %%xmm3\n\t"
+        "movdqu  96(%%rsp), %%xmm4\n\t"
+        "movdqu 112(%%rsp), %%xmm5\n\t"
+        "movdqu 128(%%rsp), %%xmm6\n\t"
+        "movdqu 144(%%rsp), %%xmm7\n\t"
+        "add $168, %%rsp\n\t"
+        "pop %%r9\n\t"
+        "pop %%r8\n\t"
+        "pop %%rcx\n\t"
+        "pop %%rdx\n\t"
+        "pop %%rsi\n\t"
+        "pop %%rdi\n\t"
+        "jmp *orig_aim_cam_update(%%rip)\n\t"
         : : : "memory"
     );
 }
@@ -3011,6 +3093,40 @@ int main(int argc, char **argv) {
 
             g_native_camera_hook_installed = 1;
             printf("[NATIVE MOUSE] Direct camera rotation hook installed successfully at image+0x1436c00 and image+0x1436e15 (thunk=%p, orig=%p)\n", (void*)t, (void*)orig_cam_update);
+        } while (0);
+
+        /* Aim camera (monocular) update, called at image+0x1436d2f and image+0x1436d5e */
+        do {
+            if (!g_native_camera_hook_installed) break;
+            static const unsigned char aim1_expected[5] = { 0xe8, 0x2c, 0xcb, 0xff, 0xff };
+            static const unsigned char aim2_expected[5] = { 0xe8, 0xfd, 0xca, 0xff, 0xff };
+            static const unsigned char aim_target_expected[4] = { 0x55, 0x48, 0x89, 0xe5 };
+            if (memcmp(image + 0x1436d2f, aim1_expected, 5) != 0 ||
+                memcmp(image + 0x1436d5e, aim2_expected, 5) != 0 ||
+                memcmp(image + 0x1433860, aim_target_expected, 4) != 0) {
+                fprintf(stderr, "[NATIVE MOUSE GUARD] Aim camera signature mismatch; monocular mouse look not hooked.\n");
+                break;
+            }
+
+            /* Slots import_count+2..+7 belong to the assert hook stub. */
+            unsigned char *t = thunks + (import_count + 8) * 32;
+            uintptr_t hook_fn = (uintptr_t)guest_aim_camera_update_thunk;
+            t[0] = 0xff; t[1] = 0x25; t[2] = 0x00; t[3] = 0x00; t[4] = 0x00; t[5] = 0x00;
+            memcpy(t + 6, &hook_fn, 8);
+
+            int64_t disp1 = (int64_t)t - (int64_t)(image + 0x1436d2f + 5);
+            int64_t disp2 = (int64_t)t - (int64_t)(image + 0x1436d5e + 5);
+            if (disp1 < INT32_MIN || disp1 > INT32_MAX || disp2 < INT32_MIN || disp2 > INT32_MAX) {
+                fprintf(stderr, "[NATIVE MOUSE GUARD] Aim camera hook displacement out of 32-bit range; skipping hook.\n");
+                break;
+            }
+
+            orig_aim_cam_update = (void (ABI *)(void*, void*))(image + 0x1433860);
+            int32_t d1 = (int32_t)disp1;
+            int32_t d2 = (int32_t)disp2;
+            memcpy(image + 0x1436d30, &d1, 4);
+            memcpy(image + 0x1436d5f, &d2, 4);
+            printf("[NATIVE MOUSE] Aim camera (monocular) hook installed at image+0x1436d2f and image+0x1436d5e\n");
         } while (0);
     }
     if (!cpu_only) bbgpu_menu_pointer_install(image, size);
