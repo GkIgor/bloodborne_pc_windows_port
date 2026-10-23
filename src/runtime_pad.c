@@ -166,12 +166,14 @@ static void sample_host(PadData *d) {
     int inv_x = 0, inv_y = 0;
     const int mk_enabled = bbgpu_get_mk_config(&sens_x, &sens_y, &inv_x, &inv_y, NULL, NULL);
 
-    // Mouse Buttons (only active while mouse is captured in relative mode)
+    // Mouse Buttons (only active while mouse is captured in relative mode, or the menu pointer has it)
     const int mouse_is_captured = bbgpu_mouse_captured();
+    // The buttons the menu pointer takes (1 left, 2 right) choose and go back instead of their bindings.
+    const int pointer_owns = mouse_is_captured ? 0 : bbgpu_menu_pointer_mouse_buttons();
     float mouse_x_pos = 0.0f, mouse_y_pos = 0.0f;
-    const SDL_MouseButtonFlags mouse_buttons = mouse_is_captured ? SDL_GetMouseState(&mouse_x_pos, &mouse_y_pos) : 0;
-    const bool lmb_raw = (mouse_buttons & SDL_BUTTON_LMASK) != 0;
-    const bool rmb_raw = (mouse_buttons & SDL_BUTTON_RMASK) != 0;
+    const SDL_MouseButtonFlags mouse_buttons = (mouse_is_captured || pointer_owns) ? SDL_GetMouseState(&mouse_x_pos, &mouse_y_pos) : 0;
+    const bool lmb_raw = (mouse_buttons & SDL_BUTTON_LMASK) != 0 && !(pointer_owns & 1);
+    const bool rmb_raw = (mouse_buttons & SDL_BUTTON_RMASK) != 0 && !(pointer_owns & 2);
     const bool mmb = (mouse_buttons & SDL_BUTTON_MMASK) != 0;
     const bool x1 = (mouse_buttons & SDL_BUTTON_X1MASK) != 0;
     const bool x2 = (mouse_buttons & SDL_BUTTON_X2MASK) != 0;

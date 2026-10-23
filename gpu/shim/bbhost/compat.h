@@ -89,5 +89,6 @@ bool host_text_entry_open();
 // the native PC option rows.
 inline bool ingame_menu_open() { return false; }
 inline bool debug_menu_open() { return false; }
-inline void option_menu_list_update(void*, bool) {}
+// bbport: spots Item Storage's item list (../bbport_menu_pointer.cpp).
+void option_menu_list_update(void* list, bool focus);
 inline bool option_menu_click_decides(void*, int) { return false; }

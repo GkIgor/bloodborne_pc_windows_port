@@ -20,4 +20,7 @@ void Click();
 void Back();
 void Wheel(float notches);
 
+/// Item Storage's item list has focus and right click is bound to L2, which switches its pages.
+bool RightClickSwitchesPages();
+
 } // namespace BbMenuPointer

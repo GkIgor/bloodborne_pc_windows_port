@@ -61,6 +61,8 @@ int bbgpu_get_mk_native_mouse(void);
 int bbgpu_menu_pointer_install(unsigned char *image, uint64_t size);
 /* Notes the pad's own state and returns the buttons the menu pointer presses this sample. */
 uint32_t bbgpu_menu_pointer_buttons(uint32_t buttons, uint8_t lx, uint8_t ly);
+/* The mouse buttons the menu pointer takes while it has the mouse: 1 left (choose), 2 right (back). */
+int bbgpu_menu_pointer_mouse_buttons(void);
 
 enum BbCustomKey {
     BB_KEY_NONE = 0,
