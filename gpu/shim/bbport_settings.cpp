@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <SDL3/SDL.h>
@@ -183,6 +184,11 @@ void Set(Values& v, const std::string& key, const std::string& value) {
                 v.output_res = r;
             }
         }
+    } else if (key.rfind("cheat.", 0) == 0) {
+        const int index = std::atoi(key.c_str() + 6);
+        if (index >= 0 && index < CheatSlotCount) {
+            v.cheats[index] = i != 0;
+        }
     } else {
         for (int e = 0; e < EffectCount; ++e) {
             if (key == Effects[e].key) {
@@ -323,6 +329,8 @@ bool ResolutionNeedsRestart() {
 }
 
 void Save() {
+    static std::mutex save_mutex;
+    std::scoped_lock lock{save_mutex};
     const auto& v = Get();
     FILE* file = std::fopen(Path(), "w");
     if (!file) {
@@ -368,6 +376,11 @@ void Save() {
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");
     std::fprintf(file, "language=%s\n", v.language == LangRu ? "ru" : "en");
+    // Live cheat states (F4 menu).  Section headers are comments for the loader above.
+    std::fprintf(file, "\n[Cheats]\n");
+    for (int c = 0; c < CheatSlotCount; ++c) {
+        std::fprintf(file, "cheat.%d=%d\n", c, int(v.cheats[c].load()));
+    }
     // Action keybindings
     for (int a = 0; a < BB_ACTION_COUNT; ++a) {
         std::fprintf(file, "%s=%s\n", s_action_infos[a].ini_key, KeyCodeToString(v.keybinds[a].load()));

@@ -60,6 +60,8 @@ inline constexpr Effect Effects[] = {
     {"debug_menu", "Debug menu (needs the font files)", "Debug menu (нужны файлы шрифтов)", false},
 };
 inline constexpr int EffectCount = int(sizeof(Effects) / sizeof(Effects[0]));
+/// Persistent cheat slots (bbport.ini [Cheats]). The live cheat table uses ids 0..16.
+inline constexpr int CheatSlotCount = 32;
 /// Live output resolutions: the upscaler's output and the UI host targets.
 inline constexpr int OutputWidths[] = {1280, 1920, 2560, 3840};
 inline constexpr int OutputHeights[] = {720, 1080, 1440, 2160};
@@ -104,6 +106,8 @@ struct Values {
     Values();
     /// Applied at start (patches.py); the menu shows when a restart is needed.
     std::atomic<bool> effects[EffectCount]{};
+    /// Live cheat states (F4 menu), persisted under [Cheats].
+    std::atomic<bool> cheats[CheatSlotCount]{};
     std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
     std::atomic<int> prep_workers{-1}; ///< -1 default (Available/2), 0 off, 1..16 explicit workers
     std::atomic<int> output_res{OutputDefault}; ///< index into OutputWidths

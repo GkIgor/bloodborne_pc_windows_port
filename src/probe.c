@@ -54,6 +54,11 @@ void runtime_guest_image_range(uint64_t *base, uint64_t *size) {
     if (base) *base = (uint64_t)(uintptr_t)image;
     if (size) *size = image_size;
 }
+/* The image range is published before relocations/startup patches/module initializers run.
+ * A live patcher must not write to the image until those are complete. */
+int runtime_guest_image_ready(void) {
+    return entered_game;
+}
 static int is_guest_address(uintptr_t addr) {
     return image && image_size && addr >= (uintptr_t)image && addr < (uintptr_t)image + image_size;
 }

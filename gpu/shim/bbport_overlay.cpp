@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_overlay.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -19,6 +21,7 @@
 #include <windows.h>
 #endif
 #include <vk_mem_alloc.h>
+#include "bbport_cheats.h"
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "imgui.h"
@@ -65,7 +68,9 @@ using BbSettings::Tr; // English by default, Russian with language=ru (bbport.in
 std::mutex imgui_mutex; // the ImGui context: window thread (input) and present thread
 bool initialized = false;
 std::atomic<bool> menu_open{false};
+std::atomic<bool> cheat_menu_open{false};
 bool l3_down = false, r3_down = false;
+bool cheat_l1_down = false, cheat_r1_down = false, cheat_back_down = false;
 bool dirty = false; // settings changed while open: saved on close
 float base_scale = 1.0f;
 int rebinding_action = -1;
@@ -268,7 +273,15 @@ void SetOpen(bool value) {
         }
     }
     menu_open = value;
-    ImGui::GetIO().MouseDrawCursor = value;
+    ImGui::GetIO().MouseDrawCursor = value || cheat_menu_open.load();
+}
+
+void SetCheatOpen(bool value) {
+    if (cheat_menu_open.load() == value) {
+        return;
+    }
+    cheat_menu_open = value;
+    ImGui::GetIO().MouseDrawCursor = value || menu_open.load();
 }
 
 ImGuiKey KeyFromSdl(SDL_Keycode key) {
@@ -869,6 +882,134 @@ void Menu() {
     }
 }
 
+bool ContainsNoCase(const std::string& text, const std::string& needle) {
+    if (needle.empty()) return true;
+    const auto it = std::search(
+        text.begin(), text.end(), needle.begin(), needle.end(), [](char a, char b) {
+            return std::tolower(static_cast<unsigned char>(a)) ==
+                   std::tolower(static_cast<unsigned char>(b));
+        });
+    return it != text.end();
+}
+
+void DrawCheatMenu() {
+    BbCheats::Update();
+    const auto cheats = BbCheats::List();
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - 40.0f * base_scale,
+                                   viewport->WorkPos.y + 40.0f * base_scale),
+                            ImGuiCond_Appearing, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(650.0f * base_scale, 0.0f), ImGuiCond_Appearing);
+    bool keep_open = true;
+    if (!ImGui::Begin("Bloodborne Cheats & Tweaks (F4)###bb_cheats", &keep_open,
+                      ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End();
+        return;
+    }
+
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+    ImGui::TextDisabled("%s", BbCheats::Status());
+    ImGui::PopTextWrapPos();
+    ImGui::TextDisabled("F4 toggles this menu.  Gamepad: L1 + R1 + Back.");
+
+    ImGui::Separator();
+    static char search[128] = "";
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##cheat_search", "Search cheats...", search, sizeof(search));
+    ImGui::Spacing();
+    if (ImGui::Button("Enable All Cheats")) {
+        BbCheats::EnableAll();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Disable All Cheats / Revert")) {
+        BbCheats::DisableAll();
+    }
+    ImGui::SameLine();
+    int active = 0;
+    int available = 0;
+    for (const auto& cheat : cheats) {
+        if (cheat.active) ++active;
+        if (cheat.available) ++available;
+    }
+    ImGui::TextDisabled("%d active / %d available", active, available);
+    ImGui::Separator();
+
+    const char* const categories[BbCheats::CategoryCount] = {
+        "Player / God Mode",
+        "Items, Echoes & Insight",
+        "Combat & World",
+        "Visual & Graphic Tweaks",
+    };
+    const bool filtering = search[0] != '\0';
+    for (int category = 0; category < BbCheats::CategoryCount; ++category) {
+        bool any = false;
+        for (const auto& cheat : cheats) {
+            if (cheat.category != category) continue;
+            if (ContainsNoCase(cheat.name, search) || ContainsNoCase(cheat.description, search)) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) continue;
+        if (filtering) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+        if (!ImGui::CollapsingHeader(categories[category], ImGuiTreeNodeFlags_DefaultOpen)) {
+            continue;
+        }
+        if (category == BbCheats::CategoryVisual) {
+            ImGui::TextDisabled("These also update the matching effect_* setting for the next launch.");
+        }
+        for (const auto& cheat : cheats) {
+            if (cheat.category != category) continue;
+            if (!ContainsNoCase(cheat.name, search) &&
+                !ContainsNoCase(cheat.description, search)) {
+                continue;
+            }
+            ImGui::PushID(cheat.id);
+            bool enabled = cheat.active;
+            const bool unavailable = !cheat.available;
+            if (unavailable) ImGui::BeginDisabled();
+            if (ImGui::Checkbox(cheat.name.c_str(), &enabled)) {
+                BbCheats::Set(cheat.id, enabled);
+            }
+            if (ImGui::BeginItemTooltip()) {
+                ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+                ImGui::TextUnformatted(cheat.description.c_str());
+                if (!cheat.error.empty()) {
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s",
+                                       cheat.error.c_str());
+                }
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+            if (unavailable) ImGui::EndDisabled();
+            if (!cheat.error.empty()) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "(!)");
+                if (ImGui::BeginItemTooltip()) {
+                    ImGui::TextUnformatted(cheat.error.c_str());
+                    ImGui::EndTooltip();
+                }
+            } else if (cheat.startup_applied) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(applied at startup)");
+            }
+            ImGui::PopID();
+        }
+        ImGui::Spacing();
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled(
+        "Live memory patches.  Disable All restores the mod bytes; the JSON master stays "
+        "until restart.");
+    ImGui::End();
+    if (!keep_open) {
+        SetCheatOpen(false);
+    }
+}
+
 void FpsCounter() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float pad = 12.0f * base_scale;
@@ -1079,7 +1220,7 @@ void UpdateTextInput(SDL_Window* window) {
     bool want = false;
     {
         std::scoped_lock lock{imgui_mutex};
-        want = initialized && menu_open && ImGui::GetIO().WantTextInput;
+        want = initialized && (menu_open || cheat_menu_open) && ImGui::GetIO().WantTextInput;
     }
     if (want != SDL_TextInputActive(window)) {
         if (want) {
@@ -1096,15 +1237,30 @@ bool HandleEvent(const SDL_Event& event) {
         return false;
     }
     ImGuiIO& io = ImGui::GetIO();
-    const bool is_open = menu_open;
+    const bool is_open = menu_open || cheat_menu_open;
     switch (event.type) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
         if (down && !event.key.repeat) {
-            if (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE)) {
-                SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
+            if (event.key.key == SDLK_INSERT) {
+                SetOpen(!menu_open.load());
                 return true;
+            }
+            // F4: independent cheat / debug menu (Insert remains the settings menu).
+            if (event.key.key == SDLK_F4) {
+                SetCheatOpen(!cheat_menu_open.load());
+                return true;
+            }
+            if (event.key.key == SDLK_ESCAPE) {
+                if (cheat_menu_open.load()) {
+                    SetCheatOpen(false);
+                    return true;
+                }
+                if (menu_open.load()) {
+                    SetOpen(false);
+                    return true;
+                }
             }
             // HUD overlay hotkeys: F11 or Shift + Tab
             const bool shift = (event.key.mod & SDL_KMOD_SHIFT) != 0;
@@ -1172,9 +1328,20 @@ bool HandleEvent(const SDL_Event& event) {
             l3_down = down;
         } else if (button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) {
             r3_down = down;
+        } else if (button == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) {
+            cheat_l1_down = down;
+        } else if (button == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) {
+            cheat_r1_down = down;
+        } else if (button == SDL_GAMEPAD_BUTTON_BACK) {
+            cheat_back_down = down;
         }
         if (down && l3_down && r3_down) {
-            SetOpen(!is_open);
+            SetOpen(!menu_open.load());
+            return true;
+        }
+        // Cheat menu: L1 + R1 + Back (View).  It does not collide with Insert, F4 or L3+R3.
+        if (down && cheat_l1_down && cheat_r1_down && cheat_back_down) {
+            SetCheatOpen(!cheat_menu_open.load());
             return true;
         }
         if (!is_open) {
@@ -1261,11 +1428,16 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (menu_open || BbSettings::Get().show_fps || BbSettings::Get().show_hud || (g_window && g_window->IsTextInputActive()));
+    if (initialized) {
+        // Apply persisted cheats even when neither menu is open.
+        BbCheats::Update();
+    }
+    return initialized && (menu_open || cheat_menu_open || BbSettings::Get().show_fps ||
+                           BbSettings::Get().show_hud || (g_window && g_window->IsTextInputActive()));
 }
 
 bool CapturesInput() {
-    return menu_open;
+    return menu_open || cheat_menu_open;
 }
 
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
@@ -1299,9 +1471,12 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (menu_open) {
         Menu();
     }
-    if (BbSettings::Get().show_hud && !menu_open) {
+    if (cheat_menu_open) {
+        DrawCheatMenu();
+    }
+    if (BbSettings::Get().show_hud && !menu_open && !cheat_menu_open) {
         HudOverlay();
-    } else if (BbSettings::Get().show_fps && !menu_open) {
+    } else if (BbSettings::Get().show_fps && !menu_open && !cheat_menu_open) {
         FpsCounter();
     }
     if (g_window && g_window->IsTextInputActive()) {
