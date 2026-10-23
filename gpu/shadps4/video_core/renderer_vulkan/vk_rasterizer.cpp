@@ -20,6 +20,8 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_threads.h"
+#include "bbport_button_prompts.h"
+#include "video_core/renderer_vulkan/vk_button_prompts.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -58,6 +60,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     camera_motion->SetObjectMotion(object_motion.get());
     upscaler = std::make_unique<TemporalUpscaler>(instance, scheduler, texture_cache, runtime,
                                                   *camera_motion, *scene_targets);
+    // bbport: the game's key guide icons drawn for the device in use (bbport_button_prompts.h).
+    prompts = std::make_unique<ButtonPrompts>(instance, scheduler, buffer_cache);
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -955,6 +959,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         scene_debug_frame = scene_debug && std::remove(scene_debug) == 0;
         scene_targets->debug = scene_debug_frame;
     }
+    // bbport: the key guide icons for the device in use (a change: uploaded before this draw).
+    prompts->Update();
     bind_prepared = used_prepared;
     motion_draw = pipeline->GetGraphicsKey().motion_vectors;
     motion_geometry = 0;
@@ -1484,6 +1490,12 @@ bool Rasterizer::TexturesBindableOnHelper(const Shader::Info& stage,
         if (const auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
             image_id = depth_image_id;
             image = &texture_cache.GetImage(image_id);
+        }
+        // bbport: prompt textures need the main thread (their views and the atlas's decode are
+        // recorded there), so the helper leaves this stage to BindTextures.
+        DetectPromptTextures(*image);
+        if (prompts->Active() && (image->prompt_icon != 0 || image->prompt_atlas != 0)) {
+            return false;
         }
         if (image->binding.needs_rebind || !texture_cache.IsUpToDate(image_id) ||
             scene_targets->Tracks(image->image_uid) ||
@@ -2216,6 +2228,25 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
     return entry;
 }
 
+void Rasterizer::DetectPromptTextures(VideoCore::Image& image) {
+    if (!prompts->Active()) {
+        return;
+    }
+    // A key guide icon the GPU copied in (never uploaded, so never recognised by RefreshImage).
+    if (image.MaybePromptIcon()) {
+        image.prompt_icon = u8(BbPrompts::IconOf(
+            reinterpret_cast<const void*>(image.info.guest_address), 1024));
+    }
+    // An atlas uploaded before the prompts' table was read (RefreshImage deferred it).
+    if (image.prompt_upload == ~0u) {
+        const u32 atlas =
+            BbPrompts::AtlasOf(reinterpret_cast<const void*>(image.info.guest_address),
+                               image.info.guest_size, image.info.size.width, image.info.size.height);
+        image.prompt_atlas = u8(atlas);
+        image.prompt_upload = atlas ? 1u : 0u;
+    }
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* prepared,
                               Shader::Backend::Bindings& binding, u32& write_index,
                               bool& barrier, bool on_helper) {
@@ -2401,6 +2432,29 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             auto& image_view = texture_cache.FindTexture(
                 image_id, desc, memo_entry ? &memo_entry->view_memo : nullptr, !on_helper);
             const auto binding = image.binding;
+
+            // bbport: one of the game's key guide icons, or an HUD atlas with them, samples the
+            // port's own for the device in use (the atlas is decoded out of the render pass).
+            if (!is_storage && prompts->Active()) {
+                DetectPromptTextures(image);
+                if (image.prompt_atlas != 0) {
+                    if (const vk::ImageView atlas =
+                            prompts->AtlasView(runtime, image, desc.view_info)) {
+                        image.usage.texture = 1u;
+                        image_infos.emplace_back(VK_NULL_HANDLE, atlas,
+                                                 vk::ImageLayout::eShaderReadOnlyOptimal);
+                        set_ok = false;
+                        continue;
+                    }
+                }
+                if (const vk::ImageView icon = prompts->View(image.prompt_icon, desc.view_info)) {
+                    image.usage.texture = 1u;
+                    image_infos.emplace_back(VK_NULL_HANDLE, icon,
+                                             vk::ImageLayout::eShaderReadOnlyOptimal);
+                    set_ok = false;
+                    continue;
+                }
+            }
 
             // bbport: a proxied scene image sampled with normalized coordinates reads the proxy:
             // no resample to the native size (the native image is not touched).
@@ -2632,7 +2686,16 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
         if (!entry.id) {
             continue;
         }
-        const auto& image = texture_cache.GetImage(entry.id);
+        auto& image = texture_cache.GetImage(entry.id);
+        // bbport: a key guide icon or icon atlas never takes the memoized set: it samples the
+        // port's own for the device in use (BindTextures).
+        DetectPromptTextures(image);
+        if (prompts->Active() && (image.prompt_icon != 0 || image.prompt_atlas != 0)) {
+            ++texture_set_why[2];
+            ++texture_set_misses;
+            set.generation = ~0ull;
+            return false;
+        }
         // Proxy entries need a current proxy; native entries of a proxied image go through
         // BindTextures, which may sample the proxy instead.
         const bool proxies_on = !BbToggle::Disabled(BbToggle::SampleSceneProxies);

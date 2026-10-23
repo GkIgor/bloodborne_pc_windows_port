@@ -107,14 +107,11 @@ endif()
 if (WIN32)
     if (NOT TARGET miniz::miniz)
         add_library(miniz::miniz INTERFACE IMPORTED)
-        find_path(MINIZ_INC NAMES miniz.h PATHS "$ENV{MINGW_PREFIX}/include" "C:/msys64/mingw64/include")
-        if (MINIZ_INC)
-            target_include_directories(miniz::miniz INTERFACE "${MINIZ_INC}")
-        endif()
-        find_library(MINIZ_LIB NAMES miniz libminiz.a PATHS "$ENV{MINGW_PREFIX}/lib" "C:/msys64/mingw64/lib")
-        if (MINIZ_LIB)
-            target_link_libraries(miniz::miniz INTERFACE "${MINIZ_LIB}")
-        endif()
+        # Vendored miniz (public domain): compiled into bbgpu below, so the port needs no
+        # miniz runtime DLL next to bbport.exe.
+        target_include_directories(miniz::miniz INTERFACE
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniz")
+        target_compile_definitions(miniz::miniz INTERFACE MINIZ_STATIC_DEFINE)
     endif()
 else()
     find_package(miniz REQUIRED)
@@ -187,6 +184,8 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavut
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
 if (WIN32)
     add_library(bbgpu STATIC ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
+        third_party/miniz/miniz.c third_party/miniz/miniz_tdef.c
+        third_party/miniz/miniz_tinfl.c third_party/miniz/miniz_zip.c
         shadps4/core/libraries/gnmdriver/gnmdriver.cpp
         shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
         shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}

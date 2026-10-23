@@ -124,7 +124,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     SDL_GetWindowSizeInPixels(window, &w, &h);
     width = w;
     height = h;
-    last_mouse_motion_ms = SDL_GetTicks();
+    last_mouse_motion_ms.store(SDL_GetTicks(), std::memory_order_relaxed);
     LOG_INFO(Frontend, "Window {}x{} on {}", w, h, driver);
 }
 
@@ -197,7 +197,8 @@ bool WindowSDL::PollEvents() {
         bool event_handled = false;
         if (event.type == SDL_EVENT_MOUSE_MOTION || event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
             event.type == SDL_EVENT_MOUSE_BUTTON_UP || event.type == SDL_EVENT_MOUSE_WHEEL) {
-            last_mouse_motion_ms = SDL_GetTicks();
+            last_mouse_motion_ms.store(SDL_GetTicks(), std::memory_order_relaxed);
+            mouse_input_seen.store(true, std::memory_order_relaxed);
             if (mouse_cursor_hidden) {
                 SDL_ShowCursor();
                 mouse_cursor_hidden = false;
@@ -335,7 +336,8 @@ bool WindowSDL::PollEvents() {
         // Auto-hide cursor after 3 seconds of mouse idle when not in overlay menu
         if (!BbOverlay::CapturesInput()) {
             const uint64_t now_ms = SDL_GetTicks();
-            if (!mouse_cursor_hidden && (now_ms - last_mouse_motion_ms >= 3000)) {
+            const uint64_t last_mouse_ms = last_mouse_motion_ms.load(std::memory_order_relaxed);
+            if (!mouse_cursor_hidden && (now_ms - last_mouse_ms >= 3000)) {
                 SDL_HideCursor();
                 mouse_cursor_hidden = true;
             }
@@ -395,6 +397,14 @@ void WindowSDL::ConsumeMouseDelta(float* dx, float* dy) {
     if (dy) *dy = accumulated_mouse_dy;
     accumulated_mouse_dx = 0.0f;
     accumulated_mouse_dy = 0.0f;
+}
+
+bool WindowSDL::MouseActiveWithin(uint64_t ms) const {
+    if (!mouse_input_seen.load(std::memory_order_relaxed)) {
+        return false; // the window's creation time is not mouse input
+    }
+    const uint64_t last = last_mouse_motion_ms.load(std::memory_order_relaxed);
+    return SDL_GetTicks() - last <= ms;
 }
 
 } // namespace Frontend

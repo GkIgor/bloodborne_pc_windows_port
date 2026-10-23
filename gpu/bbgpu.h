@@ -51,6 +51,8 @@ void bbgpu_get_device_info(char *vendor_buf, size_t vendor_sz,
 void bbgpu_consume_mouse_delta(float *dx, float *dy);
 /* Returns 1 if mouse look is actively capturing the cursor in relative mode. */
 int bbgpu_mouse_captured(void);
+/* Returns 1 if the mouse produced input (motion, button or wheel) within the last 250 ms. */
+int bbgpu_mouse_active_recent(void);
 /* Explicitly requests or releases mouse capture. */
 void bbgpu_set_mouse_capture(int capture);
 /* Returns 1 if M&K is enabled, and retrieves sensitivity and invert flags. */

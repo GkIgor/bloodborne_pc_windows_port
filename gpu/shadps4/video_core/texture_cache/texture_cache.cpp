@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_set>
 #include <boost/container_hash/hash.hpp>
 #include <xxhash.h>
 
+#include "bbport_button_prompts.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -955,6 +957,30 @@ void TextureCache::RefreshImage(Image& image) {
     const u32 num_mips = image.info.resources.levels;
     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
+
+    // bbport: the game's key guide icons (32x32, one level, known by their bytes): the port may
+    // sample its own for the device in use.
+    if (image.info.size.width == 32 && image.info.size.height == 32 && num_mips == 1 &&
+        num_layers == 1 && image.info.props.is_block && image.info.guest_size >= 1024) {
+        image.prompt_icon =
+            u8(BbPrompts::IconOf(std::bit_cast<const u8*>(image.info.guest_address), 1024));
+    }
+    // bbport: the HUD's atlases with key guide icons packed in: the port may sample a copy with
+    // its own. Until the loader thread has the game's table, the check is deferred to the first
+    // bind (prompt_upload = ~0u) so the render thread never waits for it.
+    if (num_mips == 1 && num_layers == 1 && image.info.props.is_block) {
+        if (!BbPrompts::Ready()) {
+            image.prompt_atlas = 0;
+            image.prompt_upload = ~0u;
+        } else {
+            static std::atomic<u32> uploads{0};
+            image.prompt_atlas =
+                u8(BbPrompts::AtlasOf(std::bit_cast<const u8*>(image.info.guest_address),
+                                      image.info.guest_size, image.info.size.width,
+                                      image.info.size.height));
+            image.prompt_upload = image.prompt_atlas ? ++uploads : 0;
+        }
+    }
 
     BbStats::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;

@@ -152,6 +152,17 @@ public:
         u32 vo_surface : 1;
     } usage{};
     bool scene_proxy = false; ///< bbport: SceneTargets holds a reduced-size proxy of it
+    u8 prompt_icon = 0;       ///< bbport: one of the game's key guide icons (BbPrompts::IconOf + 1)
+    u8 prompt_atlas = 0;      ///< bbport: one of the HUD's icon atlases (BbPrompts::AtlasOf + 1)
+    u32 prompt_upload = 0;    ///< bbport: the upload that gave it its bytes (ButtonPrompts::Atlas)
+    /// bbport: its memory may hold one of the key guide icons (32x32, one level, block-compressed):
+    /// the bytes are checked at each bind until they are one (a copy the GPU made is never
+    /// uploaded).
+    bool MaybePromptIcon() const {
+        return prompt_icon == 0 && info.size.width == 32 && info.size.height == 32 &&
+               info.resources.levels == 1 && info.resources.layers == 1 && info.props.is_block &&
+               info.guest_size >= 1024;
+    }
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
     VAddr guest_begin = 0; ///< info.guest_address

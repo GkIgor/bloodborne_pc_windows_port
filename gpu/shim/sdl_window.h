@@ -38,6 +38,8 @@ public:
     std::string GetTextInputPrompt();
     std::string GetTextInputValue();
     void ConsumeMouseDelta(float* dx, float* dy);
+    /// Whether a mouse motion, button or wheel event arrived within `ms` (any capture mode).
+    bool MouseActiveWithin(uint64_t ms) const;
     void CaptureMouse(bool capture);
     bool IsMouseCaptured() const { return relative_mouse_active; }
 
@@ -55,7 +57,8 @@ private:
     void UpdateTextTitle();
     SDL_Window* window{};
     WindowSystemInfo window_info{};
-    uint64_t last_mouse_motion_ms = 0;
+    std::atomic<uint64_t> last_mouse_motion_ms{0};
+    std::atomic<bool> mouse_input_seen{false};
     bool mouse_cursor_hidden = false;
     bool window_focused = true, mouse_inside = true;
     bool menu_released = false; ///< a game menu released the mouse; it is taken back when they close

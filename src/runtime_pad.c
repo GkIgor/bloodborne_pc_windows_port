@@ -119,6 +119,178 @@ static inline bool is_action_down(int code, const bool *k, bool lmb, bool rmb, b
     return false;
 }
 
+/* Button prompts (gpu/shim/bbport_button_prompts.cpp): the game draws its key guide with 32x32
+ * icons of PlayStation buttons. The port draws the bound key, the mouse button or another pad's
+ * button instead while that device was used last. prompt_device: 0 a PlayStation pad (the game's
+ * own icons), 1 another pad (its labels), 2 the keyboard and mouse. The generation changes with
+ * the device, the pad's type and the bindings; the renderer redraws the icons then. */
+static int prompt_device=-1;
+static int prompt_pad_type=SDL_GAMEPAD_TYPE_UNKNOWN;
+static int prompt_pad_touchpad;
+static unsigned prompt_generation=1;
+static unsigned prompt_bind_hash=1;
+
+static unsigned prompt_bindings_hash(void) {
+    int binds[BB_ACTION_COUNT];
+    bbgpu_get_all_action_bindings(binds,BB_ACTION_COUNT);
+    unsigned h=2166136261u;
+    for (int i=0;i<BB_ACTION_COUNT;++i) h=(h^(unsigned)binds[i])*16777619u;
+    return h;
+}
+static int prompt_playstation(int type) {
+    return type==SDL_GAMEPAD_TYPE_PS3 || type==SDL_GAMEPAD_TYPE_PS4 ||
+           type==SDL_GAMEPAD_TYPE_PS5;
+}
+static int prompt_nintendo(int type) {
+    return type==SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO ||
+           type==SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT ||
+           type==SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT ||
+           type==SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR;
+}
+static void prompt_note(SDL_Gamepad *g,int pad_active,int keyboard_active) {
+    const int type=g ? (int)SDL_GetGamepadType(g) : (int)SDL_GAMEPAD_TYPE_UNKNOWN;
+    const int touchpad=g ? SDL_GetNumGamepadTouchpads(g)>0 : 0;
+    const unsigned binds=prompt_bindings_hash();
+    const int previous=__atomic_load_n(&prompt_device,__ATOMIC_RELAXED);
+    int device=previous;
+    if (keyboard_active) device=2;
+    else if (g && (pad_active || device<0)) device=prompt_playstation(type) ? 0 : 1;
+    else if (device<0) device=2;
+    if (device!=previous ||
+        (device!=2 && (type!=prompt_pad_type || touchpad!=prompt_pad_touchpad)) ||
+        binds!=prompt_bind_hash) {
+        __atomic_store_n(&prompt_device,device,__ATOMIC_RELAXED);
+        __atomic_store_n(&prompt_pad_type,type,__ATOMIC_RELAXED);
+        __atomic_store_n(&prompt_pad_touchpad,touchpad,__ATOMIC_RELAXED);
+        prompt_bind_hash=binds;
+        __atomic_add_fetch(&prompt_generation,1,__ATOMIC_RELEASE);
+    }
+}
+int runtime_pad_prompt_device(void) {
+    return __atomic_load_n(&prompt_device,__ATOMIC_RELAXED);
+}
+unsigned runtime_pad_prompt_generation(void) {
+    return __atomic_load_n(&prompt_generation,__ATOMIC_ACQUIRE);
+}
+int runtime_pad_mouse_look(void) {
+    return bbgpu_get_mk_native_mouse();
+}
+
+/* The PS input name an icon stands for -> the action the port binds to it. */
+static int prompt_action(const char *name) {
+    if (!strcmp(name,"cross")) return BB_ACTION_INTERACT;
+    if (!strcmp(name,"circle")) return BB_ACTION_DODGE;
+    if (!strcmp(name,"square")) return BB_ACTION_USE_ITEM;
+    if (!strcmp(name,"triangle")) return BB_ACTION_HEAL;
+    if (!strcmp(name,"l1")) return BB_ACTION_TRANSFORM;
+    if (!strcmp(name,"l2")) return BB_ACTION_FIREARM;
+    if (!strcmp(name,"r1")) return BB_ACTION_ATTACK;
+    if (!strcmp(name,"r2")) return BB_ACTION_HEAVY_ATTACK;
+    if (!strcmp(name,"r3")) return BB_ACTION_LOCK_ON;
+    if (!strcmp(name,"options")) return BB_ACTION_MENU;
+    if (!strcmp(name,"touchpad")) return BB_ACTION_GESTURES;
+    if (!strcmp(name,"touchpad_right")) return BB_ACTION_PERSONAL_EFFECTS;
+    if (!strcmp(name,"up")) return BB_ACTION_DPAD_UP;
+    if (!strcmp(name,"down")) return BB_ACTION_DPAD_DOWN;
+    if (!strcmp(name,"left")) return BB_ACTION_DPAD_LEFT;
+    if (!strcmp(name,"right")) return BB_ACTION_DPAD_RIGHT;
+    if (!strcmp(name,"move_up")) return BB_ACTION_MOVE_FORWARD;
+    if (!strcmp(name,"move_down")) return BB_ACTION_MOVE_BACKWARD;
+    if (!strcmp(name,"move_left")) return BB_ACTION_MOVE_LEFT;
+    if (!strcmp(name,"move_right")) return BB_ACTION_MOVE_RIGHT;
+    return -1; /* l3: unbound; look_*: the mouse (runtime_pad_mouse_look) */
+}
+static const char *prompt_mouse_label(int code) {
+    switch (code) {
+    case BB_KEY_MOUSE_LEFT: return "Left";
+    case BB_KEY_MOUSE_RIGHT: return "Right";
+    case BB_KEY_MOUSE_MIDDLE: return "Middle";
+    case BB_KEY_MOUSE_X1: return "X1";
+    case BB_KEY_MOUSE_X2: return "X2";
+    default: return NULL;
+    }
+}
+/* A key cap's label: SDL's name, shortened for the common long ones. */
+static void prompt_key_label(int code,char *out,int size) {
+    static const struct { const char *from, *to; } names[]={
+        {"Return","Enter"}, {"Escape","Esc"}, {"Backspace","Bksp"},
+        {"PageUp","PgUp"}, {"PageDown","PgDn"}, {"CapsLock","Caps"},
+        {"Left Shift","Shift"}, {"Right Shift","RShift"},
+        {"Left Ctrl","Ctrl"}, {"Right Ctrl","RCtrl"},
+        {"Left Alt","Alt"}, {"Right Alt","RAlt"},
+        {"Left GUI","Win"}, {"Right GUI","RWin"},
+        {"ScrollLock","Scrl"}, {"NumLockClear","Num"},
+        {"Application","Menu"}, {"PrintScreen","PrtSc"},
+    };
+    const char *name=SDL_GetScancodeName((SDL_Scancode)code);
+    if (!name || !*name) { snprintf(out,(size_t)size,"Key %d",code); return; }
+    for (size_t i=0;i<sizeof(names)/sizeof(*names);++i) {
+        if (!strcmp(name,names[i].from)) { snprintf(out,(size_t)size,"%s",names[i].to); return; }
+    }
+    snprintf(out,(size_t)size,"%s",name);
+}
+
+/* The label of a PS input for the device in use: 'K' a key (a key cap), 'M' a mouse button,
+ * 'F' a face button, 'S' a shoulder/trigger, 'C' a round pad button; 0: the game's own icon. */
+int runtime_pad_prompt(const char *name,int prefer_mouse,char *label,int size) {
+    (void)prefer_mouse;
+    if (!name || !label || size<=0) return 0;
+    label[0]=0;
+    const int device=__atomic_load_n(&prompt_device,__ATOMIC_RELAXED);
+    if (device==2) {
+        const int action=prompt_action(name);
+        if (action<0) return 0;
+        const int code=bbgpu_get_action_binding(action);
+        if (code<=0) {
+            /* Cross also answers Enter, whatever it is bound to. */
+            if (!strcmp(name,"cross")) { snprintf(label,(size_t)size,"Enter"); return 'K'; }
+            return 0;
+        }
+        if (code==BB_KEY_CHORD_SHIFT_LMB || code==BB_KEY_CHORD_SHIFT_RMB) {
+            snprintf(label,(size_t)size,"\xe2\x87\xa7%s",
+                     code==BB_KEY_CHORD_SHIFT_LMB ? "Left" : "Right");
+            return 'M';
+        }
+        const char *mouse=prompt_mouse_label(code);
+        if (mouse) { snprintf(label,(size_t)size,"%s",mouse); return 'M'; }
+        if (code<SDL_SCANCODE_COUNT) { prompt_key_label(code,label,size); return 'K'; }
+        return 0;
+    }
+    if (device==1) {
+        const int type=__atomic_load_n(&prompt_pad_type,__ATOMIC_RELAXED);
+        const int touchpad=__atomic_load_n(&prompt_pad_touchpad,__ATOMIC_RELAXED);
+        const int nin=prompt_nintendo(type);
+        const char *face=NULL, *shoulder=NULL;
+        if (!strcmp(name,"cross")) face=nin ? "B" : "A";
+        else if (!strcmp(name,"circle")) face=nin ? "A" : "B";
+        else if (!strcmp(name,"square")) face=nin ? "Y" : "X";
+        else if (!strcmp(name,"triangle")) face=nin ? "X" : "Y";
+        if (face) { snprintf(label,(size_t)size,"%s",face); return 'F'; }
+        if (!strcmp(name,"l1")) shoulder=nin ? "L" : "LB";
+        else if (!strcmp(name,"r1")) shoulder=nin ? "R" : "RB";
+        else if (!strcmp(name,"l2")) shoulder=nin ? "ZL" : "LT";
+        else if (!strcmp(name,"r2")) shoulder=nin ? "ZR" : "RT";
+        if (shoulder) { snprintf(label,(size_t)size,"%s",shoulder); return 'S'; }
+        if (!strcmp(name,"l3")) { snprintf(label,(size_t)size,"LS"); return 'C'; }
+        if (!strcmp(name,"r3")) { snprintf(label,(size_t)size,"RS"); return 'C'; }
+        if (!strcmp(name,"options")) { snprintf(label,(size_t)size,"%s",nin ? "+" : "Menu"); return 'C'; }
+        if (!strcmp(name,"touchpad") || !strcmp(name,"touchpad_right")) {
+            snprintf(label,(size_t)size,"%s",touchpad ? "Pad" : (nin ? "-" : "View"));
+            return 'C';
+        }
+        if (!strcmp(name,"move_up") || !strcmp(name,"move_down") ||
+            !strcmp(name,"move_left") || !strcmp(name,"move_right")) {
+            snprintf(label,(size_t)size,"LS"); return 'C';
+        }
+        if (!strcmp(name,"look_up") || !strcmp(name,"look_down") ||
+            !strcmp(name,"look_left") || !strcmp(name,"look_right")) {
+            snprintf(label,(size_t)size,"RS"); return 'C';
+        }
+        return 0; /* the d-pad's icons fit any pad */
+    }
+    return 0;
+}
+
 static void sample_host(PadData *d) {
     memset(d,0,sizeof(*d));
     d->left_x=d->left_y=d->right_x=d->right_y=128;
@@ -159,6 +331,12 @@ static void sample_host(PadData *d) {
         // Back/Select on pads without a touch surface is a left-side click.
         if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
     }
+    // The pad was used this sample (the keyboard, below, may still win as the last device).
+    const int pad_active = g && (d->buttons || d->l2 > 30 || d->r2 > 30 || d->touch_count ||
+                                 d->left_x < 80 || d->left_x > 176 ||
+                                 d->left_y < 80 || d->left_y > 176 ||
+                                 d->right_x < 80 || d->right_x > 176 ||
+                                 d->right_y < 80 || d->right_y > 176);
     if (!k) return;
 
     // Souls PC Mouse & Keyboard integration
@@ -189,6 +367,30 @@ static void sample_host(PadData *d) {
     }
     const bool lmb = lmb_raw && !(chords & CHORD_LMB);
     const bool rmb = rmb_raw && !(chords & CHORD_RMB);
+
+    // Button prompts: the device used last. A bound key, mouse button or the mouse's look
+    // movement means the keyboard and mouse; Enter and the arrow keys always answer too. The
+    // look delta is kept for the camera below.
+    const int mouse_look_owns = mk_enabled && mouse_is_captured && !native_camera_owns_mouse();
+    float prompt_mouse_dx = 0.0f, prompt_mouse_dy = 0.0f;
+    if (mouse_look_owns) bbgpu_consume_mouse_delta(&prompt_mouse_dx, &prompt_mouse_dy);
+    // Any recent mouse input switches the prompts, even when the mouse is not captured (a pad
+    // user moving the mouse): the camera delta alone is consumed by the native camera hook and
+    // is not accumulated at all while the cursor is free.
+    int keyboard_active = bbgpu_mouse_active_recent() ||
+                          (mouse_is_captured &&
+                           (lmb_raw || rmb_raw || mmb || x1 || x2 ||
+                            prompt_mouse_dx * prompt_mouse_dx + prompt_mouse_dy * prompt_mouse_dy > 9.0f));
+    for (int i = 0; i < BB_ACTION_COUNT && !keyboard_active; ++i) {
+        const int c = binds[i];
+        if (c > 0 && c < SDL_SCANCODE_COUNT && k[c]) keyboard_active = 1;
+    }
+    if (k[SDL_SCANCODE_RETURN] || k[SDL_SCANCODE_KP_ENTER] ||
+        k[SDL_SCANCODE_UP] || k[SDL_SCANCODE_DOWN] ||
+        k[SDL_SCANCODE_LEFT] || k[SDL_SCANCODE_RIGHT]) {
+        keyboard_active = 1;
+    }
+    prompt_note(g, pad_active, keyboard_active);
 
     if (mk_enabled) {
         // Combat actions
@@ -229,11 +431,10 @@ static void sample_host(PadData *d) {
         static uint64_t look_last_us = 0;
         const float dt = (look_last_us && d->timestamp > look_last_us) ? (float)(d->timestamp - look_last_us) : 0.0f;
         look_last_us = d->timestamp;
-        if (!mouse_is_captured || native_camera_owns_mouse()) {
+        if (!mouse_look_owns) {
             look_x = look_y = 0.0f;
         } else {
-            float mouse_dx = 0.0f, mouse_dy = 0.0f;
-            bbgpu_consume_mouse_delta(&mouse_dx, &mouse_dy);
+            const float mouse_dx = prompt_mouse_dx, mouse_dy = prompt_mouse_dy;
             const float decay = dt >= LOOK_TAU_US ? 0.0f : 1.0f - dt / LOOK_TAU_US;
             const float gain = 127.0f / (1000.0f * LOOK_TAU_US / 1e6f);
             look_x = look_x * decay + mouse_dx * gain * (inv_x ? -sens_x : sens_x);

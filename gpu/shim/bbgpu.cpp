@@ -438,6 +438,12 @@ extern "C" int bbgpu_mouse_captured(void) {
     return (g_window && g_window->IsMouseCaptured()) ? 1 : 0;
 }
 
+extern "C" int bbgpu_mouse_active_recent(void) {
+    // Any mouse input switches the button prompts to the keyboard and mouse, whether or not the
+    // cursor is captured: a pad user moving the mouse expects the prompts to follow.
+    return (g_window && g_window->MouseActiveWithin(250)) ? 1 : 0;
+}
+
 extern "C" void bbgpu_set_mouse_capture(int capture) {
     if (g_window) {
         g_window->CaptureMouse(capture != 0);

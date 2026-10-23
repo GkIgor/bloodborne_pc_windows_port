@@ -3,14 +3,24 @@
 
 // Include the vulkan platform specific header
 #if defined(ANDROID)
+#ifndef VK_USE_PLATFORM_ANDROID_KHR
 #define VK_USE_PLATFORM_ANDROID_KHR
+#endif
 #elif defined(_WIN64)
+#ifndef VK_USE_PLATFORM_WIN32_KHR
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #elif defined(__APPLE__)
+#ifndef VK_USE_PLATFORM_METAL_EXT
 #define VK_USE_PLATFORM_METAL_EXT
+#endif
 #else
+#ifndef VK_USE_PLATFORM_WAYLAND_KHR
 #define VK_USE_PLATFORM_WAYLAND_KHR
+#endif
+#ifndef VK_USE_PLATFORM_XLIB_KHR
 #define VK_USE_PLATFORM_XLIB_KHR
+#endif
 #endif
 
 #include <vector>

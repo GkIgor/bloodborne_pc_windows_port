@@ -31,6 +31,7 @@ namespace Vulkan {
 
 class GraphicsPipeline;
 class Runtime;
+class ButtonPrompts;
 
 class Rasterizer {
 public:
@@ -309,6 +310,10 @@ private:
     static void RunTextureTask(void* rasterizer);
     static void JoinBindHelper(void* rasterizer);
 
+    /// bbport: checks `image` for one of the game's key guide icons or icon atlases once the
+    /// prompts' table is ready (a GPU copy is never uploaded, so the bind path checks too).
+    void DetectPromptTextures(VideoCore::Image& image);
+
     /// Display pass: counts the frame (BbStats::gpu_frames) and, with BB_BUFFER_STATS, the lag.
     void NoteFrameStart();
     /// BB_GPU_PROFILE: a timestamp where a render pass starts (vk_gpu_profiler.h).
@@ -352,6 +357,7 @@ private:
     u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw
     bool gbuffer_draw = false;
     std::unique_ptr<TemporalUpscaler> upscaler; // bbport: FSR (docs/upscaler.md)
+    std::unique_ptr<ButtonPrompts> prompts;     // bbport: button prompts (gpu/shim/bbport_button_prompts.h)
     std::array<float, 2> draw_jitter{};         ///< viewport offset of the current draw, pixels
     std::array<float, 2> target_scale{1.0f, 1.0f}; ///< pass drawn into the upscaler's output-size images
     const bool host_markers_enabled;
