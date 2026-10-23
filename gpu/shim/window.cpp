@@ -231,7 +231,7 @@ bool WindowSDL::PollEvents() {
             if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
                 if (event.button.button == SDL_BUTTON_LEFT) {
                     BbMenuPointer::Click();
-                } else if (event.button.button == SDL_BUTTON_RIGHT) {
+                } else if (event.button.button == SDL_BUTTON_RIGHT && !BbMenuPointer::RightClickSwitchesPages()) {
                     BbMenuPointer::Back();
                 }
                 continue;

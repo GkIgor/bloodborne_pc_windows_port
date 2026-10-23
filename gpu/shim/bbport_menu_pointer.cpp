@@ -35,7 +35,16 @@ constexpr std::uint64_t kListVTable = 0x5799fb0, kListUpdate = 0x1ecff30;
 constexpr std::size_t kListUpdateSlot = 3;
 constexpr std::uint32_t kPadUp = 0x10, kPadDown = 0x40;
 
+// Item Storage. The flow's open menu (+0xa88 of the flow at 0x5980e38) is a sequence (update
+// 0x201bc10 in vtable slot 3) running step [+0xc] of the steps at +0x10; storage's step holds at
+// +0x10 the named step (vtable 0x5745ee0) that sub_1fba4f0 makes with the name L"depository" at
+// +0x30. Its item list's listener has vtable 0x57393b0 (the inventory's too, by the same code).
+constexpr std::uint64_t kMenuFlow = 0x5980e38, kSequenceUpdate = 0x201bc10, kNamedStep = 0x5745ee0;
+constexpr std::uint64_t kDepositoryName = 0x4db4d84, kItemListListener = 0x57393b0;
+
 bool g_installed = false;
+std::uint64_t g_image_base = 0;
+std::atomic<std::int64_t> g_storage_ms{0};
 
 std::atomic<float> g_mouse_x{0.0f}, g_mouse_y{0.0f};
 std::atomic<int> g_window_w{0}, g_window_h{0};
@@ -90,7 +99,51 @@ void clear_pulses() {
     g_pulse_held = 0;
 }
 
+std::uint64_t guest_at(std::uint64_t bn) {
+    return g_image_base + (bn - kPreferredGuestSlide);
+}
+
+std::uint64_t read_u64(std::uint64_t addr) {
+    std::uint64_t v = 0;
+    return addr >= 0x1000 && host_read_safe(reinterpret_cast<const void*>(addr), &v, sizeof(v)) ? v : 0;
+}
+
+// The name of the named step the open menu is running (a UTF-16 string in the eboot), or 0.
+std::uint64_t open_menu_step_name() {
+    const std::uint64_t flow = read_u64(guest_at(kMenuFlow));
+    std::uint64_t step = flow ? read_u64(flow + 0xa88) : 0;
+    for (int depth = 0; step && depth < 8; ++depth) {
+        const std::uint64_t vt = read_u64(step);
+        if (vt == guest_at(kNamedStep)) {
+            return read_u64(step + 0x30);
+        }
+        if (vt && read_u64(vt + 3 * 8) == guest_at(kSequenceUpdate)) {
+            const std::uint64_t index = read_u64(step + 0x8) >> 32, count = read_u64(step + 0x58);
+            step = index < count ? read_u64(step + 0x10 + index * 8) : 0;
+        } else {
+            step = read_u64(step + 0x10);
+        }
+    }
+    return 0;
+}
+
 } // namespace
+
+// Game thread, every list update: storage counts while its item list has focus, not its popups.
+void option_menu_list_update(void* list, bool focus) {
+    if (!focus || !g_installed) {
+        return;
+    }
+    const auto l = reinterpret_cast<std::uint64_t>(list);
+    const std::uint64_t listener = read_u64(l + 0x30);
+    if (!listener || read_u64(listener) != guest_at(kItemListListener)) {
+        return;
+    }
+    const std::uint64_t name = open_menu_step_name();
+    if (name == guest_at(kDepositoryName)) {
+        g_storage_ms.store(now_ms(), std::memory_order_relaxed);
+    }
+}
 
 // ---- bbhost's host interface (bbhost/compat.h) ----
 
@@ -192,6 +245,12 @@ void Wheel(float notches) {
     }
 }
 
+bool RightClickSwitchesPages() {
+    const auto& s = BbSettings::Get();
+    return now_ms() - g_storage_ms.load(std::memory_order_relaxed) < 250 && s.mk_enabled.load() &&
+           s.keybinds[BB_ACTION_FIREARM].load() == BB_KEY_MOUSE_RIGHT;
+}
+
 } // namespace BbMenuPointer
 
 // ---- The loader's and the pad's side ----
@@ -207,6 +266,7 @@ extern "C" int bbgpu_menu_pointer_install(unsigned char* image, uint64_t size) {
         return 0;
     }
     const auto base = reinterpret_cast<std::uint64_t>(image);
+    g_image_base = base;
     ElfImage elf{{image, static_cast<std::size_t>(size), base}};
     menu_pointer_install(&elf);
     std::uint64_t slot = 0;
@@ -215,10 +275,23 @@ extern "C" int bbgpu_menu_pointer_install(unsigned char* image, uint64_t size) {
     return g_installed ? 1 : 0;
 }
 
+extern "C" int bbgpu_menu_pointer_mouse_buttons(void) {
+    if (!BbMenuPointer::Active() || g_relative.load()) {
+        return 0;
+    }
+    return BbMenuPointer::RightClickSwitchesPages() ? 1 : 3;
+}
+
 extern "C" uint32_t bbgpu_menu_pointer_buttons(uint32_t buttons, uint8_t lx, uint8_t ly) {
     g_pad_buttons.store(buttons, std::memory_order_relaxed);
     g_pad_lx.store(lx, std::memory_order_relaxed);
     g_pad_ly.store(ly, std::memory_order_relaxed);
+    static bool storage_was_open = false;
+    if (const bool open = BbMenuPointer::RightClickSwitchesPages(); open != storage_was_open) {
+        storage_was_open = open;
+        host_log(open ? "pointer: Item Storage's item list - right click switches pages (L2)"
+                      : "pointer: right click goes back again");
+    }
     const std::uint32_t press = menu_pointer_take_press();
     if (!BbMenuPointer::Active()) {
         clear_pulses();

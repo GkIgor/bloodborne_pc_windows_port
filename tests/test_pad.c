@@ -17,6 +17,8 @@ static int capture;
 int bbgpu_overlay_captures_input(void) { return capture; }
 int bbgpu_text_input_is_active(void) { return 0; }
 int bbgpu_mouse_captured(void) { return 1; }
+int bbgpu_menu_pointer_mouse_buttons(void) { return 0; }
+uint32_t bbgpu_menu_pointer_buttons(uint32_t buttons, uint8_t lx, uint8_t ly) { (void)buttons; (void)lx; (void)ly; return 0; }
 void bbgpu_consume_mouse_delta(float *dx, float *dy) { if (dx) *dx = 0.0f; if (dy) *dy = 0.0f; }
 int native_camera_owns_mouse(void) { return 1; }
 int bbgpu_get_mk_config(float *sens_x, float *sens_y, int *invert_x, int *invert_y, float *deadzone, float *smoothing) {
