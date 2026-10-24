@@ -34,11 +34,10 @@ from bblauncher_Utils import (
     CONTENT_SKU_CHOICES,
     DEBUG_VIEW_CHOICES,
     DEFAULT_GAME,
-    DEFAULT_KEYBINDS,
     EFFECT_CHOICES,
     FPS_CHOICES,
+    GAMEPLAY_KEYBINDS,
     HUD_QUADRANT_CHOICES,
-    KEYBINDINGS,
     LANGUAGE_CHOICES,
     LAUNCHER_VERSION,
     LIVE_RES_CHOICES,
@@ -47,39 +46,53 @@ from bblauncher_Utils import (
     PREP_WORKER_CHOICES,
     PRESET_CHOICES,
     RES_CHOICES,
+    SYSTEM_KEYBINDS,
     UPSCALER_CHOICES,
     WINDOW_MODE_CHOICES,
     build_stamp,
     connected_gpus,
+    scancode_display_name,
+    win_scan_to_scancode_name,
 )
 
 
 class KeybindButton(QPushButton):
-    key_assigned = Signal(str, str)  # (action_key, new_binding)
+    key_assigned = Signal(str, str, str)  # (action_key, stored_binding, previous_storage)
 
-    def __init__(self, action_key: str, binding_text: str, parent=None):
-        super().__init__(binding_text, parent)
+    def __init__(self, action_key: str, binding_text: str, parent=None,
+                 keyboard_only=False, display_text=None):
+        if display_text is None:
+            display_text = scancode_display_name(binding_text)
+        super().__init__(display_text, parent)
         self.action_key = action_key
+        # current_binding is always the SDL scancode name written to bbport.ini.
         self.current_binding = binding_text
+        # display_binding is what the active keyboard layout prints on that key.
+        self.display_binding = display_text
         self.listening = False
+        self.keyboard_only = keyboard_only
         self._pending_shift = None
         self.setObjectName("KeybindBtn")
         self.setFixedHeight(30)
         self.setFocusPolicy(Qt.StrongFocus)
+        if keyboard_only:
+            self.setToolTip("Keyboard-only system hotkey: press a key to assign.")
         self.clicked.connect(self.start_listening)
         self.update_style()
 
     def update_style(self):
         if self.listening:
-            self.setText("< Press Key / Click >")
+            self.setText("< Press Key >" if self.keyboard_only else "< Press Key / Click >")
         else:
-            self.setText(self.current_binding if self.current_binding else "None")
+            self.setText(self.display_binding if self.display_binding else "None")
         self.setProperty("listening", "true" if self.listening else "false")
         self.style().unpolish(self)
         self.style().polish(self)
 
-    def set_binding(self, text: str):
+    def set_binding(self, text: str, display_text=None):
         self.current_binding = text
+        self.display_binding = (scancode_display_name(text)
+                                if display_text is None else display_text)
         self.listening = False
         self.update_style()
 
@@ -103,7 +116,6 @@ class KeybindButton(QPushButton):
             return
 
         key = event.key()
-        modifiers = event.modifiers()
 
         # Shift alone binds on release; Shift held through a click becomes a mouse chord instead.
         if key == Qt.Key_Shift:
@@ -116,31 +128,44 @@ class KeybindButton(QPushButton):
             self.stop_listening()
             return
         if key == Qt.Key_Delete:
+            previous = self.current_binding
             self.stop_listening()
             self.current_binding = "None"
+            self.display_binding = "None"
             self.update_style()
-            self.key_assigned.emit(self.action_key, "None")
+            self.key_assigned.emit(self.action_key, "None", previous)
             return
 
-        name = self._qt_key_to_name(key)
+        name, label = self._event_to_binding(event)
+        if name == "Unknown":
+            return
+        previous = self.current_binding
         self.stop_listening()
         self.current_binding = name
+        self.display_binding = label
         self.update_style()
-        self.key_assigned.emit(self.action_key, name)
+        self.key_assigned.emit(self.action_key, name, previous)
 
     def keyReleaseEvent(self, event: QKeyEvent):
         if self.listening and event.key() == Qt.Key_Shift and not event.isAutoRepeat() and self._pending_shift:
             name = self._pending_shift
+            previous = self.current_binding
             self.stop_listening()
             self.current_binding = name
+            self.display_binding = name
             self.update_style()
-            self.key_assigned.emit(self.action_key, name)
+            self.key_assigned.emit(self.action_key, name, previous)
             return
         super().keyReleaseEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent):
         if not self.listening:
             super().mousePressEvent(event)
+            return
+
+        # Overlay/HUD/cheat/capture hotkeys are keyboard-only.  Keep listening instead of
+        # turning a stray click into a binding.
+        if self.keyboard_only:
             return
 
         self._pending_shift = None
@@ -158,12 +183,34 @@ class KeybindButton(QPushButton):
 
         name = btn_map.get(btn, None)
         if name:
+            previous = self.current_binding
             self.stop_listening()
             self.current_binding = name
+            self.display_binding = name
             self.update_style()
-            self.key_assigned.emit(self.action_key, name)
+            self.key_assigned.emit(self.action_key, name, previous)
         else:
             self.stop_listening()
+
+    def _event_to_binding(self, event: QKeyEvent):
+        """Return (storage_name, display_label) for a key press.
+
+        Storage uses the physical SDL scancode name, so AZERTY and QWERTY bind the
+        same key positions.  The label is looked up through the active layout.
+        """
+        key = event.key()
+        scan_code = int(event.nativeScanCode()) & 0xFF
+        stored = win_scan_to_scancode_name(scan_code)
+        text = event.text()
+        if stored and (Qt.Key_A <= key <= Qt.Key_Z
+                       or Qt.Key_0 <= key <= Qt.Key_9
+                       or (len(text) == 1 and text.isprintable())):
+            return stored, scancode_display_name(stored)
+
+        name = self._qt_key_to_name(key)
+        if name != "Unknown":
+            return name, name
+        return "Unknown", ""
 
     def _qt_key_to_name(self, key: int) -> str:
         key_map = {
@@ -1710,6 +1757,18 @@ class LauncherUI:
         row_kb_header.addWidget(lbl_kb)
         row_kb_header.addStretch()
 
+        btn_preset_azerty = QPushButton("AZERTY")
+        btn_preset_azerty.setObjectName("SecondaryBtn")
+        btn_preset_azerty.setToolTip("Set movement keys to ZQSD (AZERTY layout).")
+        btn_preset_azerty.clicked.connect(lambda: self.apply_keybind_preset("azerty"))
+        row_kb_header.addWidget(btn_preset_azerty)
+
+        btn_preset_qwerty = QPushButton("QWERTY")
+        btn_preset_qwerty.setObjectName("SecondaryBtn")
+        btn_preset_qwerty.setToolTip("Set movement keys to WASD (QWERTY layout).")
+        btn_preset_qwerty.clicked.connect(lambda: self.apply_keybind_preset("qwerty"))
+        row_kb_header.addWidget(btn_preset_qwerty)
+
         btn_save_ini = QPushButton("Save Input Parameters to bbport.ini")
         btn_save_ini.setObjectName("SecondaryBtn")
         btn_save_ini.clicked.connect(self.save_bbport_ini)
@@ -1721,16 +1780,27 @@ class LauncherUI:
         row_kb_header.addWidget(btn_reset_kb)
         l_mk.addLayout(row_kb_header)
 
+        kb_columns = QHBoxLayout()
+        kb_columns.setSpacing(32)
+
+        # Left: gameplay pad/mouse bindings.
+        left_col = QVBoxLayout()
+        left_col.setSpacing(6)
+        lbl_gameplay = QLabel("Gameplay Controls")
+        lbl_gameplay.setStyleSheet(
+            "color: #8b8b98; font-size: 11px; font-weight: 600; background: transparent;"
+        )
+        left_col.addWidget(lbl_gameplay)
+
         grid_kb = QGridLayout()
         grid_kb.setHorizontalSpacing(16)
         grid_kb.setVerticalSpacing(8)
         grid_kb.setColumnMinimumWidth(0, 240)
         grid_kb.setColumnMinimumWidth(1, 160)
         grid_kb.setColumnStretch(1, 0)
-        grid_kb.setColumnStretch(2, 1)
 
         self.keybind_buttons = {}
-        for row, (ini_key, desc, def_val) in enumerate(DEFAULT_KEYBINDS):
+        for row, (ini_key, desc, def_val) in enumerate(GAMEPLAY_KEYBINDS):
             lbl_desc = QLabel(desc)
             lbl_desc.setStyleSheet("color: #dcdce0; font-weight: 500; background: transparent;")
             grid_kb.addWidget(lbl_desc, row, 0)
@@ -1741,7 +1811,49 @@ class LauncherUI:
             self.keybind_buttons[ini_key] = btn_kb
             grid_kb.addWidget(btn_kb, row, 1)
 
-        l_mk.addLayout(grid_kb)
+        left_col.addLayout(grid_kb)
+        left_col.addStretch()
+
+        # Right: four keyboard-only system hotkeys.
+        right_col = QVBoxLayout()
+        right_col.setSpacing(6)
+        lbl_system = QLabel("System Hotkeys")
+        lbl_system.setStyleSheet(
+            "color: #8b8b98; font-size: 11px; font-weight: 600; background: transparent;"
+        )
+        right_col.addWidget(lbl_system)
+
+        lbl_hint = QLabel(
+            "Overlay, performance HUD, cheat menu and mouse capture. "
+            "These four are keyboard-only so a mouse attack cannot open a menu."
+        )
+        lbl_hint.setWordWrap(True)
+        lbl_hint.setStyleSheet("color: #8b8b98; font-size: 11px; background: transparent;")
+        right_col.addWidget(lbl_hint)
+
+        grid_sys = QGridLayout()
+        grid_sys.setHorizontalSpacing(16)
+        grid_sys.setVerticalSpacing(8)
+        grid_sys.setColumnMinimumWidth(0, 230)
+        grid_sys.setColumnMinimumWidth(1, 150)
+        grid_sys.setColumnStretch(1, 1)
+        for row, (ini_key, desc, def_val) in enumerate(SYSTEM_KEYBINDS):
+            lbl_desc = QLabel(desc)
+            lbl_desc.setStyleSheet("color: #dcdce0; font-weight: 500; background: transparent;")
+            grid_sys.addWidget(lbl_desc, row, 0)
+
+            cur_val = ini_opts.get(ini_key, def_val)
+            btn_kb = KeybindButton(ini_key, cur_val, keyboard_only=True)
+            btn_kb.key_assigned.connect(self.on_keybind_button_assigned)
+            self.keybind_buttons[ini_key] = btn_kb
+            grid_sys.addWidget(btn_kb, row, 1)
+
+        right_col.addLayout(grid_sys)
+        right_col.addStretch()
+
+        kb_columns.addLayout(left_col, 0)
+        kb_columns.addLayout(right_col, 1)
+        l_mk.addLayout(kb_columns)
 
         c_layout.addWidget(card_mk)
         c_layout.addStretch()

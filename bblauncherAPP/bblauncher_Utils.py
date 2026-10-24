@@ -28,7 +28,7 @@ LOG_KEEP = 20
 SETTINGS_FILE = APP_DIR / "bblauncher_settings.json"
 PATCHES_XML = APP_DIR / "patches" / "Bloodborne.xml"
 DEFAULT_GAME = Path(os.environ.get("BB_GAME_DIR", "../CUSA03173"))
-LAUNCHER_VERSION = "0.6.4"
+LAUNCHER_VERSION = "0.7.0"
 
 
 def build_stamp() -> str:
@@ -203,7 +203,7 @@ DEFAULT_SETTINGS = {
     "last_run_duration": 0,
 }
 
-DEFAULT_KEYBINDS = [
+GAMEPLAY_KEYBINDS = [
     ("key.attack", "Light Attack (R1)", "Mouse Left"),
     ("key.heavy_attack", "Heavy Attack (R2)", "Shift + Mouse Left"),
     ("key.firearm", "Firearm / Gun (L2)", "Mouse Right"),
@@ -226,6 +226,131 @@ DEFAULT_KEYBINDS = [
     ("key.menu", "System Menu (Options)", "Escape"),
     ("key.walk", "Walk (hold)", "Left Alt"),
 ]
+
+# UI hotkeys are keyboard-only: mapping a menu toggle to an attack mouse button would fire
+# while playing.  They are still stored in bbport.ini and shown in the in-game keybind list.
+SYSTEM_KEYBINDS = [
+    ("key.overlay_toggle", "In-Game Overlay Toggle", "Insert"),
+    ("key.hud_toggle", "Performance HUD Toggle", "F11"),
+    ("key.cheat_toggle", "Cheat Menu Toggle", "F4"),
+    ("key.mouse_capture_toggle", "Mouse Capture / Release Toggle", "F1"),
+]
+
+DEFAULT_KEYBINDS = GAMEPLAY_KEYBINDS + SYSTEM_KEYBINDS
+
+# Movement layouts.  These are the labels printed on the keyboard; apply_keybind_preset
+# converts them to the physical SDL scancode names that the game actually binds.
+KEYBIND_PRESETS = {
+    "qwerty": {
+        "key.move_forward": "W",
+        "key.move_left": "A",
+        "key.move_backward": "S",
+        "key.move_right": "D",
+    },
+    "azerty": {
+        "key.move_forward": "Z",
+        "key.move_left": "Q",
+        "key.move_backward": "S",
+        "key.move_right": "D",
+    },
+}
+
+# SDL scancode names describe physical US key positions.  bbport.ini and the game keep those
+# names so a binding stays on the same physical key; the launcher shows the character printed
+# on the key for the active Windows layout.  Windows scan code -> SDL scancode name.
+_WIN_SCAN_TO_SDL_NAME = {
+    0x02: "1", 0x03: "2", 0x04: "3", 0x05: "4", 0x06: "5",
+    0x07: "6", 0x08: "7", 0x09: "8", 0x0A: "9", 0x0B: "0",
+    0x0C: "-", 0x0D: "=",
+    0x10: "Q", 0x11: "W", 0x12: "E", 0x13: "R", 0x14: "T",
+    0x15: "Y", 0x16: "U", 0x17: "I", 0x18: "O", 0x19: "P",
+    0x1A: "[", 0x1B: "]",
+    0x1E: "A", 0x1F: "S", 0x20: "D", 0x21: "F", 0x22: "G",
+    0x23: "H", 0x24: "J", 0x25: "K", 0x26: "L",
+    0x27: ";", 0x28: "'", 0x29: "`",
+    0x2B: "\\",
+    0x2C: "Z", 0x2D: "X", 0x2E: "C", 0x2F: "V", 0x30: "B",
+    0x31: "N", 0x32: "M",
+    0x33: ",", 0x34: ".", 0x35: "/",
+    0x39: "Space",
+}
+_SDL_NAME_TO_WIN_SCAN = {name: scan for scan, name in _WIN_SCAN_TO_SDL_NAME.items()}
+_USER32 = None
+
+
+def _get_user32():
+    """Load user32 lazily so the launcher still imports on non-Windows hosts."""
+    global _USER32
+    if _USER32 is None:
+        if os.name != "nt":
+            _USER32 = False
+        else:
+            try:
+                from ctypes import wintypes
+
+                lib = ctypes.WinDLL("user32", use_last_error=True)
+                lib.GetKeyNameTextW.argtypes = [wintypes.LONG, wintypes.LPWSTR, ctypes.c_int]
+                lib.GetKeyNameTextW.restype = ctypes.c_int
+                _USER32 = lib
+            except Exception:
+                _USER32 = False
+    return _USER32 or None
+
+
+def _key_name_text(scan_code: int) -> str:
+    """Return the active layout's label for a Windows scan code, or an empty string."""
+    user32 = _get_user32()
+    if user32 is None or not scan_code:
+        return ""
+    buf = ctypes.create_unicode_buffer(64)
+    if user32.GetKeyNameTextW(int(scan_code) << 16, buf, len(buf)) > 0:
+        return buf.value
+    return ""
+
+
+def win_scan_to_scancode_name(scan_code: int) -> str:
+    """Map a Windows scan code to the SDL scancode name used by bbport.ini."""
+    return _WIN_SCAN_TO_SDL_NAME.get(int(scan_code) & 0xFF, "")
+
+
+def scancode_display_name(stored_name: str) -> str:
+    """Show a stored SDL scancode name as the label printed on the active keyboard.
+
+    Digits keep their US names ("1".."0") because a French AZERTY key reports its
+    unshifted punctuation character ("&", "é", ...) and a number is clearer in the UI.
+    """
+    if not stored_name:
+        return "None"
+    if stored_name.lower() in ("none", "unknown"):
+        return stored_name
+    if len(stored_name) != 1 or not stored_name.isascii():
+        return stored_name
+    if stored_name.isdigit():
+        return stored_name
+    scan_code = _SDL_NAME_TO_WIN_SCAN.get(stored_name.upper())
+    if scan_code is None:
+        return stored_name
+    return _key_name_text(scan_code) or stored_name
+
+
+def display_name_to_scancode_label(label: str) -> str:
+    """Resolve a printed key label (for example AZERTY "Z") to a stored SDL name ("W")."""
+    label = (label or "").strip()
+    if not label:
+        return label
+    if len(label) != 1 or not label.isascii():
+        return label
+    target = label.upper()
+    # Walk the physical key table so the answer follows the active layout.  On a
+    # French layout this maps Z->W, Q->A, W->Z and A->Q; on QWERTY it is the identity.
+    for stored_name, scan_code in _SDL_NAME_TO_WIN_SCAN.items():
+        if len(stored_name) == 1 and stored_name.isalpha():
+            if _key_name_text(scan_code).upper() == target:
+                return stored_name
+    if target in _SDL_NAME_TO_WIN_SCAN:
+        return target
+    return label
+
 
 KEYBINDINGS = [(k, desc) for _, desc, k in DEFAULT_KEYBINDS]
 
@@ -294,21 +419,68 @@ def running_instances():
         return []
 
 
-def kill_tree(proc: subprocess.Popen):
-    guard = get_bb_guard()
-    if guard:
-        for instance in running_instances():
-            guard.terminate(instance.pid)
+def _taskkill_tree(pid: int) -> bool:
+    """Force-kill a Windows process and its descendants before the parent can disappear."""
+    if os.name != "nt":
+        return False
+    try:
+        result = subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            creationflags=NO_WINDOW,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
-    if proc and proc.poll() is None:
+
+def terminate_bb_instances(timeout: float = 2.0) -> list[int]:
+    """Terminate this install's bbport.exe processes. Returns PIDs that survived."""
+    guard = get_bb_guard()
+    survivors = []
+    for instance in running_instances():
+        if guard is None:
+            survivors.append(instance.pid)
+            continue
+        try:
+            if not guard.terminate(instance.pid, timeout=timeout):
+                survivors.append(instance.pid)
+        except Exception:
+            survivors.append(instance.pid)
+    return survivors
+
+
+def kill_tree(proc: subprocess.Popen):
+    """Force-stop cmd.exe -> run.bat -> bbport.exe, even if the wrapper already exited.
+
+    taskkill /T must run while the cmd.exe parent still owns the tree.  The bb_guard sweep
+    then catches a game process that outlived its wrapper (or was started from another
+    shell), and the second sweep handles the small race between the two steps.
+    """
+    if os.name == "nt" and proc is not None and proc.poll() is None:
+        _taskkill_tree(proc.pid)
+
+    terminate_bb_instances(timeout=2.0)
+
+    if proc is not None and proc.poll() is None:
         try:
             proc.terminate()
             try:
-                proc.wait(timeout=1.5)
+                proc.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    pass
         except OSError:
             pass
+
+    # A game process can remain after cmd.exe is gone.  Kill it now, not on the next launch.
+    terminate_bb_instances(timeout=1.0)
 
 
 def rotate_log():
@@ -490,8 +662,14 @@ class ProcessWorker(QThread):
         self.env = env
         self.cwd = cwd
         self.proc = None
+        self._stop_requested = False
 
     def run(self):
+        # STOP can be pressed while the worker is still starting.  Do not launch a game
+        # that the user has already asked to stop.
+        if self._stop_requested:
+            self.process_finished.emit(-1)
+            return
         try:
             self.proc = subprocess.Popen(
                 self.cmd,
@@ -502,6 +680,9 @@ class ProcessWorker(QThread):
                 stderr=subprocess.STDOUT,
                 creationflags=NO_WINDOW,
             )
+            # Close the race between the check above and Popen returning.
+            if self._stop_requested:
+                kill_tree(self.proc)
         except Exception as ex:
             self.batch_emitted.emit([f"Launch Error: {ex}"])
             self.process_finished.emit(-1)
@@ -531,5 +712,5 @@ class ProcessWorker(QThread):
             self.process_finished.emit(rc)
 
     def terminate_proc(self):
-        if self.proc and self.proc.poll() is None:
-            kill_tree(self.proc)
+        self._stop_requested = True
+        kill_tree(self.proc)

@@ -131,10 +131,10 @@ static unsigned prompt_generation=1;
 static unsigned prompt_bind_hash=1;
 
 static unsigned prompt_bindings_hash(void) {
-    int binds[BB_ACTION_COUNT];
-    bbgpu_get_all_action_bindings(binds,BB_ACTION_COUNT);
+    int binds[BB_ACTION_GAMEPLAY_COUNT];
+    bbgpu_get_all_action_bindings(binds,BB_ACTION_GAMEPLAY_COUNT);
     unsigned h=2166136261u;
-    for (int i=0;i<BB_ACTION_COUNT;++i) h=(h^(unsigned)binds[i])*16777619u;
+    for (int i=0;i<BB_ACTION_GAMEPLAY_COUNT;++i) h=(h^(unsigned)binds[i])*16777619u;
     return h;
 }
 static int prompt_playstation(int type) {
@@ -210,7 +210,8 @@ static const char *prompt_mouse_label(int code) {
     default: return NULL;
     }
 }
-/* A key cap's label: SDL's name, shortened for the common long ones. */
+/* A key cap's label: the active layout's character for letter/punctuation keys,
+ * otherwise SDL's physical name shortened for the common long ones. */
 static void prompt_key_label(int code,char *out,int size) {
     static const struct { const char *from, *to; } names[]={
         {"Return","Enter"}, {"Escape","Esc"}, {"Backspace","Bksp"},
@@ -226,6 +227,16 @@ static void prompt_key_label(int code,char *out,int size) {
     if (!name || !*name) { snprintf(out,(size_t)size,"Key %d",code); return; }
     for (size_t i=0;i<sizeof(names)/sizeof(*names);++i) {
         if (!strcmp(name,names[i].from)) { snprintf(out,(size_t)size,"%s",names[i].to); return; }
+    }
+    /* The game binds SDL scancodes, which are named for physical US keys.  Show
+     * the character printed on the active AZERTY/QWERTY key instead.  Digits stay
+     * as 1..0: their unshifted AZERTY glyphs (&, é, ...) make poor control caps. */
+    const int localized=(code>=SDL_SCANCODE_A && code<=SDL_SCANCODE_Z) ||
+                        (code>=SDL_SCANCODE_MINUS && code<=SDL_SCANCODE_SLASH);
+    if (localized) {
+        const char *local=SDL_GetKeyName(
+            SDL_GetKeyFromScancode((SDL_Scancode)code,SDL_KMOD_NONE,false));
+        if (local && *local && strcmp(local,"Unknown")) name=local;
     }
     snprintf(out,(size_t)size,"%s",name);
 }
@@ -363,7 +374,7 @@ static void sample_host(PadData *d) {
 
     // A held Shift chord owns its mouse button so the bare-button action doesn't fire with it.
     unsigned chords = 0;
-    for (int i = 0; i < BB_ACTION_COUNT; ++i) {
+    for (int i = 0; i < BB_ACTION_GAMEPLAY_COUNT; ++i) {
         if (binds[i] == BB_KEY_CHORD_SHIFT_LMB && lshift && lmb_raw) chords |= CHORD_LMB;
         if (binds[i] == BB_KEY_CHORD_SHIFT_RMB && lshift && rmb_raw) chords |= CHORD_RMB;
     }
@@ -383,7 +394,7 @@ static void sample_host(PadData *d) {
                           (mouse_is_captured &&
                            (lmb_raw || rmb_raw || mmb || x1 || x2 ||
                             prompt_mouse_dx * prompt_mouse_dx + prompt_mouse_dy * prompt_mouse_dy > 9.0f));
-    for (int i = 0; i < BB_ACTION_COUNT && !keyboard_active; ++i) {
+    for (int i = 0; i < BB_ACTION_GAMEPLAY_COUNT && !keyboard_active; ++i) {
         const int c = binds[i];
         if (c > 0 && c < SDL_SCANCODE_COUNT && k[c]) keyboard_active = 1;
     }

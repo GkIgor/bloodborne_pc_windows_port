@@ -329,6 +329,13 @@ ImGuiKey KeyFromGamepad(u8 button) {
     }
 }
 
+// The UI hotkeys are stored as SDL scancodes.  Using the scancode (not the layout-dependent
+// keycode) keeps a bind on the same physical key on AZERTY and QWERTY keyboards.
+bool KeyMatchesAction(const SDL_Event& event, int action) {
+    const int code = BbSettings::Get().keybinds[action].load();
+    return code > 0 && code < SDL_SCANCODE_COUNT && event.key.scancode == code;
+}
+
 float PixelDensity(SDL_WindowID id) {
     SDL_Window* window = SDL_GetWindowFromID(id);
     const float density = window ? SDL_GetWindowPixelDensity(window) : 1.0f;
@@ -812,8 +819,8 @@ void Menu() {
             dirty = true;
         }
 
-        ImGui::TextDisabled("%s", Tr("Click a button, then press any key or mouse button. ESC to cancel, DEL to clear.",
-                                     "Нажмите кнопку, затем любую клавишу или кнопку мыши. ESC для отмены, DEL для очистки."));
+        ImGui::TextDisabled("%s", Tr("Click a button, then press a key (or a mouse button for gameplay). ESC to cancel, DEL to clear. Overlay/HUD/cheat/capture hotkeys are keyboard-only.",
+                                     "Нажмите кнопку, затем клавишу (или кнопку мыши для игровых действий). ESC для отмены, DEL для очистки. Горячие клавиши оверлея/HUD/читов/мыши — только клавиатура."));
 
         const auto* action_infos = BbSettings::GetActionInfos();
         const bool child_open = ImGui::BeginChild("KeybindsChild", ImVec2(0.0f, 260.0f * base_scale), true);
@@ -1242,39 +1249,9 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
-        if (down && !event.key.repeat) {
-            if (event.key.key == SDLK_INSERT) {
-                SetOpen(!menu_open.load());
-                return true;
-            }
-            // F4: independent cheat / debug menu (Insert remains the settings menu).
-            if (event.key.key == SDLK_F4) {
-                SetCheatOpen(!cheat_menu_open.load());
-                return true;
-            }
-            if (event.key.key == SDLK_ESCAPE) {
-                if (cheat_menu_open.load()) {
-                    SetCheatOpen(false);
-                    return true;
-                }
-                if (menu_open.load()) {
-                    SetOpen(false);
-                    return true;
-                }
-            }
-            // HUD overlay hotkeys: F11 or Shift + Tab
-            const bool shift = (event.key.mod & SDL_KMOD_SHIFT) != 0;
-            if (event.key.key == SDLK_F11 || (shift && event.key.key == SDLK_TAB)) {
-                auto& s = BbSettings::Get();
-                s.show_hud = !s.show_hud.load();
-                BbSettings::Save();
-                return true;
-            }
-        }
-        if (!is_open) {
-            return false;
-        }
-        if (down && rebinding_action >= 0) {
+        // Rebind first: while the user is assigning a key, the old hotkey must not close
+        // the menu or toggle another window.  In particular, Escape cancels the capture.
+        if (down && !event.key.repeat && rebinding_action >= 0) {
             if (event.key.key == SDLK_ESCAPE) {
                 rebinding_action = -1;
                 rebinding_swap_msg.clear();
@@ -1311,6 +1288,41 @@ bool HandleEvent(const SDL_Event& event) {
                 dirty = true;
                 return true;
             }
+            // A key without a scancode (media key, IME): keep listening.
+            return true;
+        }
+        if (down && !event.key.repeat) {
+            // The overlay, HUD and cheat hotkeys are user-configurable in bbport.ini.
+            if (KeyMatchesAction(event, BB_ACTION_OVERLAY_TOGGLE)) {
+                SetOpen(!menu_open.load());
+                return true;
+            }
+            if (KeyMatchesAction(event, BB_ACTION_CHEAT_TOGGLE)) {
+                SetCheatOpen(!cheat_menu_open.load());
+                return true;
+            }
+            if (event.key.key == SDLK_ESCAPE) {
+                if (cheat_menu_open.load()) {
+                    SetCheatOpen(false);
+                    return true;
+                }
+                if (menu_open.load()) {
+                    SetOpen(false);
+                    return true;
+                }
+            }
+            // The custom HUD key plus the original Shift + Tab fallback.
+            const bool shift = (event.key.mod & SDL_KMOD_SHIFT) != 0;
+            if (KeyMatchesAction(event, BB_ACTION_HUD_TOGGLE) ||
+                (shift && event.key.key == SDLK_TAB)) {
+                auto& s = BbSettings::Get();
+                s.show_hud = !s.show_hud.load();
+                BbSettings::Save();
+                return true;
+            }
+        }
+        if (!is_open) {
+            return false;
         }
         io.AddKeyEvent(ImGuiMod_Ctrl, (event.key.mod & SDL_KMOD_CTRL) != 0);
         io.AddKeyEvent(ImGuiMod_Shift, (event.key.mod & SDL_KMOD_SHIFT) != 0);
@@ -1375,6 +1387,11 @@ bool HandleEvent(const SDL_Event& event) {
             return false;
         }
         if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && rebinding_action >= 0) {
+            // Overlay/HUD/cheat/capture hotkeys are keyboard-only: a mouse click while
+            // capturing one of them must not be interpreted as a gameplay binding.
+            if (rebinding_action >= BB_ACTION_OVERLAY_TOGGLE) {
+                return true;
+            }
             int code = BB_KEY_NONE;
             const bool shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
             if (event.button.button == SDL_BUTTON_LEFT) code = shift ? BB_KEY_CHORD_SHIFT_LMB : BB_KEY_MOUSE_LEFT;

@@ -34,13 +34,23 @@ static const ActionInfo s_action_infos[BB_ACTION_COUNT] = {
     {BB_ACTION_PERSONAL_EFFECTS, "key.personal_effects", "Personal Effects (Touchpad R)", "Личные вещи (Touchpad R)", SDL_SCANCODE_BACKSPACE},
     {BB_ACTION_MENU, "key.menu", "System Menu (Options)", "Меню игры (Options)", SDL_SCANCODE_ESCAPE},
     {BB_ACTION_WALK, "key.walk", "Walk (hold)", "Шаг (удерживать)", SDL_SCANCODE_LALT},
+    {BB_ACTION_OVERLAY_TOGGLE, "key.overlay_toggle", "Toggle In-Game Overlay",
+     "Открыть/закрыть оверлей", SDL_SCANCODE_INSERT},
+    {BB_ACTION_HUD_TOGGLE, "key.hud_toggle", "Toggle Performance HUD",
+     "Оверлей производительности", SDL_SCANCODE_F11},
+    {BB_ACTION_CHEAT_TOGGLE, "key.cheat_toggle", "Toggle Cheat Menu", "Меню читов",
+     SDL_SCANCODE_F4},
+    {BB_ACTION_MOUSE_CAPTURE_TOGGLE, "key.mouse_capture_toggle", "Toggle Mouse Capture",
+     "Захват/освобождение мыши", SDL_SCANCODE_F1},
 };
 
 const ActionInfo* GetActionInfos() {
     return s_action_infos;
 }
 
-const char* KeyCodeToString(int code) {
+namespace {
+
+const char* SpecialKeyName(int code) {
     if (code <= 0) return "None";
     if (code == BB_KEY_MOUSE_LEFT) return "Mouse Left";
     if (code == BB_KEY_MOUSE_RIGHT) return "Mouse Right";
@@ -49,6 +59,36 @@ const char* KeyCodeToString(int code) {
     if (code == BB_KEY_MOUSE_X2) return "Mouse X2";
     if (code == BB_KEY_CHORD_SHIFT_LMB) return "Shift + Mouse Left";
     if (code == BB_KEY_CHORD_SHIFT_RMB) return "Shift + Mouse Right";
+    return nullptr;
+}
+
+// Letters and punctuation are the keys whose SDL scancode names differ from the
+// character printed on a non-US layout.  Digits stay as "1".."0" because their
+// unshifted AZERTY glyphs (&, é, ...) are less useful as control labels.
+bool IsLayoutLocalized(int code) {
+    return (code >= SDL_SCANCODE_A && code <= SDL_SCANCODE_Z) ||
+           (code >= SDL_SCANCODE_MINUS && code <= SDL_SCANCODE_SLASH);
+}
+
+} // namespace
+
+const char* KeyCodeToString(int code) {
+    if (const char* special = SpecialKeyName(code)) return special;
+    if (code < SDL_SCANCODE_COUNT) {
+        if (IsLayoutLocalized(code)) {
+            const SDL_Keycode key =
+                SDL_GetKeyFromScancode((SDL_Scancode)code, SDL_KMOD_NONE, false);
+            const char* name = SDL_GetKeyName(key);
+            if (name && name[0] && SDL_strcasecmp(name, "Unknown") != 0) return name;
+        }
+        const char* name = SDL_GetScancodeName((SDL_Scancode)code);
+        if (name && name[0]) return name;
+    }
+    return "Unknown";
+}
+
+const char* KeyCodeToStorageName(int code) {
+    if (const char* special = SpecialKeyName(code)) return special;
     if (code < SDL_SCANCODE_COUNT) {
         const char* name = SDL_GetScancodeName((SDL_Scancode)code);
         if (name && name[0]) return name;
@@ -383,7 +423,8 @@ void Save() {
     }
     // Action keybindings
     for (int a = 0; a < BB_ACTION_COUNT; ++a) {
-        std::fprintf(file, "%s=%s\n", s_action_infos[a].ini_key, KeyCodeToString(v.keybinds[a].load()));
+        std::fprintf(file, "%s=%s\n", s_action_infos[a].ini_key,
+                     KeyCodeToStorageName(v.keybinds[a].load()));
     }
     std::fclose(file);
 }

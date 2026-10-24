@@ -99,6 +99,13 @@ enum BbAction {
     BB_ACTION_PERSONAL_EFFECTS,   /* Touchpad Right (Personal Effects) */
     BB_ACTION_MENU,               /* Options (System Menu) */
     BB_ACTION_WALK,               /* Hold: partial left stick deflection */
+    /* End of the gameplay actions. runtime_pad.c only maps these to the virtual pad. */
+    BB_ACTION_GAMEPLAY_COUNT,
+    /* UI hotkeys: configurable from the launcher and the in-game keybind list. */
+    BB_ACTION_OVERLAY_TOGGLE = BB_ACTION_GAMEPLAY_COUNT, /* Settings / debug overlay */
+    BB_ACTION_HUD_TOGGLE,         /* Performance HUD */
+    BB_ACTION_CHEAT_TOGGLE,       /* In-game cheat menu */
+    BB_ACTION_MOUSE_CAPTURE_TOGGLE, /* Capture / release the mouse */
     BB_ACTION_COUNT
 };
 

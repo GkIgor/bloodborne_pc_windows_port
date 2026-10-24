@@ -20,6 +20,8 @@ int bbgpu_mouse_captured(void) { return 1; }
 int bbgpu_menu_pointer_mouse_buttons(void) { return 0; }
 uint32_t bbgpu_menu_pointer_buttons(uint32_t buttons, uint8_t lx, uint8_t ly) { (void)buttons; (void)lx; (void)ly; return 0; }
 void bbgpu_consume_mouse_delta(float *dx, float *dy) { if (dx) *dx = 0.0f; if (dy) *dy = 0.0f; }
+int bbgpu_mouse_active_recent(void) { return 0; }
+int bbgpu_get_mk_native_mouse(void) { return 1; }
 int native_camera_owns_mouse(void) { return 1; }
 int bbgpu_get_mk_config(float *sens_x, float *sens_y, int *invert_x, int *invert_y, float *deadzone, float *smoothing) {
     if (sens_x) { *sens_x = 1.0f; }

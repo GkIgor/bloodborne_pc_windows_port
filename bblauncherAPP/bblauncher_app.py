@@ -19,6 +19,7 @@ import json
 import os
 import platform
 import sys
+import threading
 import time
 from datetime import datetime
 from PySide6.QtCore import QEvent, QTimer, Qt
@@ -44,6 +45,7 @@ from bblauncher_Utils import (
     DEFAULT_GAME,
     DEFAULT_SETTINGS,
     EFFECT_CHOICES,
+    KEYBIND_PRESETS,
     LAUNCHER_VERSION,
     LOG_DIR,
     LOG_FILE,
@@ -56,7 +58,9 @@ from bblauncher_Utils import (
     acquire_single_instance,
     build_stamp,
     connected_gpus,
+    display_name_to_scancode_label,
     get_bb_guard,
+    kill_tree,
     load_xml_patches,
     resolve_game_dir,
     rotate_log,
@@ -106,6 +110,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self._run_started = None
         self._path_valid = False
         self._setup_kind = "empty"
+        self._stop_requested = False
 
         self._patches_built = False
         self._display_built = False
@@ -1071,18 +1076,60 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             self.log(f"[ERROR] Could not write to {ini_path}: {ex}")
             return False
 
-    def on_keybind_button_assigned(self, action_key: str, new_val: str):
+    def _assign_keybind(self, action_key: str, new_val: str, old_val=None):
+        """Set one binding and move any conflicting action off it.
+
+        The old value is supplied by KeybindButton because it has already updated its
+        label when the signal arrives; reading current_binding here would see the new
+        value and create a duplicate instead of swapping.
+        """
+        btn = self.keybind_buttons.get(action_key)
+        if btn is None:
+            return
+        if old_val is None:
+            old_val = btn.current_binding
+        if new_val != "None":
+            for other_key, other in self.keybind_buttons.items():
+                if other_key == action_key:
+                    continue
+                if other.current_binding.lower() != new_val.lower():
+                    continue
+                # The old value may itself belong to a third action; in that case
+                # clearing the conflict is safer than creating another duplicate.
+                replacement = old_val
+                if replacement != "None" and any(
+                    key not in (action_key, other_key)
+                    and other_btn.current_binding.lower() == replacement.lower()
+                    for key, other_btn in self.keybind_buttons.items()
+                ):
+                    replacement = "None"
+                other.set_binding(replacement)
+                self.log(f"[Keybinds] Swapped '{new_val}' between {action_key} and {other_key}")
+                break
+        btn.set_binding(new_val)
+
+    def on_keybind_button_assigned(self, action_key: str, new_val: str, old_val: str):
         if not hasattr(self, "keybind_buttons"):
             return
-        # Conflict detection: if another action already has this binding, swap with previous binding
-        old_val = self.keybind_buttons[action_key].current_binding
-        if new_val != "None":
-            for other_key, btn in self.keybind_buttons.items():
-                if other_key != action_key and btn.current_binding.lower() == new_val.lower():
-                    btn.set_binding(old_val)
-                    self.log(f"[Keybinds] Swapped '{new_val}' between {action_key} and {other_key}")
-                    break
+        self._assign_keybind(action_key, new_val, old_val)
         self.save_bbport_ini()
+
+    def apply_keybind_preset(self, layout: str):
+        """Switch the movement keys between the QWERTY (WASD) and AZERTY (ZQSD) layouts."""
+        preset = KEYBIND_PRESETS.get(layout)
+        if not preset or not hasattr(self, "keybind_buttons"):
+            return
+        for action_key in ("key.move_forward", "key.move_left",
+                           "key.move_backward", "key.move_right"):
+            btn = self.keybind_buttons.get(action_key)
+            if btn is not None:
+                # The preset holds printed labels.  Convert each one to the physical
+                # SDL scancode name for this keyboard layout before saving.
+                stored = display_name_to_scancode_label(preset[action_key])
+                self._assign_keybind(action_key, stored, btn.current_binding)
+        self.save_bbport_ini()
+        keys = "WASD" if layout == "qwerty" else "ZQSD"
+        self.log(f"[Keybinds] Applied {layout.upper()} movement preset ({keys}).")
 
     def reset_keybinds_to_defaults(self):
         from bblauncher_Utils import DEFAULT_KEYBINDS
@@ -1694,6 +1741,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.save_settings()
         self.save_bbport_ini()
 
+        self._stop_requested = False
         self._run_started = time.monotonic()
         self.run_timer.start()
         self.update_run_clock()
@@ -1709,10 +1757,27 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.lbl_status.setStyleSheet("color: #4ade80; font-size: 11px; padding: 0 20px; background: transparent;")
 
     def stop_game(self):
-        if self.worker and self.worker.isRunning():
-            self.log("Terminating process tree...")
-            self._set_run_info("warn", "\u25cf Stopping...")
-            self.worker.terminate_proc()
+        if self._stop_requested:
+            return
+        self._stop_requested = True
+        # Give immediate feedback and make a second click impossible while the tree dies.
+        self.btn_stop.setEnabled(False)
+        self.log("Force-terminating the game process tree...")
+        self._set_run_info("warn", "\u25cf Stopping...")
+
+        worker = self.worker
+
+        def force_stop():
+            # taskkill /T needs the cmd.exe wrapper; the bb_guard sweep catches a game
+            # process even when the wrapper is already gone.
+            if worker is not None:
+                worker.terminate_proc()
+            else:
+                kill_tree(None)
+
+        # Killing a tree can take a moment (taskkill + guard).  Keep the UI responsive and
+        # let the worker's process_finished signal finish the status reset.
+        threading.Thread(target=force_stop, name="bbport-force-stop", daemon=True).start()
 
     def on_process_finished(self, rc: int):
         duration = 0
@@ -1728,6 +1793,12 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if self.hidden_count:
             self.log(f"({self.hidden_count} console lines hidden by the active filter)")
         self.log(f"Process exited with code: {rc}")
+
+        if self._stop_requested:
+            self._stop_requested = False
+            # Final sweep for a game process that outlived its cmd.exe wrapper.
+            kill_tree(None)
+            self.log("[STOP] Process tree terminated.")
 
         guard = get_bb_guard()
         if guard:
@@ -1770,6 +1841,12 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             if reply != QMessageBox.Yes:
                 event.ignore()
                 return
+            self._stop_requested = True
+            self.worker.terminate_proc()
+            # Give the reader thread time to observe EOF before the QThread is destroyed.
+            self.worker.wait(5000)
+        elif self.worker is not None:
+            # The wrapper exited but the game may still be alive.
             self.worker.terminate_proc()
         self.save_settings()
         event.accept()

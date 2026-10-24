@@ -20,7 +20,10 @@ struct ActionInfo {
 };
 
 const ActionInfo* GetActionInfos();
+/// Layout-aware label for the in-game keybind buttons.
 const char* KeyCodeToString(int code);
+/// Physical SDL scancode name written to bbport.ini (stable across keyboard layouts).
+const char* KeyCodeToStorageName(int code);
 int StringToKeyCode(const char* name);
 void ResetKeybindsToDefaults();
 

@@ -253,10 +253,16 @@ bool WindowSDL::PollEvents() {
             continue;
         }
 
-        // F1 toggles mouse release so the user can freely interact with desktop/second monitor
-        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F1 &&
-            relative_mouse_active) {
-            CaptureMouse(false);
+        // The mouse capture key (F1 by default) both releases and re-captures the pointer,
+        // so the user can freely interact with the desktop/second monitor and come back.
+        const int capture_key = BbSettings::Get().keybinds[BB_ACTION_MOUSE_CAPTURE_TOGGLE].load();
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && capture_key > 0 &&
+            capture_key < SDL_SCANCODE_COUNT && event.key.scancode == capture_key) {
+            if (relative_mouse_active) {
+                CaptureMouse(false);
+            } else if (mk_active && !BbOverlay::CapturesInput() && !text_active) {
+                CaptureMouse(true);
+            }
             continue;
         }
 
