@@ -62,6 +62,17 @@ int runtime_guest_image_ready(void) {
 static int is_guest_address(uintptr_t addr) {
     return image && image_size && addr >= (uintptr_t)image && addr < (uintptr_t)image + image_size;
 }
+
+static char s_game_title_id[16] = "";
+static char s_game_app_ver[16] = "";
+
+static int is_cusa03173_v109(void) {
+    if (!image || image_size < 0x53e4570) return 0;
+    if (*(const int64_t *)(image + 0x53e4568) != -1840) return 0;
+    if (s_game_title_id[0] && strcmp(s_game_title_id, "CUSA03173") != 0) return 0;
+    if (s_game_app_ver[0] && strcmp(s_game_app_ver, "01.09") != 0) return 0;
+    return 1;
+}
 static void **resolved_targets;
 static uint64_t *import_call_counts;
 static uint8_t *is_unbound;
@@ -2342,6 +2353,30 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
 
+            // DLTemporaryHeap NULL initialization recovery with real 128KB arena
+            // Gated by runtime verification of CUSA03173 v1.09
+            if ((off >= 0x207de20 && off <= 0x207de2a) && ep->ContextRecord->Rcx == 0 && is_cusa03173_v109()) {
+                static __thread uint8_t s_thread_temp_heap[131072] __attribute__((aligned(64)));
+                uint8_t *heap = s_thread_temp_heap;
+                uint64_t *hdr = (uint64_t *)heap;
+                uint64_t start = (uint64_t)(uintptr_t)(heap + 0x38);
+                uint64_t end = (uint64_t)(uintptr_t)(heap + sizeof(s_thread_temp_heap));
+                hdr[0] = start;
+                hdr[1] = end;
+                hdr[2] = start;
+                hdr[3] = end;
+                hdr[4] = (uint64_t)(uintptr_t)image + 0x535b540;
+                hdr[5] = (uint64_t)(uintptr_t)image + 0x53b3150;
+                hdr[6] = (uint64_t)(uintptr_t)(heap + 0x20);
+                void *tcb = runtime_thread_get_tcb();
+                if (tcb) {
+                    *(uint64_t *)((char *)tcb - 1840) = (uint64_t)(uintptr_t)heap;
+                }
+                ep->ContextRecord->Rcx = (DWORD64)(uintptr_t)heap;
+                if (cur) cur->exception_count++;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
             // Issue #136: Bucket allocator refill loop NULL pointer write
             if (off == 0x443025 && ep->ContextRecord->Rdi == 0) {
                 char buf[512];
@@ -2359,21 +2394,29 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
 
-            // Issue #135 secondary write safeguard: 0x21d5b45 .. 0x21d5d70 when R13 == 0
-            if (off >= 0x21d5b45 && off < 0x21d5d71 && ep->ContextRecord->R13 == 0) {
-                char buf[512];
-                snprintf(buf, sizeof(buf),
-                    "[ASSET COPY GUARD] Thread '%s' (TID %lu) at guest offset 0x%" PRIxPTR ": "
-                    "NULL destination buffer R13 in structure copy. Advancing to function epilogue.\n",
-                    cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId(), off);
-                veh_write(buf);
-                fprintf(stderr, "%s", buf);
-                fflush(stderr);
+            // allocate valid destination buffer R13 and replay copy to eliminate cascade
+            // Gated by runtime verification of CUSA03173 v1.09
+            if (off >= 0x21d5b45 && off < 0x21d5d71 && ep->ContextRecord->R13 == 0 && is_cusa03173_v109()) {
+                void *dst = runtime_low_alloc_aligned(2048, 64);
+                if (dst) {
+                    uintptr_t src = ep->ContextRecord->Rbx;
+                    if (src && !IsBadReadPtr((const void *)src, 0x398)) {
+                        memcpy(dst, (const void *)src, 0x398);
+                    }
+                    char buf[512];
+                    snprintf(buf, sizeof(buf),
+                        "[ASSET COPY GUARD] Thread '%s' (TID %lu) at guest offset 0x%" PRIxPTR ": "
+                        "NULL destination R13 restored with low-alloc buffer %p. Resuming structure copy.\n",
+                        cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId(), off, dst);
+                    veh_write(buf);
+                    fprintf(stderr, "%s", buf);
+                    fflush(stderr);
 
-                ep->ContextRecord->Rcx = 0;
-                ep->ContextRecord->Rip = (uintptr_t)image + 0x21d5d71;
-                if (cur) cur->exception_count++;
-                return EXCEPTION_CONTINUE_EXECUTION;
+                    ep->ContextRecord->R13 = (DWORD64)(uintptr_t)dst;
+                    ep->ContextRecord->Rip = (uintptr_t)image + 0x21d5b45;
+                    if (cur) cur->exception_count++;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
             }
 
             // Issue #127: particle, blood splatter, and cloth vertex stream generators
@@ -2950,6 +2993,8 @@ int main(int argc, char **argv) {
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
         sfo_value(sfo,"TITLE_ID",serial,sizeof(serial),NULL);
+        sfo_value(sfo,"TITLE_ID",s_game_title_id,sizeof(s_game_title_id),NULL);
+        sfo_value(sfo,"APP_VER",s_game_app_ver,sizeof(s_game_app_ver),NULL);
         sfo_value(sfo,"ATTRIBUTE",NULL,0,&attributes);
         uint64_t sdk=0;
         if (procparam) memcpy(&sdk,image+procparam+16,8); /* procparam: size, magic, count, sdk_version */

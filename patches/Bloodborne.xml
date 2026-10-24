@@ -45,8 +45,7 @@
             <Line Type="bytes" Address="0x0553B198" Value="01"/>
             <Line Type="bytes" Address="0x058B0870" Value="01"/>
             <Line Type="bytes" Address="0x0553AC8D" Value="01"/>
-            <Line Type="bytes" Address="0x0603AD1A" Value="00"/>
-            <Line Type="bytes" Address="0x0603AC8D" Value="01"/>
+            <!-- removed duplicate out-of-bounds 0x0603AD1A and 0x0603AC8D entries -->
             <Line Type="bytes" Address="0x0553ad1c" Value="00"/>
             <Line Type="bytes" Address="0x0553ad1a" Value="00"/>
             <Line Type="bytes" Address="0x05527B8E" Value="00"/>

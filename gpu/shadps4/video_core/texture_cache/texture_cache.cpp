@@ -686,10 +686,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     key_hash = (key_hash ^ key_hash >> 33) * 0xC4CEB9FE1A85EC53ull;
     key_hash ^= key_hash >> 33;
     auto& cached = find_image_cache[key_hash % find_image_cache.size()];
-    // An exact match stays valid while that image is registered with the same description;
-    // resolved overlaps (views into other images) only until any image registration changes.
+    // prevent SlotVector UAF and invalidate stale find_image_cache entries
     const auto still_exact = [&] {
         if (cached.view_mip >= 0 || cached.view_slice >= 0 || !cached.image_id) {
+            return false;
+        }
+        if (!slot_images.is_allocated(cached.image_id)) {
             return false;
         }
         const Image& image = slot_images[cached.image_id];
@@ -698,7 +700,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                image.info.guest_size == info.guest_size && image.info.size == info.size &&
                image.info.pixel_format == info.pixel_format;
     };
-    if ((cached.generation == registry_generation.load(std::memory_order_relaxed) || still_exact()) &&
+    if (cached.image_id && !slot_images.is_allocated(cached.image_id)) {
+        cached = {};
+    }
+    if (cached.image_id &&
+        (cached.generation == registry_generation.load(std::memory_order_relaxed) || still_exact()) &&
+        slot_images.is_allocated(cached.image_id) &&
         cached.address == info.guest_address &&
         cached.size == info.guest_size && cached.extent == info.size &&
         cached.format == info.pixel_format && cached.type == info.type &&
@@ -1067,6 +1074,12 @@ void TextureCache::RegisterImage(ImageId image_id) {
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
+    // invalidate memoized find_image_cache entries for unregistered image
+    for (auto& entry : find_image_cache) {
+        if (entry.image_id == image_id) {
+            entry = {};
+        }
+    }
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
@@ -1481,6 +1494,15 @@ void TextureCache::DeleteImage(ImageId image_id) {
 
     // Reclaim image and any image views it references.
     scheduler.DeferOperation([this, image_id] {
+        // clear find_image_cache entries before erasing image slot
+        {
+            std::scoped_lock lock{mutex};
+            for (auto& entry : find_image_cache) {
+                if (entry.image_id == image_id) {
+                    entry = {};
+                }
+            }
+        }
         Image& image = slot_images[image_id];
         for (auto& backing : image.backing_images) {
             for (const ImageViewId image_view_id : backing.image_view_ids) {

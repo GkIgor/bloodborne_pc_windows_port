@@ -137,11 +137,14 @@ bool Swapchain::Present() {
     };
 
     auto result = instance.GetPresentQueue().presentKHR(present_info);
-    if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
+    // handle surface lost and present errors gracefully via swapchain recreation
+    if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR ||
+        result == vk::Result::eErrorSurfaceLostKHR) {
         needs_recreation = true;
-    } else {
-        ASSERT_MSG(result == vk::Result::eSuccess, "Swapchain presentation failed: {}",
-                   vk::to_string(result));
+    } else if (result != vk::Result::eSuccess) {
+        LOG_ERROR(Render_Vulkan, "Swapchain presentation returned {}; requesting recreation",
+                  vk::to_string(result));
+        needs_recreation = true;
     }
 
     frame_index = (frame_index + 1) % image_count;
