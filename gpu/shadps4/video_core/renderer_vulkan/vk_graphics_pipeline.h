@@ -125,6 +125,8 @@ struct ClipDistanceShaderKey {
     }
 };
 
+void ClearAuxShaderCaches();
+
 } // namespace Vulkan
 
 template <>

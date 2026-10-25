@@ -11,6 +11,7 @@
 #include <unordered_set>
 
 #include "bbport_threads.h"
+#include "bbport_toggles.h"
 
 #include "common/hash.h"
 #include "common/io_file.h"
@@ -434,7 +435,9 @@ struct PipelineCache::PendingPipeline {
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
 };
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    ClearAuxShaderCaches();
+}
 
 // bbport: shader/pipeline compile time on the GPU thread, reported by BB_FRAME_STATS.
 std::atomic<u64> g_bb_compile_ns;
@@ -456,7 +459,11 @@ struct TargetStreak {
     u32 last_frame = ~0u;
     u32 frames = 0;
 };
-std::unordered_map<u64, TargetStreak> target_streaks;
+tsl::robin_map<u64, TargetStreak> target_streaks = [] {
+    tsl::robin_map<u64, TargetStreak> map;
+    map.reserve(128);
+    return map;
+}();
 
 /// The draw's render target: its first color buffer written, else its depth buffer, else 0.
 u64 DrawTarget(const AmdGpu::Regs& regs) {
@@ -520,7 +527,32 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
         info.RefreshFlatBuf();
-        if (info.pgm_base != stage.pgm_base || info.flattened_ud_buf.size() != stage.flat_size ||
+        if (info.pgm_base != stage.pgm_base || info.flattened_ud_buf.size() != stage.flat_size) {
+            return nullptr;
+        }
+        if (!BbToggle::Disabled(BbToggle::FlatHashValidation)) {
+            const u64 computed_hash = XXH3_64bits(info.flattened_ud_buf.data(),
+                                                  info.flattened_ud_buf.size() * sizeof(u32));
+            const auto& modules = stage.program->modules;
+            size_t mod_idx = stage.program->last_used;
+            if (mod_idx >= modules.size() ||
+                prepared.key.stage_hashes[static_cast<u32>(stage.hw_stage)] != HashCombine(stage.hash, mod_idx)) {
+                for (size_t p = 0; p < modules.size(); ++p) {
+                    for (size_t s = 0; s < MaxShaderStages; ++s) {
+                        if (prepared.key.stage_hashes[s] == HashCombine(stage.hash, p)) {
+                            mod_idx = p;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (mod_idx < modules.size() && modules[mod_idx].flat_hash != 0) {
+                if (computed_hash != modules[mod_idx].flat_hash) {
+                    return nullptr;
+                }
+            }
+        }
+        if (
             std::memcmp(info.flattened_ud_buf.data(), stage.flat,
                         stage.flat_size * sizeof(u32)) != 0) {
             return nullptr;
@@ -575,7 +607,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         if (!compiler) {
             const char* env = std::getenv("BB_ASYNC_PIPELINE_THREADS");
             const u32 concurrency = std::thread::hardware_concurrency();
-            const u32 default_threads = concurrency > 2 ? std::clamp(concurrency / 2, 2u, 8u) : 1u;
+            const u32 default_threads = concurrency <= 8 ? std::max(1u, concurrency / 4) : std::clamp(concurrency / 2, 2u, 8u);
             const u32 threads = env && *env ? u32(std::strtoul(env, nullptr, 10)) : default_threads;
             compiler = std::make_unique<PipelineCompiler>(std::max(threads, 1u));
             std::printf("GPU: new pipelines of passes drawn every frame compile on %u threads "
@@ -685,7 +717,11 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
     // A full-screen pass (one triangle or quad: lighting, fog, post-processing) waits for its
     // pipeline: going without one for a frame left whole frames grey. So does an indirect draw
     // (its size unknown here). What may go without is geometry, which shows a frame later.
-    constexpr u32 FullScreenIndices = 12;
+    static const bool env_async_full_screen = [] {
+        const char* env = std::getenv("BB_ASYNC_FULL_SCREEN");
+        return env && env[0] == '1';
+    }();
+    const u32 FullScreenIndices = env_async_full_screen ? 3u : (!BbToggle::Disabled(BbToggle::AsyncFullScreenTuning) ? 6u : 12u);
     if (indirect || selection.regs->num_indices <= FullScreenIndices) {
         return false;
     }
@@ -1130,7 +1166,9 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         const auto perm_hash = HashCombine(params.hash, 0);
 
         RegisterShaderMeta(new_program->info, spec.fetch_shader_data, spec, perm_hash, 0);
-        new_program->AddPermut(module, std::move(spec));
+        const u64 flat_hash = XXH3_64bits(new_program->info.flattened_ud_buf.data(),
+                                          new_program->info.flattened_ud_buf.size() * sizeof(u32));
+        new_program->AddPermut(module, std::move(spec), flat_hash);
         new_program->info_template = std::make_unique<Shader::Info>(new_program->info);
         Program* program = new_program.get();
         {
@@ -1172,7 +1210,9 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         std::unique_lock lk{programs_mutex};
-        program->AddPermut(module, std::move(spec));
+        const u64 flat_hash = XXH3_64bits(info.flattened_ud_buf.data(),
+                                          info.flattened_ud_buf.size() * sizeof(u32));
+        program->AddPermut(module, std::move(spec), flat_hash);
     } else {
         info.AddBindings(binding);
         module = it->module;

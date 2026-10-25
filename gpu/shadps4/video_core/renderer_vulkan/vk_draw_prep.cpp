@@ -270,7 +270,10 @@ void DrawPreparation::BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg
     }
     // Idle helpers can starve on a busy CPU. Rather than queueing without bound, restart
     // them from the GPU thread's own state (one register copy) once the scanner lags.
-    constexpr u64 MaxScanLag = 64;
+    static const u64 MaxScanLag = [] {
+        const char* env = std::getenv("BB_PREP_SCAN_LAG");
+        return env && *env ? static_cast<u64>(std::strtoull(env, nullptr, 10)) : 16ull;
+    }();
     if (!submissions.empty() && seq > tail_seq + MaxScanLag &&
         submissions.front()->seq < seq && !submissions.front()->scanned.load()) {
         *tail_regs = regs;

@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <utility>
 #include <boost/container/small_vector.hpp>
+#include <mutex>
+#include <tsl/robin_map.h>
+#include "bbport_toggles.h"
 
 #include "common/assert.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
@@ -17,6 +20,18 @@
 namespace Vulkan {
 
 using Shader::Backend::SPIRV::AuxShaderType;
+
+static std::mutex aux_modules_mutex;
+static tsl::robin_map<u64, vk::UniqueShaderModule> aux_tcs_cache;
+static tsl::robin_map<u64, vk::UniqueShaderModule> aux_tes_cache;
+static tsl::robin_map<u64, vk::UniqueShaderModule> aux_frag_cache;
+
+void ClearAuxShaderCaches() {
+    std::scoped_lock lock{aux_modules_mutex};
+    aux_tcs_cache.clear();
+    aux_tes_cache.clear();
+    aux_frag_cache.clear();
+}
 
 static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eFragment,
@@ -199,7 +214,28 @@ GraphicsPipeline::GraphicsPipeline(
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationControl,
-            .module = CompileSPV(sdata.tcs, instance.GetDevice()),
+            .module = [&]() {
+                if (BbToggle::Disabled(BbToggle::AuxTessCache)) {
+                    return CompileSPV(sdata.tcs, instance.GetDevice());
+                }
+                const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+                u64 key = static_cast<u64>(type) |
+                          (static_cast<u64>(fs_info.clip_distance_emulation) << 8) |
+                          (static_cast<u64>(fs_info.num_inputs) << 16);
+                key ^= XXH3_64bits(fs_info.inputs.data(), fs_info.num_inputs * sizeof(fs_info.inputs[0]));
+                std::scoped_lock lock{aux_modules_mutex};
+                auto it = aux_tcs_cache.find(key);
+                if (it == aux_tcs_cache.end()) {
+                    const vk::ShaderModuleCreateInfo shader_info = {
+                        .codeSize = sdata.tcs.size() * sizeof(u32),
+                        .pCode = sdata.tcs.data(),
+                    };
+                    auto [res, mod] = instance.GetDevice().createShaderModuleUnique(shader_info);
+                    ASSERT_MSG(res == vk::Result::eSuccess, "Failed to compile SPIR-V shader: {}", vk::to_string(res));
+                    it = aux_tcs_cache.emplace(key, std::move(mod)).first;
+                }
+                return *it->second;
+            }(),
             .pName = "main",
         });
     }
@@ -218,7 +254,28 @@ GraphicsPipeline::GraphicsPipeline(
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationEvaluation,
-            .module = CompileSPV(sdata.tes, instance.GetDevice()),
+            .module = [&]() {
+                if (BbToggle::Disabled(BbToggle::AuxTessCache)) {
+                    return CompileSPV(sdata.tes, instance.GetDevice());
+                }
+                const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+                u64 key = static_cast<u64>(AuxShaderType::PassthroughTES) |
+                          (static_cast<u64>(fs_info.clip_distance_emulation) << 8) |
+                          (static_cast<u64>(fs_info.num_inputs) << 16);
+                key ^= XXH3_64bits(fs_info.inputs.data(), fs_info.num_inputs * sizeof(fs_info.inputs[0]));
+                std::scoped_lock lock{aux_modules_mutex};
+                auto it = aux_tes_cache.find(key);
+                if (it == aux_tes_cache.end()) {
+                    const vk::ShaderModuleCreateInfo shader_info = {
+                        .codeSize = sdata.tes.size() * sizeof(u32),
+                        .pCode = sdata.tes.data(),
+                    };
+                    auto [res, mod] = instance.GetDevice().createShaderModuleUnique(shader_info);
+                    ASSERT_MSG(res == vk::Result::eSuccess, "Failed to compile SPIR-V shader: {}", vk::to_string(res));
+                    it = aux_tes_cache.emplace(key, std::move(mod)).first;
+                }
+                return *it->second;
+            }(),
             .pName = "main",
         });
     }
@@ -237,7 +294,25 @@ GraphicsPipeline::GraphicsPipeline(
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eFragment,
-            .module = CompileSPV(sdata.fragment, instance.GetDevice()),
+            .module = [&]() {
+                if (BbToggle::Disabled(BbToggle::AuxTessCache)) {
+                    return CompileSPV(sdata.fragment, instance.GetDevice());
+                }
+                const auto& vs = runtime_infos[static_cast<u32>(Shader::SwStage::Vertex)].hw.vs;
+                const u64 key = XXH3_64bits(vs.outputs.data(), vs.outputs.size() * sizeof(vs.outputs[0]));
+                std::scoped_lock lock{aux_modules_mutex};
+                auto it = aux_frag_cache.find(key);
+                if (it == aux_frag_cache.end()) {
+                    const vk::ShaderModuleCreateInfo shader_info = {
+                        .codeSize = sdata.fragment.size() * sizeof(u32),
+                        .pCode = sdata.fragment.data(),
+                    };
+                    auto [res, mod] = instance.GetDevice().createShaderModuleUnique(shader_info);
+                    ASSERT_MSG(res == vk::Result::eSuccess, "Failed to compile SPIR-V shader: {}", vk::to_string(res));
+                    it = aux_frag_cache.emplace(key, std::move(mod)).first;
+                }
+                return *it->second;
+            }(),
             .pName = "main",
         });
     }

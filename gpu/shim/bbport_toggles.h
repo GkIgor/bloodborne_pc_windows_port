@@ -63,7 +63,10 @@ enum : std::uint64_t {
     // On by default (bit set: off): history of a thin feature this jitter phase missed is kept
     // when nothing moves. Static-camera flicker of railings/window bars p99.9 -45% (2026-10-03).
     TaaKeepNearerHistory = 1ull << 55,
+    AuxTessCache = 1ull << 56, ///< caches auxiliary tess/clip shader modules across pipelines
     SceneMipBias = 1ull << 57, ///< negative LOD bias of G-buffer samplers at reduced scene sizes
+    AsyncFullScreenTuning = 1ull << 58, ///< lower full-screen index threshold (12 -> 6) for async compile
+    FlatHashValidation = 1ull << 59, ///< fast hash check on flattened user-data before memcmp
     /// Scene textures use BB_ANISO (16) times anisotropic filtering instead of the game's
     /// ratio; bit set: the game's own samplers (A/B while the game runs).
     ForcedAniso = 1ull << 61,
