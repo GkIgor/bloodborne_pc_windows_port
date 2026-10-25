@@ -40,10 +40,12 @@ constexpr uint64_t kPs4Base = 0x400000;
 // player.  In the 1 Hit Kill code cave the PS4-relative displacement resolves to
 // `image_base - 0x3FC000` in this port.  Derive the scratch address from the live image
 // base instead of hardcoding it, so the master's absolute store and the code cave's
-// RIP-relative read always agree.  Do not NOP the store: 1 Hit Kill depends on it.
+// RIP-relative read always agree.  If that address is not free, a private page within
+// +/-1 GiB of the code cave is used instead and both references are retargeted.  Do not
+// NOP the store: 1 Hit Kill depends on it.
 constexpr uint64_t kJsonScratchDelta = 0x3FC000;
 constexpr size_t kJsonScratchRegionSize = 0x10000;
-uint64_t g_json_scratch = 0; ///< image_base - kJsonScratchDelta, set when the image is ready
+uint64_t g_json_scratch = 0; ///< image_base - kJsonScratchDelta, or a fallback page
 
 struct Write {
     uint64_t offset = 0;
@@ -152,6 +154,181 @@ size_t PageSize() {
     return page;
 }
 
+#ifdef _WIN32
+// Keep the JSON master's absolute store and the 1 Hit Kill cave's RIP-relative read in
+// sync.  The cave instruction is `48 3B 1D <disp32>` at image offset 0x50DB862; its next
+// instruction is at 0x50DB869.
+constexpr uint64_t kOneHitScratchWrite = 0x50DB852;
+constexpr size_t kOneHitScratchDisp = 0x13;
+constexpr uint64_t kOneHitScratchNext = 0x50DB869;
+
+bool PatchOneHitKillScratch(uint64_t scratch) {
+    const int64_t next = static_cast<int64_t>(g_image_base + kOneHitScratchNext);
+    const int64_t rel = static_cast<int64_t>(scratch) - next;
+    if (rel < -2147483648LL || rel > 2147483647LL) return false;
+    const int32_t disp = static_cast<int32_t>(rel);
+    for (auto& cheat : g_cheats) {
+        for (auto& write : cheat.writes) {
+            if (write.offset != kOneHitScratchWrite ||
+                write.on.size() < kOneHitScratchDisp + sizeof(disp)) {
+                continue;
+            }
+            if (write.on[kOneHitScratchDisp - 3] != 0x48 ||
+                write.on[kOneHitScratchDisp - 2] != 0x3B ||
+                write.on[kOneHitScratchDisp - 1] != 0x1D) {
+                return false;
+            }
+            std::memcpy(write.on.data() + kOneHitScratchDisp, &disp, sizeof(disp));
+            return true;
+        }
+    }
+    // No 1 Hit Kill code cave in this table: nothing reads the scratch page through a
+    // RIP-relative displacement, so the master's absolute store is the only user.
+    return true;
+}
+
+// Allocate a private scratch page within the signed 32-bit reach of the 1 Hit Kill read.
+// Only free granules are used: placeholders and foreign reservations must never be committed
+// with plain VirtualAlloc, which is what caused ERROR_INVALID_ADDRESS (487).
+
+using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
+
+VirtualAlloc2Fn VirtualAlloc2Proc() {
+    static const VirtualAlloc2Fn fn = [] {
+        HMODULE kernel = GetModuleHandleW(L"kernelbase.dll");
+        if (!kernel) kernel = GetModuleHandleW(L"kernel32.dll");
+        return kernel ? reinterpret_cast<VirtualAlloc2Fn>(
+                            reinterpret_cast<void*>(GetProcAddress(kernel, "VirtualAlloc2")))
+                      : nullptr;
+    }();
+    return fn;
+}
+
+// Last resort: the host address space inside the cave's reach is fully reserved.  That
+// happens when the image loads at the base of the guest low map (0x0800000000) and a large
+// host allocation covers everything below it: the derived page, the whole 2 GiB below and
+// the guest placeholder above are all taken.  The guest low map belongs to the port, so
+// replace one 64 KiB granule near the top of the reach with a private page.
+// runtime_low_map() advances to the next address when a mapping fails, so the guest only
+// loses that one granule of address space.
+bool AllocateJsonScratchInGuestSpace(uint64_t* out) {
+    VirtualAlloc2Fn const alloc2 = VirtualAlloc2Proc();
+    if (!alloc2 || !out || !g_image_base || !g_image_size) return false;
+    // Only carve inside the guest low map ([0x0800000000, 0x1000000000)); anything outside
+    // it belongs to the host and must not be touched.
+    constexpr uintptr_t kGuestLowMin = 0x0800000000;
+    constexpr uintptr_t kGuestLowMax = 0x1000000000;
+    constexpr uintptr_t kGranule = 0x10000;
+    constexpr uintptr_t kReach = 0x7FFF0000;
+    if (static_cast<uintptr_t>(g_image_base) < kGuestLowMin) return false;
+    const uintptr_t next = static_cast<uintptr_t>(g_image_base + kOneHitScratchNext);
+    const uintptr_t image_end =
+        (static_cast<uintptr_t>(g_image_base) + static_cast<uintptr_t>(g_image_size) +
+         kGranule - 1) & ~(kGranule - 1);
+    uintptr_t cursor = (next + kReach) & ~(kGranule - 1);
+    if (cursor + kGranule > kGuestLowMax) cursor = (kGuestLowMax - kGranule) & ~(kGranule - 1);
+    for (int guard = 0; guard < 64; ++guard) {
+        if (cursor <= image_end || cursor < kGuestLowMin) return false;
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info))) return false;
+        const uintptr_t region_base = reinterpret_cast<uintptr_t>(info.BaseAddress);
+        const uintptr_t region_end = region_base + static_cast<uintptr_t>(info.RegionSize);
+        if (info.State == MEM_RESERVE && region_end > cursor &&
+            region_end - cursor >= kGranule) {
+            // A placeholder must be split to the exact range before it can be replaced.
+            // MEM_PRESERVE_PLACEHOLDER also proves this reservation is a placeholder: it
+            // fails on a normal reservation, and we then leave it alone.
+            if (VirtualFree(reinterpret_cast<void*>(cursor), region_end - cursor,
+                            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                MEMORY_BASIC_INFORMATION tail{};
+                const uintptr_t after = cursor + kGranule;
+                if (VirtualQuery(reinterpret_cast<void*>(after), &tail, sizeof(tail))) {
+                    VirtualFree(reinterpret_cast<void*>(after),
+                                static_cast<uintptr_t>(tail.RegionSize),
+                                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                    void* const page =
+                        alloc2(GetCurrentProcess(), reinterpret_cast<void*>(cursor), kGranule,
+                               MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                               PAGE_READWRITE, nullptr, 0);
+                    if (page == reinterpret_cast<void*>(cursor)) {
+                        std::memset(page, 0, kGranule);
+                        *out = static_cast<uint64_t>(cursor);
+                        return true;
+                    }
+                }
+            }
+        }
+        if (region_base <= image_end) return false;
+        cursor = (region_base - 1) & ~(kGranule - 1);
+    }
+    return false;
+}
+
+bool AllocateJsonScratchNearImage(uint64_t* out) {
+    if (!out || !g_image_base || !g_image_size) return false;
+    constexpr uintptr_t kGranule = 0x10000;
+    // The cave encodes a signed 32-bit RIP displacement; keep a margin below INT32_MAX.
+    constexpr uintptr_t kReach = 0x7FFF0000;
+    const uintptr_t next = static_cast<uintptr_t>(g_image_base + kOneHitScratchNext);
+    const uintptr_t lower = next > kReach ? next - kReach : kGranule;
+    const uintptr_t upper = next + kReach;
+    const uintptr_t image_end =
+        (static_cast<uintptr_t>(g_image_base) + static_cast<uintptr_t>(g_image_size) +
+         kGranule - 1) & ~(kGranule - 1);
+
+    auto try_at = [&](uintptr_t address) -> bool {
+        if (address < lower || address > upper || (address & (kGranule - 1))) return false;
+        void* const page = VirtualAlloc(reinterpret_cast<void*>(address),
+                                        kJsonScratchRegionSize,
+                                        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!page) return false;
+        if (page != reinterpret_cast<void*>(address)) {
+            VirtualFree(page, 0, MEM_RELEASE);
+            return false;
+        }
+        std::memset(page, 0, kJsonScratchRegionSize);
+        *out = static_cast<uint64_t>(address);
+        return true;
+    };
+
+    // Walk whole regions with VirtualQuery instead of probing a fixed strip of granules: the
+    // derived page can sit inside a large placeholder/reservation, and the whole 2 GiB reach
+    // may be needed before a free granule appears.  Only MEM_FREE regions are considered.
+    auto scan = [&](uintptr_t cursor, bool downward) -> bool {
+        for (int guard = 0; guard < 8192; ++guard) {
+            cursor = downward ? (cursor & ~(kGranule - 1))
+                              : ((cursor + kGranule - 1) & ~(kGranule - 1));
+            if (cursor < lower || cursor > upper) return false;
+            MEMORY_BASIC_INFORMATION info{};
+            if (!VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info))) {
+                return false;
+            }
+            const uintptr_t region_base = reinterpret_cast<uintptr_t>(info.BaseAddress);
+            const uintptr_t region_end = region_base + static_cast<uintptr_t>(info.RegionSize);
+            if (info.State == MEM_FREE && region_end > cursor &&
+                region_end - cursor >= kGranule) {
+                if (try_at(cursor)) return true;
+            }
+            if (downward) {
+                if (region_base <= lower) return false;
+                cursor = region_base - kGranule;
+            } else {
+                if (region_end >= upper) return false;
+                cursor = region_end;
+            }
+        }
+        return false;
+    };
+
+    // The original address is the granule containing image_base - 0x3FC000.  Walk down
+    // first: it is normally adjacent to the image.  If the image is boxed in, try above it.
+    const uintptr_t original = static_cast<uintptr_t>(g_json_scratch);
+    if (original && scan(original, true)) return true;
+    if (scan(image_end, false)) return true;
+    return AllocateJsonScratchInGuestSpace(out);
+}
+#endif
+
 // Reserve the scratch page that the JSON master and the 1 Hit Kill code cave share.  This
 // runs before the cheat table is validated, so the validator accepts the two PS4-derived
 // references instead of disabling the patch.
@@ -162,33 +339,18 @@ bool EnsureJsonScratchLocked() {
         return false;
     }
 #ifdef _WIN32
-    auto* const target = reinterpret_cast<void*>(static_cast<uintptr_t>(g_json_scratch));
+    void* target = reinterpret_cast<void*>(static_cast<uintptr_t>(g_json_scratch));
     MEMORY_BASIC_INFORMATION info{};
     if (!VirtualQuery(target, &info, sizeof(info))) {
         g_status = "Could not query the JSON scratch page.";
         return false;
     }
-    // Do not take over a page that is already committed by the host or a module.  The
-    // address is below the guest low-map reservation (0x0800000000), so it is free in a
-    // normal session; if it is not, fail closed instead of corrupting unrelated memory.
-    if (info.State == MEM_COMMIT) {
-        g_status = "The JSON scratch address is already in use.";
-        return false;
-    }
-    if (info.Type == MEM_IMAGE || info.Type == MEM_MAPPED) {
-        g_status = "The JSON scratch address belongs to a loaded image.";
-        return false;
-    }
-    if (info.State == MEM_RESERVE) {
-        if (!VirtualAlloc(target, PageSize(), MEM_COMMIT, PAGE_READWRITE)) {
-            char text[192];
-            std::snprintf(text, sizeof(text),
-                          "Could not commit the JSON scratch page (Win32 error %lu).",
-                          static_cast<unsigned long>(GetLastError()));
-            g_status = text;
-            return false;
-        }
-    } else {
+    // A MEM_RESERVE page may be a VirtualAlloc2 placeholder (the guest address space) or
+    // another component's reservation.  Plain VirtualAlloc(MEM_COMMIT) cannot commit those
+    // and returns ERROR_INVALID_ADDRESS.  Only commit a genuinely free range; otherwise
+    // allocate a private page near the 1 Hit Kill cave and retarget both references.
+    bool have_page = false;
+    if (info.State == MEM_FREE) {
         // The target is page-aligned but not allocation-granularity aligned.  Reserve the
         // containing 64 KiB granule, then commit it read/write.
         const uintptr_t region_base =
@@ -196,17 +358,28 @@ bool EnsureJsonScratchLocked() {
         void* const region = VirtualAlloc(reinterpret_cast<void*>(region_base),
                                           kJsonScratchRegionSize,
                                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (!region) {
+        if (region) {
+            std::memset(region, 0, kJsonScratchRegionSize);
+            have_page = true;
+        }
+        // The page is free but its granule is partly taken: use a private page instead.
+    }
+    if (!have_page) {
+        if (!AllocateJsonScratchNearImage(&g_json_scratch)) {
             char text[192];
             std::snprintf(text, sizeof(text),
-                          "Could not reserve the JSON scratch page at 0x%llX "
-                          "(Win32 error %lu).",
-                          static_cast<unsigned long long>(g_json_scratch),
-                          static_cast<unsigned long>(GetLastError()));
+                          "The JSON scratch address is occupied and no free page was found "
+                          "within 2 GB of image 0x%llX.",
+                          static_cast<unsigned long long>(g_image_base));
             g_status = text;
             return false;
         }
-        std::memset(region, 0, kJsonScratchRegionSize);
+        target = reinterpret_cast<void*>(static_cast<uintptr_t>(g_json_scratch));
+    }
+
+    if (!PatchOneHitKillScratch(g_json_scratch)) {
+        g_status = "Could not retarget the JSON scratch reference.";
+        return false;
     }
 
     MEMORY_BASIC_INFORMATION verify{};
