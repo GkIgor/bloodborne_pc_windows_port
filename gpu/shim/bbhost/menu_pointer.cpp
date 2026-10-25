@@ -136,6 +136,7 @@ constexpr std::uint8_t kVisible = 0x40;
 constexpr std::size_t kGetBounds = 0x1f0;
 
 std::uint64_t g_slide = 0;
+std::uint64_t g_image_size = 0;
 bool g_log = false;
 // BBHOST_POINTER=0: the hook stays in and still reports focus (the camera
 // needs it) but never moves a cursor - for telling the game's own behaviour
@@ -173,6 +174,13 @@ bool guest_code(std::uint64_t addr) {
     }
     std::uint8_t p[4] = {};
     return safe_read(addr, p, sizeof(p)) && p[0] == 0x55 && p[1] == 0x48 && p[2] == 0x89 && p[3] == 0xe5;
+}
+
+// bbport: a vtable slot in the eboot's code, prologue or not. A std::function's call slot is
+// often a frameless thunk - the inventory item list's (0x1f128f0) opens with mov rax,[rdi+8].
+bool guest_slot(std::uint64_t vtable, std::size_t off, std::uint64_t* fn) {
+    return vtable >= g_slide && vtable + off + 8 <= g_slide + g_image_size &&
+           safe_read(vtable + off, fn, sizeof(*fn)) && *fn >= guest(0x400000) && *fn < guest(kExecEnd);
 }
 
 std::int64_t now_ms() {
@@ -719,8 +727,7 @@ void pointer_step(std::uint8_t* c, const std::uint8_t* input) {
     // What sub_1ecff30 does once it sees the index change.
     const auto listener = field<std::uint64_t>(c, kListener);
     std::uint64_t lvt = 0, call = 0;
-    if (listener && safe_read(listener, &lvt, sizeof(lvt)) && safe_read(lvt + 0x10, &call, sizeof(call)) &&
-        guest_code(call)) {
+    if (listener && safe_read(listener, &lvt, sizeof(lvt)) && guest_slot(lvt, 0x10, &call)) {
         std::int32_t index = now;
         hle_call_guest(ptr(call), ptr(listener), &index);
     }
@@ -755,6 +762,7 @@ GUEST_ABI void pc_list_update(std::uint8_t* comp, std::uint8_t* input) {
 
 void menu_pointer_install(ElfImage* image) {
     g_slide = image->mem.slide;
+    g_image_size = image->mem.size;
     g_log = [] {
         const char* e = std::getenv("BBHOST_POINTER_LOG");
         return e && e[0] == '1';
