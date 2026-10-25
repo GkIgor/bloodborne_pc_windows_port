@@ -669,6 +669,10 @@ void pointer_step(std::uint8_t* c, const std::uint8_t* input) {
     if (!moved && !click) {
         return;
     }
+    if (host_wheel_holds_cursor()) {
+        refused("the wheel holds the cursor");
+        return;
+    }
     if (direction_held()) {
         refused("a direction is held");
         return;

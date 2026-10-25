@@ -99,6 +99,38 @@ void clear_pulses() {
     g_pulse_held = 0;
 }
 
+bool pulses_pending() {
+    std::scoped_lock lock{g_pulse_lock};
+    return g_pulse_held || !g_pulses.empty();
+}
+
+// From a wheel notch the wheel owns the cursor, so a hand moving while it scrolls cannot
+// re-target a row. Once the wheel has been idle for kWheelIdleMs, moving the pointer
+// kWheelReleasePx (stage pixels) from where it then was, or a click, hands it back.
+constexpr float kWheelReleasePx = 10.0f;
+constexpr std::int64_t kWheelIdleMs = 400;
+std::atomic<bool> g_wheel_holds{false};
+// Window thread only.
+float g_wheel_x = 0.0f, g_wheel_y = 0.0f;
+std::int64_t g_wheel_ms = 0;
+
+bool pointer_log() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_POINTER_LOG");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+void release_wheel(const char* why) {
+    if (g_wheel_holds.exchange(false)) {
+        clear_pulses();
+        if (pointer_log()) {
+            host_log("pointer: the wheel releases the cursor (%s)", why);
+        }
+    }
+}
+
 std::uint64_t guest_at(std::uint64_t bn) {
     return g_image_base + (bn - kPreferredGuestSlide);
 }
@@ -205,6 +237,10 @@ bool host_text_entry_open() {
     return bbgpu_text_input_is_active() != 0;
 }
 
+bool host_wheel_holds_cursor() {
+    return g_wheel_holds.load(std::memory_order_relaxed);
+}
+
 // ---- The window's side ----
 
 namespace BbMenuPointer {
@@ -217,6 +253,17 @@ bool Active() {
 void NoteMouse(float x, float y) {
     g_mouse_x.store(x, std::memory_order_relaxed);
     g_mouse_y.store(y, std::memory_order_relaxed);
+    float sx = 0.0f, sy = 0.0f;
+    if (!g_wheel_holds.load(std::memory_order_relaxed) || !host_mouse_stage_position(sx, sy)) {
+        return;
+    }
+    if (now_ms() - g_wheel_ms < kWheelIdleMs || pulses_pending()) {
+        g_wheel_x = sx;
+        g_wheel_y = sy;
+    } else if ((sx - g_wheel_x) * (sx - g_wheel_x) + (sy - g_wheel_y) * (sy - g_wheel_y) >
+               kWheelReleasePx * kWheelReleasePx) {
+        release_wheel("pointer moved");
+    }
 }
 
 void NoteWindow(int width, int height, bool focused, bool inside, bool relative) {
@@ -232,6 +279,7 @@ void NoteDevice(bool pad) {
 }
 
 void Click() {
+    release_wheel("click");
     menu_pointer_click();
 }
 
@@ -240,9 +288,20 @@ void Back() {
 }
 
 void Wheel(float notches) {
-    if (notches != 0.0f) {
-        push_pulse(notches > 0.0f ? kPadUp : kPadDown);
+    if (notches == 0.0f) {
+        return;
     }
+    if (host_mouse_stage_position(g_wheel_x, g_wheel_y)) {
+        g_wheel_ms = now_ms();
+        if (!g_wheel_holds.exchange(true) && pointer_log()) {
+            host_log("pointer: the wheel holds the cursor");
+        }
+    }
+    push_pulse(notches > 0.0f ? kPadUp : kPadDown);
+}
+
+bool WheelHoldsCursor() {
+    return g_wheel_holds.load(std::memory_order_relaxed);
 }
 
 bool RightClickSwitchesPages() {
@@ -294,6 +353,7 @@ extern "C" uint32_t bbgpu_menu_pointer_buttons(uint32_t buttons, uint8_t lx, uin
     }
     const std::uint32_t press = menu_pointer_take_press();
     if (!BbMenuPointer::Active()) {
+        g_wheel_holds.store(false, std::memory_order_relaxed);
         clear_pulses();
         return 0;
     }

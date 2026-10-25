@@ -84,6 +84,8 @@ bool host_mouse_relative();
 void host_mouse_describe(char* out, std::size_t n);
 bool host_options_open();
 bool host_text_entry_open();
+// bbport: the wheel is stepping the cursor; a hover would fight it.
+bool host_wheel_holds_cursor();
 
 // bbhost features this port does not have: its own host menu, the debug menu's controller and
 // the native PC option rows.

@@ -12,7 +12,8 @@ The mouse as a pointer in the game's menus:
   hover on movement, click handling (decide, slider arrows, combo box sides, spinners),
   region-aware confirmation and the front-end/open-menu checks. bbport changes: a list's
   cursor listener is called when its vtable slot is in the eboot's code even without a frame
-  prologue (the inventory's is a thunk, so hover never refreshed its item details).
+  prologue (the inventory's is a thunk, so hover never refreshed its item details), and hover
+  yields while the wheel holds the cursor (`host_wheel_holds_cursor`).
 - `gpu/shim/bbhost/compat.h` declares the parts of bbhost's host interface that file uses
   (guest memory and calls, logging, pad, mouse, settings) with bbhost's signatures; features this
   port lacks (bbhost's host menu, debug-menu controller, native PC option rows) are stubs.
