@@ -195,19 +195,19 @@ bool WindowSDL::PollEvents() {
             continue;
         }
         bool event_handled = false;
-        if (event.type == SDL_EVENT_MOUSE_MOTION || event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
-            event.type == SDL_EVENT_MOUSE_BUTTON_UP || event.type == SDL_EVENT_MOUSE_WHEEL) {
-            last_mouse_motion_ms.store(SDL_GetTicks(), std::memory_order_relaxed);
-            mouse_input_seen.store(true, std::memory_order_relaxed);
-            if (mouse_cursor_hidden) {
-                SDL_ShowCursor();
-                mouse_cursor_hidden = false;
-            }
-        }
         if (event.type == SDL_EVENT_MOUSE_MOTION) {
             BbMenuPointer::NoteMouse(event.motion.x, event.motion.y);
         } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
             BbMenuPointer::NoteMouse(event.button.x, event.button.y);
+        }
+        if (event.type == SDL_EVENT_MOUSE_MOTION || event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+            event.type == SDL_EVENT_MOUSE_BUTTON_UP || event.type == SDL_EVENT_MOUSE_WHEEL) {
+            last_mouse_motion_ms.store(SDL_GetTicks(), std::memory_order_relaxed);
+            mouse_input_seen.store(true, std::memory_order_relaxed);
+            if (mouse_cursor_hidden && !(pointer_menu && BbMenuPointer::WheelHoldsCursor())) {
+                SDL_ShowCursor();
+                mouse_cursor_hidden = false;
+            }
         }
         if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
             (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && std::abs(event.gaxis.value) > 8000)) {
@@ -348,6 +348,18 @@ bool WindowSDL::PollEvents() {
                 mouse_cursor_hidden = true;
             }
         } else if (mouse_cursor_hidden) {
+            SDL_ShowCursor();
+            mouse_cursor_hidden = false;
+        }
+    }
+
+    const bool wheel_hold = pointer_menu && !relative_mouse_active && BbMenuPointer::WheelHoldsCursor();
+    if (wheel_hold && !mouse_cursor_hidden) {
+        SDL_HideCursor();
+        mouse_cursor_hidden = wheel_cursor_hidden = true;
+    } else if (!wheel_hold && wheel_cursor_hidden) {
+        wheel_cursor_hidden = false;
+        if (mouse_cursor_hidden && !relative_mouse_active) {
             SDL_ShowCursor();
             mouse_cursor_hidden = false;
         }

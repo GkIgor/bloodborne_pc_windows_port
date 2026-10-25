@@ -19,6 +19,9 @@ void NoteDevice(bool pad);
 void Click();
 void Back();
 void Wheel(float notches);
+/// The wheel is stepping the cursor: hover is off and the window hides the cursor until a click,
+/// or the pointer moving once the wheel has gone idle.
+bool WheelHoldsCursor();
 
 /// Item Storage's item list has focus and right click is bound to L2, which switches its pages.
 bool RightClickSwitchesPages();
