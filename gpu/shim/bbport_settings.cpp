@@ -264,6 +264,9 @@ void Load() {
         std::fclose(file);
         std::printf("Settings: %s\n", Path());
     }
+    if (const char* env = std::getenv("BB_SHARPNESS_DEFAULT")) {
+        v.sharpness = Clamp(std::strtof(env, nullptr), 0.0f, 2.0f);
+    }
     // Environment overrides (scripts, A/B tests).
     if (const char* env = std::getenv("BB_UPSCALER")) {
         v.upscaler = UpscalerOff;

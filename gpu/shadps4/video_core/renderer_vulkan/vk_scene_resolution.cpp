@@ -57,15 +57,28 @@ bool SceneTargets::Blittable(vk::Format format) const {
 }
 bool SceneTargets::ShaderResampled(const VideoCore::Image& image) const {
     const auto format = image.backing->image.image_ci.format;
-    if (!image.info.props.is_depth || (Blittable(format) && !force_stencil_bits)) return false;
+    if (!image.info.props.is_depth) return false;
+    const bool stencil = bool(image.aspect_mask & vk::ImageAspectFlagBits::eStencil);
+    if (stencil) {
+        if (Blittable(format) && !force_stencil_bits) return false;
+        const auto features = Features(format);
+        const auto required = vk::FormatFeatureFlagBits::eSampledImage |
+                              vk::FormatFeatureFlagBits::eDepthStencilAttachment;
+        return (features & required) == required &&
+               (instance.IsShaderStencilExportSupported() || force_stencil_bits);
+    }
+    // bbport: conservative 2x2 min-filter for forward-Z depth proxies (Audit U3).
+    if (BbToggle::Disabled(BbToggle::DepthMinFilter)) {
+        if (Blittable(format)) return false;
+    }
     const auto features = Features(format);
     const auto required = vk::FormatFeatureFlagBits::eSampledImage |
                           vk::FormatFeatureFlagBits::eDepthStencilAttachment;
     // Without shader stencil export (e.g. Pascal) depth/stencil stays native: the eight-draw
     // stencil resampler costs too much on such GPUs. BB_SCENE_STENCIL_BITS=1 forces it (tests).
-    return (features & required) == required &&
-           (!(image.aspect_mask & vk::ImageAspectFlagBits::eStencil) ||
-            instance.IsShaderStencilExportSupported() || force_stencil_bits);
+    return (features & required) == required;
+
+
 }
 // 1 for the scene size, 2 for half resolution (the game's post-processing chain), else 0.
 // Half resolution needs a scene size that halves exactly: the proxy keeps the scene's factor,
@@ -178,7 +191,7 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
         const auto& proxy = e.image.image_ci.extent;
         Resample(src, dst, original,
                  to_native ? vk::Extent2D{original.info.size.width, original.info.size.height}
-                           : vk::Extent2D{proxy.width, proxy.height});
+                           : vk::Extent2D{proxy.width, proxy.height}, !to_native);
         // (Depth proxies are single-level: Eligible.)
         if (to_native) e.state.Resolved(); else e.state.CopiedToProxy();
         copying = false;
@@ -219,7 +232,7 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
     copying = false;
 }
 void SceneTargets::Resample(vk::Image src, vk::Image dst, const VideoCore::Image& original,
-                            vk::Extent2D dst_size) {
+                            vk::Extent2D dst_size, bool downscale) {
     const auto device = instance.GetDevice();
     const auto format = original.backing->image.image_ci.format;
     const bool stencil = bool(original.aspect_mask & vk::ImageAspectFlagBits::eStencil);
@@ -289,9 +302,11 @@ void SceneTargets::Resample(vk::Image src, vk::Image dst, const VideoCore::Image
                 cmd.pushConstants(layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(bit), &bit);
                 cmd.setStencilWriteMask(vk::StencilFaceFlagBits::eFrontAndBack, bit);
                 cmd.setStencilReference(vk::StencilFaceFlagBits::eFrontAndBack, bit);
-                cmd.draw(3, 1, 0, 0);
+            cmd.draw(3, 1, 0, 0);
             }
         } else {
+            const u32 mode = downscale ? 1u : 0u;
+            cmd.pushConstants(layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(mode), &mode);
             cmd.draw(3, 1, 0, 0);
         }
         cmd.endRendering();

@@ -1741,8 +1741,8 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         // Include every stream: identical position buffers can be paired with different
         // skinning/instance data. Index topology and base offsets are matched separately.
         motion_geometry = ready ? ready->buffers_hash
-                                : XXH3_64bits(guest_buffers.data(),
-                                              guest_buffers.size() * sizeof(AmdGpu::Buffer));
+                                : HashBufferDescriptors(guest_buffers.data(), guest_buffers.size());
+
     }
     // Object motion research: vertex streams of G-buffer draws.
     if (FrameCapture::Active() && gbuffer_draw) {

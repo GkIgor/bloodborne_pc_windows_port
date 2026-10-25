@@ -622,8 +622,13 @@ struct Upscaler::Impl {
         mlsr.inv_scale[1] = 1.0f / mlsr.scale[1];
         mlsr.jitter[0] = f.jitter[0];
         mlsr.jitter[1] = f.jitter[1];
-        mlsr.mv_scale[0] = f.motion_scale[0] / float(rw);
-        mlsr.mv_scale[1] = f.motion_scale[1] / float(rh);
+        static const bool mv_uv = [] {
+            const char* env = std::getenv("BB_FSR411_MV_UV");
+            return !env || env[0] != '0';
+        }();
+        mlsr.mv_scale[0] = mv_uv ? f.motion_scale[0] / float(rw) : f.motion_scale[0];
+        mlsr.mv_scale[1] = mv_uv ? f.motion_scale[1] / float(rh) : f.motion_scale[1];
+
         mlsr.tex_size[0] = mlsr.max_render_size[0] = float(ow);
         mlsr.tex_size[1] = mlsr.max_render_size[1] = float(oh);
         mlsr.width = ow;

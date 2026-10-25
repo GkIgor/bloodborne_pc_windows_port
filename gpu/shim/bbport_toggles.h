@@ -43,6 +43,7 @@ enum : std::uint64_t {
     PendingFenceWaits = 1ull << 39,
     PipelinedDispatch = 1ull << 40,
     RecorderFences = 1ull << 41,
+    StableMotionHash = 1ull << 41, ///< zero base_address when hashing AmdGpu::Buffer for motion geometry
     PipelinedMemoryWrites = 1ull << 42,
     MultiCopyShader = 1ull << 43,
     RenderStateMemo = 1ull << 44,
@@ -71,6 +72,8 @@ enum : std::uint64_t {
     /// Scene textures use BB_ANISO (16) times anisotropic filtering instead of the game's
     /// ratio; bit set: the game's own samplers (A/B while the game runs).
     ForcedAniso = 1ull << 61,
+    DepthMinFilter = 1ull << 62, ///< conservative 2x2 min-filter for forward-Z depth downsampling
+    TaaDefaults = 1ull << 63, ///< modern TAA defaults: YCoCg variance clipping, tonemap blend, 3x3 filter
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {

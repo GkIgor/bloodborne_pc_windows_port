@@ -27,6 +27,8 @@
 #include "common/types.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "bbport_toggles.h"
+#include <xxhash.h>
 
 namespace Vulkan {
 
@@ -62,6 +64,28 @@ inline u64 ImageDescHash(const AmdGpu::Image& sharp, const Shader::ImageResource
 
 /// Vertex inputs of a draw (the dynamic vertex input path): the attribute and binding
 /// descriptions, the V# of each stream, and the stream memory merged into ranges.
+inline u64 HashBufferDescriptors(const AmdGpu::Buffer* buffers, size_t count) {
+    if (count == 0) return 0;
+    if (BbToggle::Disabled(BbToggle::StableMotionHash)) {
+        return XXH3_64bits(buffers, count * sizeof(AmdGpu::Buffer));
+    }
+    constexpr size_t StackLimit = 32;
+    std::array<AmdGpu::Buffer, StackLimit> stack_buffers;
+    if (count <= StackLimit) {
+        for (size_t i = 0; i < count; ++i) {
+            stack_buffers[i] = buffers[i];
+            stack_buffers[i].base_address = 0;
+        }
+        return XXH3_64bits(stack_buffers.data(), count * sizeof(AmdGpu::Buffer));
+    } else {
+        std::vector<AmdGpu::Buffer> copy(buffers, buffers + count);
+        for (auto& b : copy) {
+            b.base_address = 0;
+        }
+        return XXH3_64bits(copy.data(), count * sizeof(AmdGpu::Buffer));
+    }
+}
+
 struct PreparedVertexInputs {
     struct Range {
         VAddr base, end;

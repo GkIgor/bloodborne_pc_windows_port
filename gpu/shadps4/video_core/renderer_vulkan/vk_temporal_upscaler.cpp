@@ -686,22 +686,39 @@ void TemporalUpscaler::RecordTaa(vk::CommandBuffer cmdbuf, vk::ImageView color,
                                     : vk::DescriptorType::eStorageImage,
             .pImageInfo = &infos[i]};
     }
+    static const bool invert_taa_jitter = [] {
+        const char* env = std::getenv("BB_TAA_JITTER_INVERT");
+        return env && env[0] == '1';
+    }();
+    const std::array<float, 2> taa_jitter = invert_taa_jitter
+        ? std::array<float, 2>{-jitter[0], -jitter[1]}
+        : jitter;
     struct Params {
         std::array<float, 2> jitter;
         u32 reset, pad;
         std::array<std::array<float, 4>, 3> depth;
-    } params{jitter, reset ? 1u : 0u, std::getenv("BB_TAA_DIAGNOSTICS") ?
+    } params{taa_jitter, reset ? 1u : 0u, std::getenv("BB_TAA_DIAGNOSTICS") ?
                  u32(std::clamp(std::atoi(std::getenv("BB_TAA_DIAGNOSTICS")),1,3)) : 0u,
              camera_motion.TaaDepthParameters()};
     // Optional techniques for A/B in one run (BB_TOGGLE_FILE bits 51-54): tonemapped blending,
     // YCoCg clipping, variance clipping, 3x3 reconstruction. Measured in game on 2026-10-02
     // (static and panning camera, interleaved captures): none improved stability beyond run
     // noise; YCoCg clipping and the reconstruction made it worse. Default: all off.
-    params.pad |= (BbToggle::Disabled(BbToggle::TaaTonemapBlend) ? 1u << 8 : 0u) |
+    const bool taa_defaults = !BbToggle::Disabled(BbToggle::TaaDefaults);
+    if (taa_defaults) {
+        params.pad |= (!BbToggle::Disabled(BbToggle::TaaTonemapBlend) ? 1u << 8 : 0u) |
+                      (!BbToggle::Disabled(BbToggle::TaaClip) ? 2u << 8 : 0u) |
+                      (!BbToggle::Disabled(BbToggle::TaaVariance) ? 4u << 8 : 0u) |
+                      (!BbToggle::Disabled(BbToggle::TaaFilter) ? 8u << 8 : 0u) |
+                      (!BbToggle::Disabled(BbToggle::TaaKeepNearerHistory) ? 16u << 8 : 0u);
+    } else {
+        params.pad |= (32u << 8) |
+                      (BbToggle::Disabled(BbToggle::TaaTonemapBlend) ? 1u << 8 : 0u) |
                   (BbToggle::Disabled(BbToggle::TaaClip) ? 2u << 8 : 0u) |
                   (BbToggle::Disabled(BbToggle::TaaVariance) ? 4u << 8 : 0u) |
                   (BbToggle::Disabled(BbToggle::TaaFilter) ? 8u << 8 : 0u) |
                   (BbToggle::Disabled(BbToggle::TaaKeepNearerHistory) ? 16u << 8 : 0u);
+    }
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *taa_pipeline);
     if (params.pad & 0xffu) {
         static u32 diagnostic_frames = 0;

@@ -201,7 +201,9 @@ void main() {
                 }
                 diagnostic_history = clipped;
                 // Reliable history suppresses subpixel shimmer even on distant geometry.
-                float weight = mix(0.98, 0.85, moving) * coverage;
+                const float max_weight = (variant & 32u) != 0u ? 0.98 : 0.88;
+                const float min_weight = (variant & 32u) != 0u ? 0.85 : 0.75;
+                float weight = mix(max_weight, min_weight, moving) * coverage;
                 history_weight = weight;
                 // Tonemapped blending: a few very bright HDR samples otherwise dominate.
                 result = (variant & 1u) != 0u
