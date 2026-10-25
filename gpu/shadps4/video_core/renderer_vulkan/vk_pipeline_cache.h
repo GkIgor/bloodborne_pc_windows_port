@@ -3,6 +3,12 @@
 
 #pragma once
 
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <future>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <shared_mutex>
 #include <variant>
@@ -115,7 +121,53 @@ struct PrepWorker {
 
 struct PreparedDraw;
 
-class PipelineCompiler;
+class PipelineCompiler {
+public:
+    explicit PipelineCompiler(u32 threads) {
+        for (u32 i = 0; i < threads; ++i) {
+            workers.emplace_back([this] { Run(); });
+        }
+    }
+    ~PipelineCompiler() {
+        {
+            std::scoped_lock lk{mutex};
+            stop = true;
+        }
+        cv.notify_all();
+        for (auto& worker : workers) {
+            worker.join();
+        }
+    }
+    void Submit(std::function<void()> job) {
+        {
+            std::scoped_lock lk{mutex};
+            jobs.push_back(std::move(job));
+        }
+        cv.notify_one();
+    }
+
+private:
+    void Run() {
+        for (;;) {
+            std::function<void()> job;
+            {
+                std::unique_lock lk{mutex};
+                cv.wait(lk, [&] { return stop || !jobs.empty(); });
+                if (jobs.empty()) {
+                    return; // stopping, every job done
+                }
+                job = std::move(jobs.front());
+                jobs.pop_front();
+            }
+            job();
+        }
+    }
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::function<void()>> jobs;
+    std::vector<std::thread> workers;
+    bool stop = false;
+};
 
 class PipelineCache {
 public:
@@ -203,6 +255,18 @@ private:
     const PreparedDraw* used_prepared = nullptr;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
+    struct SelectionCache {
+        bool valid = false;
+        u64 reg_checksum = ~0ull;
+        DrawIndirectParams indirect_params{};
+        GraphicsPipelineKey key;
+        std::array<const Shader::Info*, MaxShaderStages> infos{};
+        std::array<vk::ShaderModule, MaxShaderStages> modules{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+        bool motion = false;
+    };
+    SelectionCache selection_cache{};
+    PipelineCompiler& GetCompiler();
     PipelineSelection sel{}; ///< GPU thread selection state
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start

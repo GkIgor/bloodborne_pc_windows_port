@@ -67,6 +67,7 @@ enum : std::uint64_t {
     SceneMipBias = 1ull << 57, ///< negative LOD bias of G-buffer samplers at reduced scene sizes
     AsyncFullScreenTuning = 1ull << 58, ///< lower full-screen index threshold (12 -> 6) for async compile
     FlatHashValidation = 1ull << 59, ///< fast hash check on flattened user-data before memcmp
+    SelectionCache = 1ull << 60, ///< caches pipeline selection across draws with identical registers
     /// Scene textures use BB_ANISO (16) times anisotropic filtering instead of the game's
     /// ratio; bit set: the game's own samplers (A/B while the game runs).
     ForcedAniso = 1ull << 61,

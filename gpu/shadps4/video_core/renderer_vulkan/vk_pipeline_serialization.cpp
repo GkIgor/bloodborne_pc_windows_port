@@ -8,7 +8,10 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
-#include "video_core/renderer_vulkan/vk_shader_util.h"
+#include <chrono>
+#include <future>
+#include "common/hash.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h" 
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
@@ -322,6 +325,8 @@ void PipelineCache::WarmUp() {
         return;
     }
 
+    const auto warmup_start = std::chrono::steady_clock::now();
+
     Storage::DataBase::Instance().Open();
 
     // Check if cache is compatible
@@ -358,59 +363,309 @@ void PipelineCache::WarmUp() {
         return;
     }
 
+    const char* env_warmup = std::getenv("BB_WARMUP_ASYNC");
+    const bool warmup_async = !env_warmup || (std::strcmp(env_warmup, "0") != 0);
+
     u32 num_pipelines{};
     u32 num_total_pipelines{};
-
     u32 num_removed{};
 
-    try {
-        num_removed = Storage::DataBase::Instance().ForEachBlob(
-            Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
-                ++num_total_pipelines;
+    if (!warmup_async) {
+        try {
+            num_removed = Storage::DataBase::Instance().ForEachBlob(
+                Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
+                    ++num_total_pipelines;
 
-                Serialization::Archive ar{std::move(data)};
-                Serialization::Reader pldata{ar};
+                    Serialization::Archive ar{std::move(data)};
+                    Serialization::Reader pldata{ar};
 
-                u32 version{};
-                pldata.Read(version);
-                if (version != Serialization::PipelineKeyVersion) {
+                    u32 version{};
+                    pldata.Read(version);
+                    if (version != Serialization::PipelineKeyVersion) {
+                        return false;
+                    }
+
+                    u32 is_compute{};
+                    pldata.Read(is_compute);
+
+                    bool result{};
+                    if (is_compute) {
+                        result = LoadComputePipeline(ar);
+                    } else {
+                        result = LoadGraphicsPipeline(ar);
+                    }
+
+                    if (result) {
+                        ++num_pipelines;
+                    }
+                    return result;
+                });
+        } catch (const Serialization::CorruptData& e) {
+            LOG_ERROR(Render, "Corrupted pipeline cache detected during WarmUp: {}. Clearing cache.",
+                      e.what());
+            Storage::DataBase::Instance().Clear();
+            Storage::DataBase::Instance().FinishPreload();
+            profile_data.resize(sizeof(profile));
+            std::memcpy(profile_data.data(), &profile, sizeof(profile));
+            Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                               std::move(profile_data));
+            return;
+        }
+    } else {
+        struct StagedPermut {
+            Program* program = nullptr;
+            size_t perm_idx = 0;
+            Shader::StageSpecialization spec;
+            std::shared_future<vk::ShaderModule> future;
+        };
+
+        struct WarmUpGraphicsEntry {
+            GraphicsPipelineKey key;
+            GraphicsPipeline::SerializationSupport sdata;
+            std::array<const Shader::Info*, MaxShaderStages> infos{};
+            std::array<std::shared_future<vk::ShaderModule>, MaxShaderStages> futures{};
+            std::optional<Shader::Gcn::FetchShaderData> fetch_shader;
+        };
+
+        struct WarmUpComputeEntry {
+            ComputePipelineKey key;
+            ComputePipeline::SerializationSupport sdata;
+            const Shader::Info* info = nullptr;
+            std::shared_future<vk::ShaderModule> future;
+        };
+
+        std::vector<WarmUpGraphicsEntry> staged_graphics;
+        std::vector<WarmUpComputeEntry> staged_compute;
+        std::vector<StagedPermut> staged_permutations;
+        tsl::robin_map<u64, std::shared_future<vk::ShaderModule>> spv_futures;
+
+        auto stage_shader = [&](Serialization::Archive& ar,
+                                std::optional<Shader::Gcn::FetchShaderData>& out_fetch_shader,
+                                const Shader::Info*& out_info,
+                                std::shared_future<vk::ShaderModule>& out_future) -> bool {
+            auto program = std::make_unique<Program>();
+            Shader::StageSpecialization spec{};
+            spec.info = &program->info;
+            size_t perm_idx{};
+            if (!LoadShaderMeta(ar, program->info, out_fetch_shader, spec, perm_idx)) {
+                return false;
+            }
+
+            std::vector<u32> spv{};
+            Storage::DataBase::Instance().Load(
+                Storage::BlobType::ShaderBinary,
+                fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx), spv);
+            if (spv.empty() || spv[0] != 0x07230203u) {
+                LOG_WARNING(Render_Vulkan, "Cached shader binary {}_{:x}_{} is missing or invalid SPIR-V",
+                            program->info.hw_stage, program->info.pgm_hash, perm_idx);
+                return false;
+            }
+
+            const u64 perm_hash = HashCombine(program->info.pgm_hash, perm_idx);
+            Program* program_ptr = nullptr;
+            {
+                std::unique_lock lk{programs_mutex};
+                auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
+                if (new_program) {
+                    it_pgm.value() = std::move(program);
+                }
+                program_ptr = it_pgm.value().get();
+            }
+
+            out_info = &program_ptr->info;
+            spec.info = &program_ptr->info;
+
+            auto it = std::ranges::find_if(staged_permutations, [&](const StagedPermut& p) {
+                return p.program == program_ptr && p.spec == spec;
+            });
+            if (it != staged_permutations.end()) {
+                if (it->perm_idx != perm_idx) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Cached permutation {} of {}_{:x} conflicts with index {}, skipping preload",
+                                perm_idx, program_ptr->info.hw_stage, program_ptr->info.pgm_hash, it->perm_idx);
+                    return false;
+                }
+                out_future = it->future;
+            } else {
+                auto conflict_it = std::ranges::find_if(staged_permutations, [&](const StagedPermut& p) {
+                    return p.program == program_ptr && p.perm_idx == perm_idx;
+                });
+                if (conflict_it != staged_permutations.end()) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Cached permutation index {} of {}_{:x} already used with different spec, skipping preload",
+                                perm_idx, program_ptr->info.hw_stage, program_ptr->info.pgm_hash);
                     return false;
                 }
 
-                u32 is_compute{};
-                pldata.Read(is_compute);
+                auto task = std::make_shared<std::packaged_task<vk::ShaderModule()>>(
+                    [device = instance.GetDevice(), spv_data = std::move(spv)]() {
+                        return CompileSPV(spv_data, device);
+                    });
+                out_future = task->get_future().share();
+                spv_futures.emplace(perm_hash, out_future);
+                GetCompiler().Submit([task]() { (*task)(); });
+                staged_permutations.push_back(StagedPermut{
+                    .program = program_ptr,
+                    .perm_idx = perm_idx,
+                    .spec = std::move(spec),
+                    .future = out_future,
+                });
+            }
+            return true;
+        };
 
-                bool result{};
-                if (is_compute) {
-                    result = LoadComputePipeline(ar);
-                } else {
-                    result = LoadGraphicsPipeline(ar);
-                }
+        try {
+            num_removed = Storage::DataBase::Instance().ForEachBlob(
+                Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
+                    ++num_total_pipelines;
 
-                if (result) {
-                    ++num_pipelines;
+                    Serialization::Archive ar{std::move(data)};
+                    Serialization::Reader pldata{ar};
+
+                    u32 version{};
+                    pldata.Read(version);
+                    if (version != Serialization::PipelineKeyVersion) {
+                        return false;
+                    }
+
+                    u32 is_compute{};
+                    pldata.Read(is_compute);
+
+                    if (is_compute) {
+                        ComputePipelineKey key{};
+                        key.Deserialize(ar);
+                        ComputePipeline::SerializationSupport sdata{};
+                        sdata.Deserialize(ar);
+
+                        std::vector<u8> meta_blob;
+                        Storage::DataBase::Instance().Load(
+                            Storage::BlobType::ShaderMeta,
+                            fmt::format("{:#018x}", key.value), meta_blob);
+                        if (meta_blob.empty()) {
+                            return false;
+                        }
+
+                        Serialization::Archive meta_ar{std::move(meta_blob)};
+                        std::optional<Shader::Gcn::FetchShaderData> fetch_dummy;
+                        const Shader::Info* c_info = nullptr;
+                        std::shared_future<vk::ShaderModule> c_future;
+                        if (!stage_shader(meta_ar, fetch_dummy, c_info, c_future)) {
+                            return false;
+                        }
+
+                        staged_compute.push_back(WarmUpComputeEntry{
+                            .key = key,
+                            .sdata = sdata,
+                            .info = c_info,
+                            .future = c_future,
+                        });
+                        return true;
+                    } else {
+                        GraphicsPipelineKey key{};
+                        key.Deserialize(ar);
+                        GraphicsPipeline::SerializationSupport sdata{};
+                        sdata.Deserialize(ar);
+
+                        WarmUpGraphicsEntry entry{};
+                        entry.key = key;
+                        entry.sdata = sdata;
+
+                        for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
+                            const auto& hash = key.stage_hashes[stage_idx];
+                            if (!hash) {
+                                continue;
+                            }
+                            std::vector<u8> meta_blob;
+                            Storage::DataBase::Instance().Load(
+                                Storage::BlobType::ShaderMeta,
+                                fmt::format("{:#018x}", hash), meta_blob);
+                            if (meta_blob.empty()) {
+                                return false;
+                            }
+                            Serialization::Archive meta_ar{std::move(meta_blob)};
+                            if (!stage_shader(meta_ar, entry.fetch_shader, entry.infos[stage_idx],
+                                              entry.futures[stage_idx])) {
+                                return false;
+                            }
+                        }
+
+                        staged_graphics.push_back(std::move(entry));
+                        return true;
+                    }
+                });
+        } catch (const Serialization::CorruptData& e) {
+            LOG_ERROR(Render, "Corrupted pipeline cache detected during WarmUp: {}. Clearing cache.",
+                      e.what());
+            Storage::DataBase::Instance().Clear();
+            Storage::DataBase::Instance().FinishPreload();
+            profile_data.resize(sizeof(profile));
+            std::memcpy(profile_data.data(), &profile, sizeof(profile));
+            Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                               std::move(profile_data));
+            return;
+        }
+
+        // Between passes: wait for all compilation futures to complete and populate program permutations
+        for (auto& item : staged_permutations) {
+            vk::ShaderModule mod = item.future.get();
+            if (mod) {
+                std::unique_lock lk{programs_mutex};
+                item.program->InsertPermut(mod, std::move(item.spec), item.perm_idx);
+            }
+        }
+
+        // Pass 2: synchronous pipeline instantiation on startup thread
+        for (auto& entry : staged_compute) {
+            vk::ShaderModule mod = entry.future.get();
+            if (!mod) {
+                continue;
+            }
+            const auto [it, is_new] = compute_pipelines.try_emplace(entry.key);
+            if (is_new) {
+                it.value() = std::make_unique<ComputePipeline>(
+                    instance, scheduler, desc_heap, profile, *pipeline_cache, entry.key,
+                    *entry.info, mod, entry.sdata, true);
+                ++num_pipelines;
+            }
+        }
+
+        const std::array<Shader::RuntimeInfo, MaxShaderStages> empty_runtime_infos{};
+        for (auto& entry : staged_graphics) {
+            bool all_stages_ok = true;
+            std::array<vk::ShaderModule, MaxShaderStages> modules{};
+            for (size_t s = 0; s < MaxShaderStages; ++s) {
+                if (entry.futures[s].valid()) {
+                    modules[s] = entry.futures[s].get();
+                    if (!modules[s]) {
+                        all_stages_ok = false;
+                        break;
+                    }
                 }
-                return result;
-            });
-    } catch (const Serialization::CorruptData& e) {
-        LOG_ERROR(Render, "Corrupted pipeline cache detected during WarmUp: {}. Clearing cache.",
-                  e.what());
-        Storage::DataBase::Instance().Clear();
-        Storage::DataBase::Instance().FinishPreload();
-        // Without its profile the next start would skip the warm-up altogether.
-        profile_data.resize(sizeof(profile));
-        std::memcpy(profile_data.data(), &profile, sizeof(profile));
-        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
-                                           std::move(profile_data));
-        return;
+            }
+            if (!all_stages_ok) {
+                continue;
+            }
+            const auto [it, is_new] = graphics_pipelines.try_emplace(entry.key);
+            if (is_new) {
+                it.value() = std::make_unique<GraphicsPipeline>(
+                    instance, scheduler, desc_heap, profile, entry.key, *pipeline_cache,
+                    entry.infos, empty_runtime_infos, entry.fetch_shader, modules, entry.sdata, true);
+                ++num_pipelines;
+            }
+        }
     }
 
-    LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    sel.infos.fill(nullptr);
+    sel.modules.fill(nullptr);
+    sel.fetch_shader.reset();
+
+    const auto warmup_end = std::chrono::steady_clock::now();
+    const auto warmup_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(warmup_end - warmup_start).count();
+
+    LOG_INFO(Render, "Pipeline cache warmup completed in {} ms (preloaded {} pipelines, mode={})",
+             warmup_ms, num_pipelines, warmup_async ? "async" : "sync");
     if (num_total_pipelines > num_pipelines) {
-        // bbport: only the unusable keys go. Clearing the whole cache here also deleted the
-        // profile (so the next start loaded nothing) and the shaders of the pipelines just
-        // preloaded (whose later keys then referenced missing files): every other start
-        // threw the cache away and the one in between started cold.
         LOG_WARNING(Render, "{} cached pipelines could not be loaded: removed {} keys, kept {}",
                     num_total_pipelines - num_pipelines, num_removed, num_pipelines);
     }

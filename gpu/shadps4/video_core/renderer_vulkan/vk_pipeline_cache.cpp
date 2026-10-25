@@ -378,53 +378,19 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     WarmUp();
 }
 
-class PipelineCompiler {
-public:
-    explicit PipelineCompiler(u32 threads) {
-        for (u32 i = 0; i < threads; ++i) {
-            workers.emplace_back([this] { Run(); });
-        }
+PipelineCompiler& PipelineCache::GetCompiler() {
+    if (!compiler) {
+        const char* env = std::getenv("BB_ASYNC_PIPELINE_THREADS");
+        const u32 concurrency = std::thread::hardware_concurrency();
+        const u32 default_threads = concurrency <= 8 ? std::max(1u, concurrency / 4) : std::clamp(concurrency / 2, 2u, 8u);
+        const u32 threads = env && *env ? u32(std::strtoul(env, nullptr, 10)) : default_threads;
+        compiler = std::make_unique<PipelineCompiler>(std::max(threads, 1u));
+        std::printf("GPU: new pipelines of passes drawn every frame compile on %u threads "
+                    "(BB_ASYNC_PIPELINES=0: on the GPU thread, the game waits)\n",
+                    std::max(threads, 1u));
     }
-    ~PipelineCompiler() {
-        {
-            std::scoped_lock lk{mutex};
-            stop = true;
-        }
-        cv.notify_all();
-        for (auto& worker : workers) {
-            worker.join();
-        }
-    }
-    void Submit(std::function<void()> job) {
-        {
-            std::scoped_lock lk{mutex};
-            jobs.push_back(std::move(job));
-        }
-        cv.notify_one();
-    }
-
-private:
-    void Run() {
-        for (;;) {
-            std::function<void()> job;
-            {
-                std::unique_lock lk{mutex};
-                cv.wait(lk, [&] { return stop || !jobs.empty(); });
-                if (jobs.empty()) {
-                    return; // stopping, every job done
-                }
-                job = std::move(jobs.front());
-                jobs.pop_front();
-            }
-            job();
-        }
-    }
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::deque<std::function<void()>> jobs;
-    std::vector<std::thread> workers;
-    bool stop = false;
-};
+    return *compiler;
+}
 
 struct PipelineCache::PendingPipeline {
     std::mutex mutex;
@@ -573,10 +539,38 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             return pipeline;
         }
     }
-    sel.draw_indirect_params = params;
-    if (!RefreshGraphicsKey(sel)) {
-        return nullptr;
+    bool hit = false;
+    if (!BbToggle::Disabled(BbToggle::SelectionCache) && selection_cache.valid &&
+        selection_cache.reg_checksum == liverpool->gfx_reg_checksum &&
+        selection_cache.indirect_params.vertex_sgpr_offset == params.vertex_sgpr_offset &&
+        selection_cache.indirect_params.instance_sgpr_offset == params.instance_sgpr_offset) {
+        sel.graphics_key = selection_cache.key;
+        sel.infos = selection_cache.infos;
+        sel.modules = selection_cache.modules;
+        sel.fetch_shader = selection_cache.fetch_shader;
+        sel.motion = selection_cache.motion;
+        sel.draw_indirect_params = params;
+        hit = true;
     }
+
+    if (!hit) {
+        sel.draw_indirect_params = params;
+        if (!RefreshGraphicsKey(sel)) {
+            selection_cache.valid = false;
+            return nullptr;
+        }
+        if (!BbToggle::Disabled(BbToggle::SelectionCache)) {
+            selection_cache.valid = true;
+            selection_cache.reg_checksum = liverpool->gfx_reg_checksum;
+            selection_cache.indirect_params = params;
+            selection_cache.key = sel.graphics_key;
+            selection_cache.infos = sel.infos;
+            selection_cache.modules = sel.modules;
+            selection_cache.fetch_shader = sel.fetch_shader;
+            selection_cache.motion = sel.motion;
+        }
+    }
+
     if (const auto found = graphics_pipelines.find(sel.graphics_key); found != graphics_pipelines.end()) {
         return found->second.get();
     }
@@ -604,22 +598,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         return FinishPipeline(sel.graphics_key, *job);
     }
     if (skippable) {
-        if (!compiler) {
-            const char* env = std::getenv("BB_ASYNC_PIPELINE_THREADS");
-            const u32 concurrency = std::thread::hardware_concurrency();
-            const u32 default_threads = concurrency <= 8 ? std::max(1u, concurrency / 4) : std::clamp(concurrency / 2, 2u, 8u);
-            const u32 threads = env && *env ? u32(std::strtoul(env, nullptr, 10)) : default_threads;
-            compiler = std::make_unique<PipelineCompiler>(std::max(threads, 1u));
-            std::printf("GPU: new pipelines of passes drawn every frame compile on %u threads "
-                        "(BB_ASYNC_PIPELINES=0: on the GPU thread, the game waits)\n",
-                        std::max(threads, 1u));
-        }
+        auto& comp = GetCompiler();
         auto job = std::make_shared<PendingPipeline>();
         job->modules = sel.modules;
         pending_graphics.emplace(sel.graphics_key, job);
         ++async_started;
         ++g_bb_compiles;
-        compiler->Submit([this, job, key = sel.graphics_key, infos = sel.infos,
+        comp.Submit([this, job, key = sel.graphics_key, infos = sel.infos,
                           runtime_infos = sel.runtime_infos, fetch = sel.fetch_shader,
                           modules = sel.modules]() mutable {
             GraphicsPipeline::SerializationSupport sdata{};
