@@ -55,7 +55,7 @@ inline constexpr Effect Effects[] = {
     {"effect_dof", "Depth of field (DoF)", "Глубина резкости (DoF)", true},
     {"effect_motion_blur", "Motion blur", "Размытие в движении", true},
     {"effect_ssao", "SSAO shading", "Затенение SSAO", true},
-    {"effect_game_aa", "The game's own anti-aliasing", "Собственное сглаживание игры", true},
+    {"effect_game_aa", "Native Game AA", "Собственное сглаживание игры", true},
     {"effect_dynamic_shadows", "Dynamic light shadows", "Тени от динамических источников", true},
     {"effect_ssr", "SSR reflections (not in the original game)", "Отражения SSR (не было в игре)", false},
     {"skip_intro", "Skip the intro videos at start", "Пропуск заставок при запуске", false},

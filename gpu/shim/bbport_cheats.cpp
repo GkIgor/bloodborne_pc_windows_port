@@ -749,7 +749,7 @@ void BuildTable() {
            {XmlWrite(0x04D27714, "9A99993F", "0000803F")});
     AddXml(12, "Skip Intro",
            "Zeros the intro logo strings.  Takes effect on the next launch of the intro.",
-           CategoryCombat, "skip_intro",
+           CategoryVisual, "skip_intro",
            {
                XmlWrite(0x04D99138, "00000000", "4C006F00"),
                XmlWrite(0x04D99154, "00000000", "4C006F00"),

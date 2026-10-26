@@ -662,37 +662,7 @@ void Menu() {
             "остаётся в 1080p — на Steam Deck и старых видеокартах это заметно медленнее. "
             "Выключена: всё рисуется в разрешении пресета, смена — через перезапуск. Авто включает "
             "её на мощных дискретных видеокартах. Применяется после перезапуска игры."));
-    ImGui::SeparatorText(Tr("Game effects (after restart)", "Эффекты игры (после перезапуска)"));
-    const char* const lods[] = {Tr("Highest (-2)", "Максимальная (-2)"),
-                                Tr("Game default", "Как в игре"),
-                                Tr("Lower (1)", "Ниже (1)"),
-                                Tr("Lowest (2)", "Минимальная (2)")};
-    static constexpr int lod_values[] = {-2, 0, 1, 2};
-    int lod_index = 1;
-    for (int i = 0; i < 4; ++i) {
-        if (lod_values[i] == s.model_lod) lod_index = i;
-    }
-    if (ImGui::BeginCombo(Tr("Model detail", "Детализация моделей"), lods[lod_index])) {
-        for (int i = 0; i < 4; ++i) {
-            if (ImGui::Selectable(lods[i], i == lod_index)) {
-                Store(s.model_lod, lod_values[i], true);
-            }
-        }
-        ImGui::EndCombo();
-    }
-    for (int e = 0; e < BbSettings::EffectCount; ++e) {
-        Checkbox(Tr(BbSettings::Effects[e].label_en, BbSettings::Effects[e].label_ru), s.effects[e]);
-    }
-    Hint(Tr("Effects are switched on and off by game patches at start (patches/Bloodborne.xml). "
-            "Motion blur and dynamic light shadows put a noticeable load on the GPU.",
-            "Эффекты включаются и выключаются патчами игры при запуске (patches/Bloodborne.xml). "
-            "Размытие в движении и тени от динамических источников заметно нагружают GPU."));
-    Hint(Tr("Free camera: hold Cross and press L3 (keyboard: Space + Z). Debug menu: left "
-            "touchpad / Tab. Needs DbgFont14h.ccm and DbgFont14h.tpf in dvdroot_ps4/font from "
-            "Nexus mod #253. Right touchpad: Backspace.",
-            "Свободная камера: удерживайте Cross и нажимайте L3 (клавиатура: Space + Z). "
-            "Debug menu: левый touchpad / Tab. Нужны DbgFont14h.ccm и DbgFont14h.tpf "
-            "в dvdroot_ps4/font из мода Nexus #253. Правый touchpad: Backspace."));
+
 
     bool restart = s.object_motion != s.startup_object_motion ||
                    s.model_lod != s.startup_model_lod ||
@@ -700,6 +670,7 @@ void Menu() {
                    s.prep_workers != s.startup_prep_workers ||
                    BbSettings::ResolutionNeedsRestart();
     for (int e = 0; e < BbSettings::EffectCount; ++e) {
+        if (e == 0) continue; // Chromatic aberration is a live memory patch; does not need restart
         restart |= s.effects[e] != s.startup_effects[e];
     }
     if (restart) {
@@ -958,6 +929,22 @@ void DrawCheatMenu() {
                 break;
             }
         }
+        if (category == BbCheats::CategoryVisual && !any) {
+            if (ContainsNoCase("Model detail", search) ||
+                ContainsNoCase("Детализация моделей", search) ||
+                ContainsNoCase("Native Game AA", search) ||
+                ContainsNoCase("Собственное сглаживание игры", search) ||
+                ContainsNoCase(BbSettings::Effects[5].label_en, search) ||
+                ContainsNoCase(BbSettings::Effects[5].label_ru, search) ||
+                ContainsNoCase(BbSettings::Effects[6].label_en, search) ||
+                ContainsNoCase(BbSettings::Effects[6].label_ru, search) ||
+                ContainsNoCase(BbSettings::Effects[8].label_en, search) ||
+                ContainsNoCase(BbSettings::Effects[8].label_ru, search) ||
+                ContainsNoCase(BbSettings::Effects[9].label_en, search) ||
+                ContainsNoCase(BbSettings::Effects[9].label_ru, search)) {
+                any = true;
+            }
+        }
         if (!any) continue;
         if (filtering) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
         if (!ImGui::CollapsingHeader(categories[category], ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -965,6 +952,27 @@ void DrawCheatMenu() {
         }
         if (category == BbCheats::CategoryVisual) {
             ImGui::TextDisabled("These also update the matching effect_* setting for the next launch.");
+            auto& s = BbSettings::Get();
+            if (!filtering || ContainsNoCase("Model detail", search) || ContainsNoCase("Детализация моделей", search)) {
+                const char* const lods[] = {Tr("Highest (-2)", "Максимальная (-2)"),
+                                            Tr("Game default", "Как в игре"),
+                                            Tr("Lower (1)", "Ниже (1)"),
+                                            Tr("Lowest (2)", "Минимальная (2)")};
+                static constexpr int lod_values[] = {-2, 0, 1, 2};
+                int lod_index = 1;
+                for (int i = 0; i < 4; ++i) {
+                    if (lod_values[i] == s.model_lod) lod_index = i;
+                }
+                if (ImGui::BeginCombo(Tr("Model detail", "Детализация моделей"), lods[lod_index])) {
+                    for (int i = 0; i < 4; ++i) {
+                        if (ImGui::Selectable(lods[i], i == lod_index)) {
+                            Store(s.model_lod, lod_values[i], true);
+                            BbSettings::Save();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+            }
         }
         for (const auto& cheat : cheats) {
             if (cheat.category != category) continue;
@@ -1003,6 +1011,56 @@ void DrawCheatMenu() {
                 ImGui::TextDisabled("(applied at startup)");
             }
             ImGui::PopID();
+        }
+        if (category == BbCheats::CategoryVisual) {
+            auto& s = BbSettings::Get();
+            auto DrawVisualEffect = [&](int effect_idx, bool has_two_hints = false) {
+                const auto& eff = BbSettings::Effects[effect_idx];
+                if (filtering && !ContainsNoCase(eff.label_en, search) && !ContainsNoCase(eff.label_ru, search)) {
+                    return;
+                }
+                ImGui::PushID(2000 + effect_idx);
+                bool val = s.effects[effect_idx];
+                if (ImGui::Checkbox(Tr(eff.label_en, eff.label_ru), &val)) {
+                    Store(s.effects[effect_idx], val, true);
+                    BbSettings::Save();
+                }
+                if (has_two_hints) {
+                    Hint(Tr("Effects are switched on and off by game patches at start (patches/Bloodborne.xml). "
+                            "Motion blur and dynamic light shadows put a noticeable load on the GPU.",
+                            "Эффекты включаются и выключаются патчами игры при запуске (patches/Bloodborne.xml). "
+                            "Размытие в движении и тени от динамических источников заметно нагружают GPU."));
+                    Hint(Tr("Free camera: hold Cross and press L3 (keyboard: Space + Z). Debug menu: left "
+                            "touchpad / Tab. Needs DbgFont14h.ccm and DbgFont14h.tpf in dvdroot_ps4/font from "
+                            "Nexus mod #253. Right touchpad: Backspace.",
+                            "Свободная камера: удерживайте Cross и нажимайте L3 (клавиатура: Space + Z). "
+                            "Debug menu: левый touchpad / Tab. Нужны DbgFont14h.ccm и DbgFont14h.tpf "
+                            "в dvdroot_ps4/font из мода Nexus #253. Правый touchpad: Backspace."));
+                }
+                ImGui::PopID();
+            };
+
+            DrawVisualEffect(4); // Native Game AA
+            DrawVisualEffect(5); // Dynamic light shadows
+            DrawVisualEffect(6); // SSR reflections (not in the original game)
+            DrawVisualEffect(8); // Free camera (Cross + L3)
+            DrawVisualEffect(9, /*has_two_hints=*/true); // Debug menu (needs the font files) (?) (?)
+
+            bool restart = s.model_lod != s.startup_model_lod;
+            for (int e = 0; e < BbSettings::EffectCount; ++e) {
+                if (e == 0) continue; // Chromatic aberration is a live memory patch; does not need restart
+                restart |= s.effects[e] != s.startup_effects[e];
+            }
+            if (restart) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s",
+                                   Tr("Changes apply after restarting the game",
+                                      "Изменения применятся после перезапуска игры"));
+                if (ImGui::Button(Tr("Apply and restart the game", "Применить и перезапустить игру"))) {
+                    BbSettings::Save();
+                    runtime_restart();
+                }
+            }
         }
         ImGui::Spacing();
     }
@@ -1156,12 +1214,7 @@ void HudOverlay() {
 } // namespace
 
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
-    if (const char* env = std::getenv("BB_OVERLAY")) {
-        if (!std::strcmp(env, "0") || !std::strcmp(env, "off") || !std::strcmp(env, "false")) {
-            std::printf("Overlay: disabled (BB_OVERLAY=0)\n");
-            return;
-        }
-    }
+    // Overlay is permanently enabled and hardcoded (required for character naming & input dialogs)
     std::scoped_lock lock{imgui_mutex};
     if (initialized) {
         return;
