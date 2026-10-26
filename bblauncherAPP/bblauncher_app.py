@@ -278,7 +278,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "language": self.cmb_lang.currentData() or "1",
                 "feat_upscaler": self.chk_fsr.isChecked() and upscaler_choice != "Off",
                 "upscaler_model": upscaler_choice,
-                "feat_overlay": self.chk_overlay.isChecked(),
+                "feat_overlay": True,
                 "feat_fps_patch": self.chk_fps_patch.isChecked(),
                 "window_mode": win_mode,
                 "fullscreen": win_mode == "Fullscreen",
@@ -1638,10 +1638,8 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         else:
             env["BB_UPSCALER"] = upscaler_map.get(upscaler_choice, "fsr31")
 
-        if not cfg["feat_overlay"]:
-            env["BB_OVERLAY"] = "0"
-        else:
-            env.pop("BB_OVERLAY", None)
+        # In-game overlay configuration menu is permanently enabled
+        env.pop("BB_OVERLAY", None)
 
         if not cfg["feat_fps_patch"]:
             env["BB_FPS_PATCH"] = "0"

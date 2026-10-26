@@ -1455,10 +1455,6 @@ class LauncherUI:
         self.chk_fps_patch.setChecked(self.settings.get("feat_fps_patch", True))
         row_flags.addWidget(self.chk_fps_patch, 0, 1)
 
-        self.chk_overlay = QCheckBox("In-Game Overlay Configuration Menu")
-        self.chk_overlay.setChecked(self.settings.get("feat_overlay", True))
-        row_flags.addWidget(self.chk_overlay, 1, 0)
-
         def on_upscaler_combo_changed():
             active = self.cmb_upscaler.currentData() != "off"
             self.chk_fsr.blockSignals(True)
