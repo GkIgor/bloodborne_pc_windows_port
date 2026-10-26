@@ -10,6 +10,8 @@
 #include "bbport_threads.h"
 
 extern "C" std::uint64_t runtime_disabled_optimizations;
+/// The second toggle word (BB_TOGGLE_FILE2): every bit of the first word is assigned.
+extern "C" std::uint64_t runtime_disabled_optimizations2;
 
 namespace BbToggle {
 enum : std::uint64_t {
@@ -42,8 +44,7 @@ enum : std::uint64_t {
     PipelinedTasks = 1ull << 38,
     PendingFenceWaits = 1ull << 39,
     PipelinedDispatch = 1ull << 40,
-    RecorderFences = 1ull << 41,
-    StableMotionHash = 1ull << 41, ///< zero base_address when hashing AmdGpu::Buffer for motion geometry
+    RecorderFences = 1ull << 41, ///< Stage-B fences deferred to the recording thread (liverpool.cpp)
     PipelinedMemoryWrites = 1ull << 42,
     MultiCopyShader = 1ull << 43,
     RenderStateMemo = 1ull << 44,
@@ -76,8 +77,22 @@ enum : std::uint64_t {
     TaaDefaults = 1ull << 63, ///< modern TAA defaults: YCoCg variance clipping, tonemap blend, 3x3 filter
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
+/// Switches that need a bit of their own; the first word above has all 64 assigned, so these
+/// are bits of runtime_disabled_optimizations2 (the file named by BB_TOGGLE_FILE2).
+enum : std::uint64_t {
+    /// Zero base_address when hashing AmdGpu::Buffer for motion geometry. This used to be
+    /// 1ull << 41, shared with RecorderFences; a BB_TOGGLE_FILE value of 1<<41 now turns only
+    /// RecorderFences off, and this switch is set from the second file.
+    StableMotionHash = 1ull << 0,
+    /// The crash guards added to the recorder and the guest fault handler (set: off).
+    DefensiveGuards = 1ull << 1,
+};
 inline bool Disabled(std::uint64_t bit) {
     return (__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & bit) != 0;
+}
+/// Disabled(), for the switches in the second word.
+inline bool Disabled2(std::uint64_t bit) {
+    return (__atomic_load_n(&runtime_disabled_optimizations2, __ATOMIC_RELAXED) & bit) != 0;
 }
 } // namespace BbToggle
 

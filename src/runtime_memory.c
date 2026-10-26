@@ -825,6 +825,9 @@ void runtime_low_free_aligned(void *ptr) {
  * 1073741824 the lock-free UpdateImage path for clean, tracked images. */
 /* Bits 32 and up: the draw pipeline and related GPU thread work (gpu/shim/bbport_toggles.h). */
 uint64_t runtime_disabled_optimizations;
+/* The second toggle word: the first has all 64 bits assigned (gpu/shim/bbport_toggles.h), so
+ * the switches added after it are read from BB_TOGGLE_FILE2, same format, same 250 ms poll. */
+uint64_t runtime_disabled_optimizations2;
 __thread RuntimeRecoverBuf *runtime_fault_recover;
 static void *toggle_watcher(void *path) {
     for (unsigned long long last=ULLONG_MAX;;) {
@@ -840,10 +843,27 @@ static void *toggle_watcher(void *path) {
     }
     return NULL;
 }
+static void *toggle2_watcher(void *path) {
+    for (unsigned long long last=ULLONG_MAX;;) {
+        FILE *f=fopen(path,"r");
+        unsigned long long value=0;
+        if (f) { if (fscanf(f,"%llu",&value)!=1) value=0; fclose(f); }
+        if (value!=last) {
+            __atomic_store_n(&runtime_disabled_optimizations2,(uint64_t)value,__ATOMIC_RELEASE);
+            printf("Runtime: disabled optimizations2 mask=%llu\n",value);
+            last=value;
+        }
+        struct timespec t={0,250000000}; nanosleep(&t,NULL);
+    }
+    return NULL;
+}
 void runtime_memory_set_gpu_hooks(GpuRange map, GpuRange unmap, GpuRange invalidate) {
     const char *toggles=getenv("BB_TOGGLE_FILE");
     static pthread_t watcher;
     if (toggles && !watcher) pthread_create(&watcher,NULL,toggle_watcher,(void *)toggles);
+    const char *toggles2=getenv("BB_TOGGLE_FILE2");
+    static pthread_t watcher2;
+    if (toggles2 && !watcher2) pthread_create(&watcher2,NULL,toggle2_watcher,(void *)toggles2);
     write_lock();
     hook_map=map; hook_unmap=unmap; hook_invalidate=invalidate;
     for (size_t i=0;i<vma_count;++i) if (vmas[i].kind!=KIND_RESERVED) queue_hook(HOOK_MAP,vmas[i].start,vmas[i].end-vmas[i].start);

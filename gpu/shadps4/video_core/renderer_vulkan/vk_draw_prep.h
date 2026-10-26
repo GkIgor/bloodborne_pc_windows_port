@@ -66,7 +66,7 @@ inline u64 ImageDescHash(const AmdGpu::Image& sharp, const Shader::ImageResource
 /// descriptions, the V# of each stream, and the stream memory merged into ranges.
 inline u64 HashBufferDescriptors(const AmdGpu::Buffer* buffers, size_t count) {
     if (count == 0) return 0;
-    if (BbToggle::Disabled(BbToggle::StableMotionHash)) {
+    if (BbToggle::Disabled2(BbToggle::StableMotionHash)) {
         return XXH3_64bits(buffers, count * sizeof(AmdGpu::Buffer));
     }
     constexpr size_t StackLimit = 32;

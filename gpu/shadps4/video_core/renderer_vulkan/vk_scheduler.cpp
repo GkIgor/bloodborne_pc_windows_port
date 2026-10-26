@@ -26,6 +26,26 @@ namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
+void ReportCommandOutsideChunk(const void* chunk, size_t chunk_used,
+                               const void* command) noexcept {
+    /* Once per session: the same overwritten chunk would report on every
+     * Execute call, and this path abandons the rest of the chunk anyway. */
+    static std::atomic<bool> reported{false};
+    if (reported.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    const auto base = reinterpret_cast<std::uintptr_t>(chunk);
+    const auto addr = reinterpret_cast<std::uintptr_t>(command);
+    LOG_CRITICAL(Render_Vulkan,
+                 "RecordChunk::Execute: command {:#x} is outside the chunk storage [{:#x}..{:#x}) "
+                 "(slot {}, used {}, capacity {}): dropped the rest of the chunk",
+                 static_cast<unsigned long long>(addr), static_cast<unsigned long long>(base),
+                 static_cast<unsigned long long>(base + chunk_used),
+                 static_cast<unsigned long long>(addr - base),
+                 static_cast<unsigned long long>(chunk_used),
+                 static_cast<unsigned long long>(RecordChunk::Capacity));
+}
+
 Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
     // bbport: BB_VK_RECORD_THREAD=0 records on the calling thread.

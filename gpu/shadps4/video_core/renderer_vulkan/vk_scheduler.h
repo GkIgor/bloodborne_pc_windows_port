@@ -576,7 +576,12 @@ struct DynamicState {
 
 using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
-/// bbport: a block of deferred Vulkan commands. Commands are closures placed in
+/// a recorded command that is not inside its chunk's storage (the intrusive list was
+/// overwritten). Logs once per session; `chunk` is the chunk storage, `chunk_used` its high
+/// water mark (chunk slot index = command - chunk).
+void ReportCommandOutsideChunk(const void* chunk, size_t chunk_used, const void* command) noexcept;
+
+/// a block of deferred Vulkan commands. Commands are closures placed in
 /// fixed storage (no allocation per command) and run in order on the recording thread.
 class RecordChunk {
 public:
@@ -616,6 +621,14 @@ public:
 
     void Execute(vk::CommandBuffer cmdbuf) {
         for (CommandBase* command = first; command;) {
+            /* bbport: a command outside this chunk's storage means the list was overwritten
+             * (phase-2 C8: the loop read command 0 at +0x1d7378 and 0x4803b9f9492 at +0x1d2c38,
+             * both faulting on [command+0x10]). Two integer comparisons, no dereference, so it
+             * runs unconditionally: no legitimate command is ever outside its own chunk. */
+            if (!InChunk(command)) {
+                ReportCommandOutsideChunk(storage, used, command);
+                break;
+            }
             CommandBase* const next = command->next;
             command->Execute(cmdbuf);
             command->~CommandBase();
@@ -659,12 +672,19 @@ private:
         Func func;
     };
 
+    /// Whether `command` points at a command slot inside this chunk: the loop in Execute() is
+    /// about to read its vtable, so the check is two integer comparisons and no dereference.
+    [[nodiscard]] bool InChunk(const CommandBase* command) const noexcept {
+        const auto base = reinterpret_cast<std::uintptr_t>(storage);
+        const auto addr = reinterpret_cast<std::uintptr_t>(command);
+        return addr >= base && addr + sizeof(CommandBase) <= base + used;
+    }
+
     alignas(64) std::byte storage[Capacity];
     size_t used = 0;
     CommandBase* first{};
     CommandBase* last{};
 };
-
 class Scheduler {
 public:
     /// `threaded_recording`: Vulkan commands passed to Record() are recorded by a worker thread.

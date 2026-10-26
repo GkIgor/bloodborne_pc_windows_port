@@ -1474,6 +1474,33 @@ static void write_crash_dump(EXCEPTION_POINTERS *ep, void *fault_addr, uintptr_t
     fprintf(f, "================================================================================\n");
     fprintf(f, "=== BLOODBORNE CRASH DUMP ===\n");
     fprintf(f, "================================================================================\n\n");
+    /* Build identity: a dump that does not name its binary cannot be matched to a commit or a
+     * build, and a reporter's binary is usually not the one built locally (the reported RVAs
+     * in the C5/C8 crashes matched no local build). The PE fields are the ones dumpbin
+     * /headers prints, so the dump alone identifies the image; __DATE__/__TIME__ is this
+     * translation unit's compile stamp. Header reads only: no allocation, VEH-safe. */
+    fprintf(f, "Port build:     %s %s (probe.c compiled)\n", __DATE__, __TIME__);
+#ifdef _WIN32
+    {
+        char module_path[MAX_PATH] = "(unavailable)";
+        HMODULE module = GetModuleHandleA(NULL);
+        if (module && GetModuleFileNameA(module, module_path, (DWORD)sizeof(module_path)))
+            fprintf(f, "Host module:    %s [base %p]\n", module_path, (void *)module);
+        else
+            fprintf(f, "Host module:    (unavailable)\n");
+        const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)module;
+        const IMAGE_NT_HEADERS *nt = NULL;
+        if (dos && dos->e_magic == IMAGE_DOS_SIGNATURE)
+            nt = (const IMAGE_NT_HEADERS *)((const char *)dos + dos->e_lfanew);
+        if (nt && nt->Signature == IMAGE_NT_SIGNATURE)
+            fprintf(f, "Build ID:       TimeDateStamp 0x%08lx SizeOfImage 0x%08lx CheckSum 0x%08lx\n",
+                    (unsigned long)nt->FileHeader.TimeDateStamp,
+                    (unsigned long)nt->OptionalHeader.SizeOfImage,
+                    (unsigned long)nt->OptionalHeader.CheckSum);
+        else
+            fprintf(f, "Build ID:       (no PE header at the host module)\n");
+    }
+#endif
     fprintf(f, "Exception Code: 0x%08lx\n", code);
     if (g_crash_dump_note && g_crash_dump_note[0]) fprintf(f, "%s\n", g_crash_dump_note);
     char fault_desc[256];
@@ -2229,6 +2256,12 @@ static void log_redzone_guard_hit(uintptr_t off, uintptr_t rip, uintptr_t rsp, G
     }
 }
 
+/* the second toggle word (BB_TOGGLE_FILE2, src/runtime_memory.c). Bit 1 is
+ * BbToggle::DefensiveGuards in gpu/shim/bbport_toggles.h; this file is C and cannot include
+ * that header, so the bit is named here and the two must stay in step. Bit clear: guards on. */
+extern uint64_t runtime_disabled_optimizations2;
+#define BB_TOGGLE_DEFENSIVE_GUARDS (1ull << 1)
+
 static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code == EXCEPTION_ACCESS_VIOLATION) {
@@ -2414,6 +2447,79 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
 
                     ep->ContextRecord->R13 = (DWORD64)(uintptr_t)dst;
                     ep->ContextRecord->Rip = (uintptr_t)image + 0x21d5b45;
+                    if (cur) cur->exception_count++;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+
+            // 0x2199310 stores r13 through r12, the block the allocator called at
+            // 0x21992fb (size edx=0x10) returned; r12 == 0 when that allocation failed
+            // (log: "Guest fault (signal 11) at guest offset 0x2199310, address ...0008").
+            // Same shape as the 0x21d5b45 guard above: supply a real block and replay the store.
+            if (off == 0x2199310 && ep->ContextRecord->R12 == 0 && is_cusa03173_v109() &&
+                (__atomic_load_n(&runtime_disabled_optimizations2, __ATOMIC_RELAXED) & BB_TOGGLE_DEFENSIVE_GUARDS) == 0) {
+                void *block = runtime_low_alloc_aligned(16, 16);
+                if (block) {
+                    static volatile LONG warned;
+                    if (InterlockedExchange(&warned, 1) == 0) {
+                        const uintptr_t rsp = ep->ContextRecord->Rsp;
+                        uintptr_t ret = 0;
+                        if (rsp && !IsBadReadPtr((const void *)rsp, sizeof(ret)))
+                            ret = *(const uintptr_t *)rsp;
+                        char ret_buf[96];
+                        if (ret && is_guest_address(ret))
+                            snprintf(ret_buf, sizeof(ret_buf), "0x%" PRIxPTR " (guest 0x%" PRIxPTR ")",
+                                     ret, ret - (uintptr_t)image);
+                        else
+                            snprintf(ret_buf, sizeof(ret_buf), "%p", (void *)ret);
+                        char buf[768];
+                        snprintf(buf, sizeof(buf),
+                            "[NULL STORE GUARD] Thread '%s' (TID %lu) at guest offset 0x%" PRIxPTR ": "
+                            "r12 (16-byte allocation) was NULL; r13=%p stored into restored block %p, "
+                            "return %s.\n",
+                            cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId(), off,
+                            (void *)(uintptr_t)ep->ContextRecord->R13, block, ret_buf);
+                        veh_write(buf);
+                        fprintf(stderr, "%s", buf);
+                        fflush(stderr);
+                    }
+                    ep->ContextRecord->R12 = (DWORD64)(uintptr_t)block;
+                    ep->ContextRecord->Rip = (uintptr_t)image + 0x2199310;
+                    if (cur) cur->exception_count++;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+
+            // 0x4370b6 initialises the block [vtable+0x10](this, 0x28) returned;
+            // rax == 0 when that allocation failed (log: "Guest fault (signal 11) at guest
+            // offset 0x4370b6, address 0000000000000000 [NULL]"). 0x4370bd..0x4370e1 then
+            // initialise those 0x28 bytes in place, so a zeroed block is the expected state.
+            if (off == 0x4370b6 && ep->ContextRecord->Rax == 0 && is_cusa03173_v109() &&
+                (__atomic_load_n(&runtime_disabled_optimizations2, __ATOMIC_RELAXED) & BB_TOGGLE_DEFENSIVE_GUARDS) == 0) {
+                void *block = runtime_low_alloc_aligned(0x28, 16);
+                if (block) {
+                    memset(block, 0, 0x28);
+                    static volatile LONG warned;
+                    if (InterlockedExchange(&warned, 1) == 0) {
+                        const uint64_t this_ptr = ep->ContextRecord->R12;
+                        uint64_t vtable = 0;
+                        if (this_ptr && !IsBadReadPtr((const void *)(uintptr_t)this_ptr, sizeof(vtable)))
+                            vtable = *(const uint64_t *)(uintptr_t)this_ptr;
+                        char buf[768];
+                        snprintf(buf, sizeof(buf),
+                            "[NULL ALLOC GUARD] Thread '%s' (TID %lu) at guest offset 0x%" PRIxPTR ": "
+                            "40-byte allocation returned NULL; vtable [r12]=%p, this r12=%p rcx=%p, "
+                            "size rsi=0x%llx, restored block %p.\n",
+                            cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId(), off,
+                            (void *)(uintptr_t)vtable, (void *)(uintptr_t)this_ptr,
+                            (void *)(uintptr_t)ep->ContextRecord->Rcx,
+                            (unsigned long long)ep->ContextRecord->Rsi, block);
+                        veh_write(buf);
+                        fprintf(stderr, "%s", buf);
+                        fflush(stderr);
+                    }
+                    ep->ContextRecord->Rax = (DWORD64)(uintptr_t)block;
+                    ep->ContextRecord->Rip = (uintptr_t)image + 0x4370b6;
                     if (cur) cur->exception_count++;
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }

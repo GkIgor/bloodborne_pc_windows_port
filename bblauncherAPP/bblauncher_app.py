@@ -1709,6 +1709,17 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if ("Disable" in aa_mode or "TAA" in aa_mode) and "Disable AA" not in active_patches:
             active_patches.append("Disable AA")
 
+        # scripts/patches.py:312 adds the Intel tonemap patch on every Intel CPU regardless of
+        # BB_PATCHES, so its UI checkbox cannot turn it off; BB_INTEL_TONEMAP_FIX (patches.py:68)
+        # is the only switch. Keep the documented default (on for Intel) and let an explicit
+        # environment value win.
+        if "BB_INTEL_TONEMAP_FIX" not in os.environ:
+            intel = "Intel" in os.environ.get("PROCESSOR_IDENTIFIER", "")
+            wanted = "Intel Black Tonemap Fix" in active_patches or intel
+            env["BB_INTEL_TONEMAP_FIX"] = "1" if wanted else "0"
+            if wanted and "Intel Black Tonemap Fix" not in active_patches:
+                active_patches.append("Intel Black Tonemap Fix")
+
         if active_patches:
             env["BB_PATCHES"] = ";".join(active_patches)
         else:
