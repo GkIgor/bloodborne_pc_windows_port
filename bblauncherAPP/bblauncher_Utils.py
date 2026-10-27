@@ -28,7 +28,7 @@ LOG_KEEP = 20
 SETTINGS_FILE = APP_DIR / "bblauncher_settings.json"
 PATCHES_XML = APP_DIR / "patches" / "Bloodborne.xml"
 DEFAULT_GAME = Path(os.environ.get("BB_GAME_DIR", "../CUSA03173"))
-LAUNCHER_VERSION = "0.7.1"
+LAUNCHER_VERSION = "0.7.2"
 
 
 def build_stamp() -> str:
@@ -41,6 +41,21 @@ def build_stamp() -> str:
 
 
 FPS_CHOICES = ["uncap", "60", "90", "30"]
+# Displayed in the Display & Graphics tab. The item data is the rate passed to run.bat
+# ("uncap" for Uncapped); 30 is the native PS4 path in both modes.
+FPS_LIVE_CHOICES = [
+    ("60 (Live patch)", "60"),
+    ("90 (Live patch)", "90"),
+    ("120 (Live patch)", "120"),
+    ("Uncap (Live patch)", "uncap"),
+    ("30 (Native PS4)", "30"),
+]
+FPS_XML_CHOICES = [
+    ("60 (XML patch)", "60"),
+    ("90 (XML patch)", "90"),
+    ("Uncap (XML patch)", "uncap"),
+    ("30 (Native PS4)", "30"),
+]
 RES_CHOICES = ["1920x1080 (Native)", "1280x720", "2560x1440", "3840x2160"]
 WINDOW_MODE_CHOICES = ["Windowed", "Borderless", "Fullscreen"]
 ANISO_CHOICES = [
@@ -535,6 +550,64 @@ def load_xml_patches(xml_path: Path = PATCHES_XML):
     return patches
 
 
+LIVE_FPS_CONFLICTING_PATCHES = {
+    "30 FPS++",
+    "60FPS (no deltatime)",
+    "60 FPS++",
+    "90 FPS++",
+    "Uncap FPS++",
+    "Sprint Fix (High FPS)",
+    "60 FPS++ (Deltatime)",
+    "Performance Patch (perf increase)",
+}
+
+
+LIVE_CLOCK_SIGNATURES = (
+    (0x2018E6B, b"\x48\x8d\x75\xc0\xe8"),
+    (0x2018E36, b"\xc7\x45\xc8"),
+)
+
+
+def check_live_clock_signature(game_dir: Path) -> tuple[bool, str]:
+    """Verify the CUSA03173 v1.09 eboot bytes used by the live FPS clock hook.
+
+    The loader maps guest vaddr 0 to image offset 0. Parse the PS4 SELF with the same
+    helper the game check uses, then read the guarded windows from the ELF image so a
+    different eboot is reported instead of hooked (probe.c falls back to XML patches).
+    """
+    eboot_path = game_dir / "eboot.bin"
+    try:
+        data = eboot_path.read_bytes()
+    except OSError as ex:
+        return False, f"could not read eboot.bin ({ex})"
+    try:
+        scripts_dir = str(APP_DIR / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from prepare import parse_self
+        elf, _header, ph, _segments, _missing = parse_self(data, "eboot.bin")
+    except Exception as ex:
+        return False, f"eboot.bin could not be parsed ({ex})"
+    loads = [p for p in ph if p["type"] in (1, 0x61000010)]
+    if not loads:
+        return False, "eboot.bin has no loadable segments"
+    image_size = max(p["vaddr"] + p["memsz"] for p in loads)
+    if image_size <= 0x2035000:
+        return False, "eboot image is smaller than the live clock site"
+
+    def read_vaddr(vaddr: int, size: int):
+        for p in loads:
+            if p["vaddr"] <= vaddr and vaddr + size <= p["vaddr"] + p["filesz"]:
+                start = p["offset"] + (vaddr - p["vaddr"])
+                return bytes(elf[start:start + size])
+        return None
+
+    for vaddr, expected in LIVE_CLOCK_SIGNATURES:
+        if read_vaddr(vaddr, len(expected)) != expected:
+            return False, "eboot signature does not match the CUSA03173 v1.09 live clock site"
+    return True, "live clock signature verified"
+
+
 def verify_prelaunch(game_dir: Path) -> tuple[bool, str, list[str]]:
     details = []
 
@@ -559,6 +632,12 @@ def verify_prelaunch(game_dir: Path) -> tuple[bool, str, list[str]]:
         details.append("[OK] Game Title & Version: Bloodborne CUSA03173 v1.09 verified")
     except Exception:
         details.append("[NOTE] Version check bypassed (standalone)")
+
+    live_ok, live_msg = check_live_clock_signature(game_dir)
+    if live_ok:
+        details.append(f"[OK] FPS patch: {live_msg}")
+    else:
+        details.append(f"[WARN] FPS patch: {live_msg}; static XML patches will be used")
 
     dvdroot = game_dir / "dvdroot_ps4"
     if dvdroot.is_dir():

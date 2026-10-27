@@ -17,7 +17,21 @@ EBOOT_BASE=0x400000
 # Above 60 FPS the sprint fix always goes with the frame rate patch: without it sprinting drops to
 # half speed (the game's wall detector measured distance per frame, a 30 FPS rule).
 FPS_PRESETS={'30':[],'60':['60 FPS++'],'90':['90 FPS++','Sprint Fix (High FPS)'],
+             # Live clock: the measured-dt base retargets cloth/animation/platform physics to the
+             # real frame delta (the old fixed 1/60 base still flickered above 30 FPS). The probe
+             # hook replaces its per-frame interval and payload dt at run time (30..uncapped).
+             'live':['60 FPS++ (Deltatime)'],
              'uncap':['Uncap FPS++','Sprint Fix (High FPS)']}
+
+LIVE_FPS_CONFLICTS = {
+    '30 FPS++',
+    '60FPS (no deltatime)',
+    '60 FPS++',
+    '90 FPS++',
+    'Uncap FPS++',
+    'Sprint Fix (High FPS)',
+    'Performance Patch (perf increase)',
+}
 # Upscaler presets (bbport.ini "preset", the in-game menu): output / render size ratio. The game
 # then renders at 1920x1080 / ratio and the port's temporal upscaler restores the output size.
 OUTPUT_SIZE=(1920,1080)
@@ -315,6 +329,12 @@ def main():
     for n in raw_names:
         if n not in names:
             names.append(n)
+    if a.fps == 'live':
+        filtered = [n for n in names if n not in LIVE_FPS_CONFLICTS]
+        if len(filtered) != len(names):
+            dropped = [n for n in names if n in LIVE_FPS_CONFLICTS]
+            print(f'Patches: Live FPS active; automatically disabled conflicting patches: {dropped}')
+            names = filtered
     validate_patch_requirements(names,a.game_dir)
     segments=eboot_segments((a.out/'eboot.elf').read_bytes())
     writes=compile_patches(a.xml,names,a.app_version,segments)
@@ -334,8 +354,10 @@ def main():
         print(f'Patches: native 1080p selected (scene 1920x1080; UI 1920x1080, native executable layout)')
     if a.patches_dir:
         # After the built-in ones: an external patch of the same bytes wins.
-        writes+=compile_external(external_selection(external_patches(a.patches_dir,a.app_version,a.xml),
-                                                    a.patches_config),segments)
+        ext_selected = external_selection(external_patches(a.patches_dir,a.app_version,a.xml), a.patches_config)
+        if a.fps == 'live':
+            ext_selected = [item for item in ext_selected if not any(c.lower() in item[0].lower() for c in ('fps++', 'no deltatime', 'performance patch'))]
+        writes += compile_external(ext_selected, segments)
     # BBPATCH2: the patch base, so the loader can rebase pointers the patches write into
     # relocated slots (60/90 FPS++ replace function pointers).
     blob=struct.pack('<8sQQ',b'BBPATCH2',EBOOT_BASE,len(writes))

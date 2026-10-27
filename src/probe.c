@@ -2860,6 +2860,73 @@ void runtime_restart(void) {
 #endif
 }
 
+/* The measured-dt base patch (60 FPS++ (Deltatime)) adds a guest-global simulation dt at
+ * image+0x535A908. Its injected block writes it at 0x2018e3d, which our hook replaces, so the
+ * hook mirrors the store here. Only enabled when the base patch's code cave is present. */
+static int g_live_clock_deltatime;
+static float s_smoothed_dt;
+static int s_prev_target_fps = -1;
+
+/* Live engine clock (Phase 2). Called from the 25-byte guest stub installed at 0x2018e3d with
+ * rdi = clock singleton (rbx). No allocation, no locks: relaxed atomic reads from BbSettings
+ * and two stores into the guest singleton. Returns the simulation dt in xmm0; the stub writes
+ * it to the frame payload at [rbp-0x38] and resumes at 0x2018e6b. */
+ABI float bb_live_clock_tick(void *singleton) {
+    if (!singleton) return 0.0f;
+    float *interval = (float *)((char *)singleton + 0x18);
+    int mode = 0, target_fps = 60, max_dt_hz = 30;
+    bbgpu_get_live_clock(&mode, &target_fps, &max_dt_hz);
+    if (mode == 0) return *interval; /* static XML patches: no behaviour change */
+    const float measured = *(float *)((char *)singleton + 0x264);
+    const float target = target_fps > 0 ? 1.0f / (float)target_fps : 1.0f / 240.0f;
+    float max_dt = max_dt_hz > 0 ? 1.0f / (float)max_dt_hz : (1.0f / 30.0f);
+    if (max_dt < target) max_dt = target;
+    *interval = target;
+
+    float raw = measured > 0.0f ? measured : target;
+    if (raw < target) raw = target;
+    if (raw > max_dt) raw = max_dt;
+
+    /* Deadband: if measured dt is within ±8% of target frametime, lock to exact target.
+     * Wipes out OS timer/vsync micro-jitter so Havok cloth stays rock-steady at target FPS. */
+    if (target_fps > 0) {
+        const float deadband = target * 0.08f;
+        if (raw >= (target - deadband) && raw <= (target + deadband)) {
+            raw = target;
+        }
+    }
+
+    /* Seed immediately on initial tick or when target FPS is switched in the menu */
+    if (s_smoothed_dt <= 0.0f || s_prev_target_fps != target_fps) {
+        s_smoothed_dt = raw;
+        s_prev_target_fps = target_fps;
+    } else {
+        /* Slew-rate limiter / spike dampener: prevent sudden impulse shocks to Havok cloth
+         * constraints during frametime spikes (+15% max increase, -20% max decrease per frame). */
+        const float max_increase = s_smoothed_dt * 0.15f;
+        const float max_decrease = s_smoothed_dt * 0.20f;
+        if (raw > s_smoothed_dt) {
+            float step = raw - s_smoothed_dt;
+            if (step > max_increase) step = max_increase;
+            s_smoothed_dt += step;
+        } else if (raw < s_smoothed_dt) {
+            float step = s_smoothed_dt - raw;
+            if (step > max_decrease) step = max_decrease;
+            s_smoothed_dt -= step;
+        }
+    }
+
+    float dt = s_smoothed_dt;
+    if (dt < target) dt = target;
+    if (dt > max_dt) dt = max_dt;
+
+    if (g_live_clock_deltatime && image) {
+        *(float *)(image + 0x535A908) = dt;
+    }
+    bbgpu_note_live_clock(dt, target_fps);
+    return dt;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
 #ifdef _WIN32
@@ -3415,6 +3482,64 @@ int main(int argc, char **argv) {
         FlushInstructionCache(GetCurrentProcess(), image + assert_entry, sizeof(entry_patch));
         printf("Guest hooks: assert/panic hook on at 0x20b55b0 (stub %zu bytes at %p)\n",
                (size_t)(p - t), (void *)t);
+    } while (0);
+
+    /* Live engine clock (Phase 2): replace the dead null-assert block at 0x2018e3d with a jump
+     * to a stub that calls bb_live_clock_tick(singleton). The stub writes the clamped dt into
+     * the payload at [rbp-0x38] and resumes at 0x2018e6b. Installed after apply_patches() so it
+     * wins over the static 60/90/Uncap block, and only after the exact CUSA03173 v1.09 bytes
+     * are verified; otherwise the game keeps the XML patches and never sees the hook. */
+    do {
+        int live_mode = 0, live_target = 60, live_max_dt = 30;
+        bbgpu_get_live_clock(&live_mode, &live_target, &live_max_dt);
+        if (!live_mode) {
+            bbgpu_set_live_clock_supported(0);
+            printf("[LIVE CLOCK] Disabled by settings; using XML patches.\n");
+            break;
+        }
+        static const unsigned char resume_expected[5] = {0x48, 0x8d, 0x75, 0xc0, 0xe8};
+        static const unsigned char store_expected[3] = {0xc7, 0x45, 0xc8};
+        const int wrong_title = s_game_title_id[0] && strcmp(s_game_title_id, "CUSA03173") != 0;
+        const int wrong_version = s_game_app_ver[0] && strcmp(s_game_app_ver, "01.09") != 0;
+        if (size <= 0x2035000 || wrong_title || wrong_version ||
+            memcmp(image + 0x2018e6b, resume_expected, sizeof(resume_expected)) != 0 ||
+            memcmp(image + 0x2018e36, store_expected, sizeof(store_expected)) != 0) {
+            fprintf(stderr, "[LIVE CLOCK] Incompatible eboot signature detected; falling back to XML patches.\n");
+            fflush(stderr);
+            bbgpu_set_live_clock_supported(0);
+            break;
+        }
+        /* Slots +2..+7 hold the assert stub (up to 6*32 bytes) and +8 the aim camera jump. */
+        unsigned char *t = thunks + (import_count + 9) * 32;
+        const uintptr_t tick = (uintptr_t)bb_live_clock_tick;
+        t[0] = 0x48; t[1] = 0x89; t[2] = 0xdf;             /* mov rdi, rbx */
+        t[3] = 0x48; t[4] = 0xb8; memcpy(t + 5, &tick, 8); /* movabs rax, bb_live_clock_tick */
+        t[13] = 0xff; t[14] = 0xd0;                        /* call rax */
+        t[15] = 0xf3; t[16] = 0x0f; t[17] = 0x11; t[18] = 0x45; t[19] = 0xc8; /* movss [rbp-0x38], xmm0 */
+        t[20] = 0xe9;                                      /* jmp 0x2018e6b */
+        const int64_t rel = (int64_t)(image + 0x2018e6b) - (int64_t)(t + 25);
+        if (rel < INT32_MIN || rel > INT32_MAX) {
+            fprintf(stderr, "[LIVE CLOCK] Incompatible eboot signature detected; falling back to XML patches.\n");
+            fflush(stderr);
+            bbgpu_set_live_clock_supported(0);
+            break;
+        }
+        const int32_t rel32 = (int32_t)rel;
+        memcpy(t + 21, &rel32, 4);
+        unsigned char entry[14] = {0xff, 0x25, 0x00, 0x00, 0x00, 0x00};
+        const uint64_t stub = (uint64_t)(uintptr_t)t;
+        memcpy(entry + 6, &stub, 8);
+        memcpy(image + 0x2018e3d, entry, sizeof(entry));
+#ifdef _WIN32
+        FlushInstructionCache(GetCurrentProcess(), image + 0x2018e3d, sizeof(entry));
+#else
+        __builtin___clear_cache((char *)(image + 0x2018e3d), (char *)(image + 0x2018e3d + sizeof(entry)));
+#endif
+        static const unsigned char deltatime_cave[7] = {0x48, 0x8b, 0x05, 0xf1, 0x04, 0x4b, 0x00};
+        g_live_clock_deltatime = (size > 0x5090007 && memcmp(image + 0x5090000, deltatime_cave, sizeof(deltatime_cave)) == 0);
+        bbgpu_set_live_clock_supported(1);
+        printf("[LIVE CLOCK] Hook installed at image+0x2018e3d (stub=%p, target=%d FPS, max dt 1/%d s, deltatime=%d)\n",
+               (void *)t, live_target, live_max_dt, g_live_clock_deltatime);
     } while (0);
 
     protect(thunks, round_page((import_count + 16) * 32), 5);

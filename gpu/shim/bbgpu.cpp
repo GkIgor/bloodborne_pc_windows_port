@@ -472,6 +472,25 @@ extern "C" int bbgpu_get_mk_native_mouse(void) {
     return s.mk_enabled.load() ? 1 : 0;
 }
 
+extern "C" void bbgpu_get_live_clock(int* mode, int* target_fps, int* max_dt_hz) {
+    const auto& s = BbSettings::Get();
+    if (mode) *mode = s.live_fps.load(std::memory_order_relaxed) ? 1 : 0;
+    if (target_fps) *target_fps = s.target_fps.load(std::memory_order_relaxed);
+    if (max_dt_hz) *max_dt_hz = s.max_dt_hz.load(std::memory_order_relaxed);
+}
+
+extern "C" void bbgpu_set_live_clock_supported(int supported) {
+    BbSettings::Get().live_clock_supported.store(supported != 0, std::memory_order_relaxed);
+}
+
+extern "C" void bbgpu_note_live_clock(float dt, int target_fps) {
+    auto& s = BbSettings::Get();
+    const bool valid = dt > 0.0f && dt < 1.0f;
+    s.live_clock_dt_ms.store(valid ? dt * 1000.0f : 0.0f, std::memory_order_relaxed);
+    s.live_clock_hz.store(valid ? 1.0f / dt : 0.0f, std::memory_order_relaxed);
+    s.live_clock_target.store(target_fps, std::memory_order_relaxed);
+}
+
 extern "C" int bbgpu_get_action_binding(int action) {
     if (action < 0 || action >= BB_ACTION_COUNT) return 0;
     return BbSettings::Get().keybinds[action].load();

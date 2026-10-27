@@ -719,6 +719,57 @@ void Menu() {
                 "На 4-ядерных/4-поточных процессорах установка значения '1 поток' предотвращает "
                 "перегрузку ядер и убирает статтеры. Требуется перезапуск."));
     }
+    {
+        const char* const live_fps_labels[] = {
+            Tr("30 FPS", "30 FPS"),
+            Tr("60 FPS", "60 FPS"),
+            Tr("90 FPS", "90 FPS"),
+            Tr("120 FPS", "120 FPS"),
+            Tr("Uncapped", "Без ограничения"),
+        };
+        static constexpr int live_fps_values[] = {30, 60, 90, 120, 0};
+        const int current = s.target_fps.load();
+        int current_index = 0;
+        for (int i = 0; i < 5; ++i) {
+            if (live_fps_values[i] == current) {
+                current_index = i;
+                break;
+            }
+        }
+        const bool live_ok = s.live_clock_supported.load();
+        ImGui::BeginDisabled(!live_ok);
+        if (ImGui::BeginCombo(Tr("Target Framerate (Live)", "Целевая частота кадров (Live)"),
+                              live_fps_labels[current_index])) {
+            for (int i = 0; i < 5; ++i) {
+                if (ImGui::Selectable(live_fps_labels[i], i == current_index)) {
+                    Store(s.target_fps, live_fps_values[i], true);
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+        if (live_ok) {
+            const float dt_ms = s.live_clock_dt_ms.load();
+            const float hz = s.live_clock_hz.load();
+            const int target = s.live_clock_target.load();
+            if (target > 0) {
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f),
+                                   "Live Clock: dt %.1f ms (%.1f Hz) | target: %d FPS", dt_ms, hz,
+                                   target);
+            } else {
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f),
+                                   "Live Clock: dt %.1f ms (%.1f Hz) | target: Uncapped", dt_ms,
+                                   hz);
+            }
+            Hint(Tr("Changes the engine clock and the present limiter immediately; no restart.",
+                    "Меняет часы движка и ограничитель кадров сразу, без перезапуска."));
+        } else {
+            ImGui::TextColored(
+                ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "%s",
+                Tr("Live clock not installed: the static XML FPS patch is active.",
+                   "Живые часы не установлены: активен статический XML-патч FPS."));
+        }
+    }
 
     ImGui::SeparatorText(Tr("Other", "Прочее"));
     {

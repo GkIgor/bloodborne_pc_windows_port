@@ -59,6 +59,13 @@ void bbgpu_set_mouse_capture(int capture);
 int bbgpu_get_mk_config(float *sens_x, float *sens_y, int *invert_x, int *invert_y, float *deadzone, float *smoothing);
 /* Returns 1 if native direct mouse camera rotation is enabled. */
 int bbgpu_get_mk_native_mouse(void);
+/* Live engine clock (probe.c hook): mode 1 when live FPS patching is requested, the target
+ * rate (0 = uncapped) and the physics max-dt frequency. Relaxed atomic reads only. */
+void bbgpu_get_live_clock(int *mode, int *target_fps, int *max_dt_hz);
+/* The probe reports whether the eboot signature matched and the hook is installed. */
+void bbgpu_set_live_clock_supported(int supported);
+/* Per-frame sample for the overlay diagnostic line (dt in seconds, target fps, 0 = uncapped). */
+void bbgpu_note_live_clock(float dt, int target_fps);
 /* Hooks the game's menu list update for the mouse pointer; before the image is protected. */
 int bbgpu_menu_pointer_install(unsigned char *image, uint64_t size);
 /* Notes the pad's own state and returns the buttons the menu pointer presses this sample. */

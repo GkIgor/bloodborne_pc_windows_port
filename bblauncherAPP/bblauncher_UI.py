@@ -35,11 +35,13 @@ from bblauncher_Utils import (
     DEBUG_VIEW_CHOICES,
     DEFAULT_GAME,
     EFFECT_CHOICES,
-    FPS_CHOICES,
+    FPS_LIVE_CHOICES,
+    FPS_XML_CHOICES,
     GAMEPLAY_KEYBINDS,
     HUD_QUADRANT_CHOICES,
     LANGUAGE_CHOICES,
     LAUNCHER_VERSION,
+    LIVE_FPS_CONFLICTING_PATCHES,
     LIVE_RES_CHOICES,
     MENU_LANGUAGE_CHOICES,
     MODEL_LOD_CHOICES,
@@ -1007,7 +1009,9 @@ class LauncherUI:
         self.lbl_check_game = QLabel("\u00b7 Game files")
         self.lbl_check_vulkan = QLabel("\u00b7 Vulkan / GPU")
         self.lbl_check_avx = QLabel("\u00b7 AVX")
-        for check_label in (self.lbl_check_game, self.lbl_check_vulkan, self.lbl_check_avx):
+        self.lbl_check_fps = QLabel("\u00b7 FPS patch")
+        for check_label in (self.lbl_check_game, self.lbl_check_vulkan, self.lbl_check_avx,
+                            self.lbl_check_fps):
             check_label.setObjectName("SetupCheck")
             check_label.setStyleSheet(
                 "color: #5a5a66; font-size: 11px; background: transparent;"
@@ -1211,7 +1215,13 @@ class LauncherUI:
             top_row = QHBoxLayout()
             cb = QCheckBox(name.replace("&", "&&"))
             cb.setStyleSheet("font-weight: 700; color: #ffffff;")
-            cb.setChecked(name in self.enabled_patches)
+            is_live = hasattr(self, "chk_fps_patch") and self.chk_fps_patch.isChecked()
+            if is_live and name in LIVE_FPS_CONFLICTING_PATCHES:
+                cb.setChecked(False)
+                cb.setEnabled(False)
+                cb.setToolTip("Disabled: Conflicts with Live FPS Patching.")
+            else:
+                cb.setChecked(name in self.enabled_patches)
             cb.stateChanged.connect(lambda state, p=name: self.on_patch_toggled(p, state))
             top_row.addWidget(cb, 1)
 
@@ -1340,6 +1350,29 @@ class LauncherUI:
         row_layout.addWidget(btn)
         grid.addLayout(row_layout, row, 1, 1, 2)
 
+    def _populate_fps_combo(self, live: bool, selected: str | None = None):
+        """Fill the framerate combo for the live/XML mode, keeping the selected rate."""
+        if not hasattr(self, "cmb_fps"):
+            return
+        current = selected if selected is not None else (self.cmb_fps.currentData() or "60")
+        choices = FPS_LIVE_CHOICES if live else FPS_XML_CHOICES
+        self.cmb_fps.blockSignals(True)
+        self.cmb_fps.clear()
+        for label, value in choices:
+            self.cmb_fps.addItem(label, value)
+        index = self.cmb_fps.findData(current)
+        if index < 0:
+            index = self.cmb_fps.findData("60")
+        self.cmb_fps.setCurrentIndex(index if index >= 0 else 0)
+        self.cmb_fps.blockSignals(False)
+
+    def _on_fps_patch_toggled(self, checked: bool):
+        self._populate_fps_combo(checked)
+        if hasattr(self, "_sync_patches_to_live_fps"):
+            self._sync_patches_to_live_fps(checked)
+        self.save_settings()
+        self.save_bbport_ini()
+
     # ------------------------------------------------------------------
     # DISPLAY & GRAPHICS
     # ------------------------------------------------------------------
@@ -1356,8 +1389,7 @@ class LauncherUI:
 
         grid_disp.addWidget(QLabel("Target Framerate:"), 0, 0)
         self.cmb_fps = QComboBox()
-        self.cmb_fps.addItems(FPS_CHOICES)
-        self.cmb_fps.setCurrentText(self.settings.get("fps", "60"))
+        self.cmb_fps.setObjectName("FpsCombo")
         grid_disp.addWidget(self.cmb_fps, 0, 1)
 
         grid_disp.addWidget(QLabel("Render Resolution:"), 0, 2)
@@ -1451,9 +1483,12 @@ class LauncherUI:
         self.chk_fsr.setChecked(self.settings.get("feat_upscaler", False) and self.cmb_upscaler.currentData() != "off")
         row_flags.addWidget(self.chk_fsr, 0, 0)
 
-        self.chk_fps_patch = QCheckBox("Engine Framerate Patch (60/90/Uncap)")
+        self.chk_fps_patch = QCheckBox("Enable Live FPS Patching (60/90/120/Uncap)")
         self.chk_fps_patch.setChecked(self.settings.get("feat_fps_patch", True))
         row_flags.addWidget(self.chk_fps_patch, 0, 1)
+        self._populate_fps_combo(self.chk_fps_patch.isChecked(), self.settings.get("fps", "60"))
+        self.chk_fps_patch.toggled.connect(self._on_fps_patch_toggled)
+        self.cmb_fps.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
 
         def on_upscaler_combo_changed():
             active = self.cmb_upscaler.currentData() != "off"

@@ -11,6 +11,7 @@
 #include <sys/resource.h>
 #endif
 #include "common/assert.h"
+#include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
@@ -639,12 +640,16 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     // bbport: frame limit (see EmulatorSettings::GetFrameLimit). A request waits in the queue
     // until its slot; slots advance by one period (no drift) but never lag behind by more.
-    const u32 frame_limit = EmulatorSettings.GetFrameLimit();
-    const auto frame_period = frame_limit ? std::chrono::nanoseconds(1000000000 / frame_limit)
-                                          : std::chrono::nanoseconds(0);
+    // With the live clock hook the target can change in the overlay: read it every iteration.
+    const u32 startup_frame_limit = EmulatorSettings.GetFrameLimit();
+    u32 frame_limit = BbSettings::LiveFrameLimitActive() ? BbSettings::LiveFrameLimit()
+                                                         : startup_frame_limit;
+    auto frame_period = frame_limit ? std::chrono::nanoseconds(1000000000 / frame_limit)
+                                    : std::chrono::nanoseconds(0);
     auto next_flip = std::chrono::steady_clock::now();
-    std::printf("VideoOut: vblank %u Hz, frame limit %u FPS\n",
-                EmulatorSettings.GetVblankFrequency(), frame_limit);
+    std::printf("VideoOut: vblank %u Hz, frame limit %u FPS%s\n",
+                EmulatorSettings.GetVblankFrequency(), frame_limit,
+                BbSettings::LiveFrameLimitActive() ? " (live)" : "");
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -658,11 +663,25 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     // bbport: with a frame limit (uncapped presets) a queued flip is presented as soon as it
     // arrives and its slot allows, between vblanks, instead of on the next vblank tick.
-    const bool immediate_flips = frame_limit != 0;
-
     while (!token.stop_requested()) {
         timer.Start();
         const auto tick_deadline = std::chrono::steady_clock::now() + vblank_period;
+
+        // Live clock: the overlay can change the target without a restart. Recompute the slot
+        // period when it changes; reset next_flip so a faster target is not stuck behind the
+        // old one. One relaxed atomic read per iteration when live mode is off.
+        const u32 live_frame_limit = BbSettings::LiveFrameLimitActive()
+                                         ? BbSettings::LiveFrameLimit()
+                                         : startup_frame_limit;
+        if (live_frame_limit != frame_limit) {
+            frame_limit = live_frame_limit;
+            frame_period = frame_limit ? std::chrono::nanoseconds(1000000000 / frame_limit)
+                                       : std::chrono::nanoseconds(0);
+            next_flip = std::chrono::steady_clock::now();
+            std::printf("VideoOut: frame limit %u FPS%s\n", frame_limit,
+                        BbSettings::LiveFrameLimitActive() ? " (live)" : "");
+        }
+        const bool immediate_flips = frame_limit != 0;
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();

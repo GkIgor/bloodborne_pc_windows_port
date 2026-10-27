@@ -113,6 +113,15 @@ struct Values {
     std::atomic<bool> cheats[CheatSlotCount]{};
     std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
     std::atomic<int> prep_workers{-1}; ///< -1 default (Available/2), 0 off, 1..16 explicit workers
+    /// Live engine clock (probe.c hook). live_fps/target_fps/max_dt_hz persist; the rest is
+    /// runtime status for the overlay.
+    std::atomic<bool> live_fps{true};
+    std::atomic<int> target_fps{60}; ///< 30/60/90/120, 0 = uncapped
+    std::atomic<int> max_dt_hz{30}; ///< physics upper clamp (1/30 s by default)
+    std::atomic<bool> live_clock_supported{false};
+    std::atomic<float> live_clock_dt_ms{0.0f};
+    std::atomic<float> live_clock_hz{0.0f};
+    std::atomic<int> live_clock_target{60};
     std::atomic<int> output_res{OutputDefault}; ///< index into OutputWidths
     /// Live resolution and preset changes (run.sh): 0 off by default (startup patch, fastest
     /// on the Steam Deck and older GPUs), -1 auto (strong discrete GPUs), 1 on. On restart.
@@ -156,6 +165,11 @@ void ConfigureDlssSupport(bool available, const char* problem);
 bool FixedRenderSession();
 int RenderPreset();
 bool ResolutionNeedsRestart();
+/// Live engine clock requested at start (BB_LIVE_FPS / bbport.ini live_fps).
+bool LiveFrameLimitActive();
+/// Presenter limit while live mode is active: the target rate (240 for uncapped), or the
+/// 60 FPS XML fallback until the probe verifies the eboot and installs the hook.
+unsigned LiveFrameLimit();
 /// Writes the file (menu changes).
 void Save();
 

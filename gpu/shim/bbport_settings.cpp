@@ -185,6 +185,12 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.fsr4_invert_jitter = i != 0;
     } else if (key == "model_lod") {
         v.model_lod = std::clamp(i, -2, 2);
+    } else if (key == "live_fps") {
+        v.live_fps = i != 0;
+    } else if (key == "target_fps") {
+        v.target_fps = (value == "uncap" || i == 0) ? 0 : std::clamp(i, 30, 240);
+    } else if (key == "max_dt_hz") {
+        v.max_dt_hz = std::clamp(i, 10, 240);
     } else if (key == "prep_workers") {
         v.prep_workers = value == "auto" ? -1 : std::clamp(i, 0, 16);
     } else if (key == "live_resolution") {
@@ -287,6 +293,8 @@ void Load() {
         {"BB_HUD", "show_hud"},                     {"BB_HUD_QUADRANT", "hud_quadrant"},
         {"BB_HUD_OPACITY", "hud_opacity"},          {"BB_HUD_SCALE", "hud_scale"},
         {"BB_PREP_WORKERS", "prep_workers"},
+        {"BB_FPS", "target_fps"},                   {"BB_LIVE_FPS", "live_fps"},
+        {"BB_TARGET_FPS", "target_fps"},            {"BB_MAX_DT_HZ", "max_dt_hz"},
         {"BB_LANG", "language"},
     };
     for (const auto& [env, key] : env_keys) {
@@ -371,6 +379,21 @@ bool ResolutionNeedsRestart() {
          (v.upscaler == UpscalerTaa) != (v.startup_upscaler == UpscalerTaa));
 }
 
+bool LiveFrameLimitActive() {
+    return Get().live_fps.load(std::memory_order_relaxed);
+}
+
+unsigned LiveFrameLimit() {
+    const auto& v = Get();
+    if (!v.live_clock_supported.load(std::memory_order_relaxed)) {
+        // The launcher's live base is 60 FPS++: until the probe verifies the eboot and installs
+        // the hook (or after a signature rejection), the engine runs at that static rate.
+        return 60u;
+    }
+    const int target = v.target_fps.load(std::memory_order_relaxed);
+    return target <= 0 ? 240u : unsigned(std::clamp(target, 1, 480));
+}
+
 void Save() {
     static std::mutex save_mutex;
     std::scoped_lock lock{save_mutex};
@@ -390,7 +413,8 @@ void Save() {
                  "debug_view=%d\nshow_fps=%d\nshow_hud=%d\nhud_quadrant=%d\nhud_opacity=%.2f\nhud_scale=%.2f\n"
                  "fsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n"
                  "mk_enabled=%d\nmk_sens_x=%.2f\nmk_sens_y=%.2f\nmk_invert_x=%d\nmk_invert_y=%d\nmk_smoothing=%.2f\nmk_responsiveness=%.2f\nmk_acceleration=%.2f\n"
-                 "mouse_menu=%d\n",
+                 "mouse_menu=%d\n"
+                 "live_fps=%d\ntarget_fps=%d\nmax_dt_hz=%d\n",
                  UpscalerName(v.upscaler), v.preset.load(), v.dlss_preset.load(),
                  int(v.sharpen.load()),
                  v.sharpness.load(), int(v.jitter.load()), int(v.reactive.load()),
@@ -403,7 +427,8 @@ void Save() {
                  int(v.mk_enabled.load()), v.mk_sens_x.load(), v.mk_sens_y.load(),
                  int(v.mk_invert_x.load()), int(v.mk_invert_y.load()),
                  v.mk_smoothing.load(), v.mk_responsiveness.load(), v.mk_acceleration.load(),
-                 int(v.mouse_menu.load()));
+                 int(v.mouse_menu.load()), int(v.live_fps.load()), v.target_fps.load(),
+                 v.max_dt_hz.load());
     // Read by patches.py at start.
     for (int e = 0; e < EffectCount; ++e) {
         std::fprintf(file, "%s=%d\n", Effects[e].key, int(v.effects[e].load()));

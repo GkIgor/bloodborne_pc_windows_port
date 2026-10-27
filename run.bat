@@ -102,8 +102,14 @@ if "%BB_AUTO_RENDER_RES%"=="1" (
     set "BB_AUTO_RENDER_RES="
 )
 
-if "%BB_FPS%"=="" set "BB_FPS=uncap"
-set "fps=%BB_FPS%"
+if "%BB_FPS%"=="30" set "BB_LIVE_FPS=0"
+if "%BB_LIVE_FPS%"=="1" (
+    set "fps=live"
+    if "%BB_VBLANK_HZ%"=="" set "BB_VBLANK_HZ=0"
+) else (
+    if "%BB_FPS%"=="" set "BB_FPS=uncap"
+    set "fps=%BB_FPS%"
+)
 
 REM The scaled sizes go through a file, like mods.py above: read with for /f ('"%PYTHON%" ...
 REM "%BB_CONFIG%"') the command lost its quotes and printed nothing, so an output other than
@@ -164,7 +170,9 @@ if "%patches_config%"=="" set "patches_config=%BB_DATA_DIR%\patches.json"
 if errorlevel 1 exit /b 1
 
 if "%BB_VBLANK_HZ%"=="" (
-    if "%fps%"=="uncap" (
+    if "%fps%"=="live" (
+        set "BB_VBLANK_HZ=0"
+    ) else if "%fps%"=="uncap" (
         set "BB_VBLANK_HZ=0"
     ) else if "%fps%"=="90" (
         set "BB_VBLANK_HZ=90"

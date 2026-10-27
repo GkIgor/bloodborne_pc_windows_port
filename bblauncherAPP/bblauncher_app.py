@@ -47,6 +47,7 @@ from bblauncher_Utils import (
     EFFECT_CHOICES,
     KEYBIND_PRESETS,
     LAUNCHER_VERSION,
+    LIVE_FPS_CONFLICTING_PATCHES,
     LOG_DIR,
     LOG_FILE,
     PREP_WORKER_CHOICES,
@@ -269,7 +270,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             win_mode = self.cmb_win_mode.currentText()
             upscaler_choice = self.cmb_upscaler.currentText()
             cfg.update({
-                "fps": self.cmb_fps.currentText(),
+                "fps": self.cmb_fps.currentData() or "60",
                 "res": self.cmb_res.currentText(),
                 "aniso": self.cmb_aniso.currentText(),
                 "prep_workers": self.cmb_prep_workers.currentText(),
@@ -444,7 +445,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             if kind in run_labels:
                 self._set_run_info(kind, run_labels[kind])
 
-    def _set_setup_checks(self, game: str, vulkan: str, avx: str):
+    def _set_setup_checks(self, game: str, vulkan: str, avx: str, fps: str = "unknown"):
         if not hasattr(self, "lbl_check_game"):
             return
         icons = {"ok": "\u2713", "warn": "!", "fail": "\u2715", "unknown": "\u00b7"}
@@ -458,6 +459,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             (self.lbl_check_game, "Game files", game),
             (self.lbl_check_vulkan, "Vulkan / GPU", vulkan),
             (self.lbl_check_avx, "AVX", avx),
+            (self.lbl_check_fps, "FPS patch", fps),
         ):
             label.setText(f"{icons.get(state, '\u00b7')} {name}")
             label.setStyleSheet(
@@ -529,7 +531,15 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         else:
             avx_state = "unknown"
 
-        self._set_setup_checks(game_state, vulkan_state, avx_state)
+        fps_line = next((line for line in detail_lines if "FPS patch" in line), "")
+        if "[OK]" in fps_line:
+            fps_state = "ok"
+        elif "[WARN]" in fps_line:
+            fps_state = "warn"
+        else:
+            fps_state = "unknown"
+
+        self._set_setup_checks(game_state, vulkan_state, avx_state, fps_state)
 
     def show_setup_details(self):
         details = str(getattr(self, "_setup_details_text", "") or "").strip()
@@ -1010,6 +1020,9 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "hud_opacity": f"{self.sl_hud_opacity.value() / 100:.2f}",
                 "hud_scale": f"{self.sl_hud_scale.value() / 100:.2f}",
                 "model_lod": self.cmb_model_lod.currentData() or "0",
+                "live_fps": "1" if (self.chk_fps_patch.isChecked()
+                                    and (self.cmb_fps.currentData() or "60") != "30") else "0",
+                "target_fps": self.cmb_fps.currentData() or "60",
             })
             for effect_key, chk in self.effect_checks.items():
                 keys_to_update[effect_key] = "1" if chk.isChecked() else "0"
@@ -1238,6 +1251,12 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             elif not enabled and name in self.enabled_patches:
                 self.enabled_patches.discard(name)
                 changed = True
+        is_live = hasattr(self, "chk_fps_patch") and self.chk_fps_patch.isChecked()
+        if is_live:
+            for p in list(self.enabled_patches):
+                if p in LIVE_FPS_CONFLICTING_PATCHES:
+                    self.enabled_patches.discard(p)
+                    changed = True
         return changed
 
     def _sync_patches_from_ini(self, ini_opts: dict | None = None, persist: bool = False) -> bool:
@@ -1405,6 +1424,19 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             self.update_home_summary()
 
     def on_patch_toggled(self, name: str, state: int):
+        is_live = hasattr(self, "chk_fps_patch") and self.chk_fps_patch.isChecked()
+        if is_live and name in LIVE_FPS_CONFLICTING_PATCHES:
+            if hasattr(self, "patch_checkboxes") and name in self.patch_checkboxes:
+                cb = self.patch_checkboxes[name]
+                cb.blockSignals(True)
+                cb.setChecked(False)
+                cb.setEnabled(False)
+                cb.setToolTip("Disabled: Conflicts with Live FPS Patching.")
+                cb.blockSignals(False)
+            self.enabled_patches.discard(name)
+            self.update_patch_count_label()
+            return
+
         enabled = bool(state)
         if enabled:
             self.enabled_patches.add(name)
@@ -1425,12 +1457,46 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if self._patches_built and hasattr(self, "lbl_patch_count"):
             self.lbl_patch_count.setText(f"{len(self.enabled_patches)} / {len(self.all_xml_patches)} enabled")
 
+    def _sync_patches_to_live_fps(self, is_live: bool = None):
+        if is_live is None:
+            is_live = hasattr(self, "chk_fps_patch") and self.chk_fps_patch.isChecked()
+        changed = False
+        if is_live:
+            for p in list(self.enabled_patches):
+                if p in LIVE_FPS_CONFLICTING_PATCHES:
+                    self.enabled_patches.discard(p)
+                    changed = True
+        if getattr(self, "_patches_built", False) and hasattr(self, "patch_checkboxes"):
+            for name, cb in self.patch_checkboxes.items():
+                if name in LIVE_FPS_CONFLICTING_PATCHES:
+                    cb.blockSignals(True)
+                    if is_live:
+                        cb.setChecked(False)
+                        cb.setEnabled(False)
+                        cb.setToolTip("Disabled: Conflicts with Live FPS Patching.")
+                    else:
+                        cb.setEnabled(True)
+                        cb.setChecked(name in self.enabled_patches)
+                        cb.setToolTip("")
+                    cb.blockSignals(False)
+            self.update_patch_count_label()
+        if changed:
+            self.save_settings()
+
     def sync_patches_to_ui(self):
         if not self._patches_built:
             return
+        is_live = hasattr(self, "chk_fps_patch") and self.chk_fps_patch.isChecked()
         for name, cb in self.patch_checkboxes.items():
             cb.blockSignals(True)
-            cb.setChecked(name in self.enabled_patches)
+            if is_live and name in LIVE_FPS_CONFLICTING_PATCHES:
+                cb.setChecked(False)
+                cb.setEnabled(False)
+                cb.setToolTip("Disabled: Conflicts with Live FPS Patching.")
+            else:
+                cb.setEnabled(True)
+                cb.setChecked(name in self.enabled_patches)
+                cb.setToolTip("")
             cb.blockSignals(False)
         self.update_patch_count_label()
 
@@ -1625,7 +1691,11 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if not getattr(sys, "frozen", False):
             env["PYTHON"] = sys.executable
         env["BB_GAME_DIR"] = str(game_dir)
-        env["BB_FPS"] = cfg["fps"]
+        fps_rate = cfg["fps"]
+        # 30 is the native PS4 path in both modes: no FPS patch and no live clock hook.
+        live_fps = bool(cfg["feat_fps_patch"]) and fps_rate != "30"
+        env["BB_FPS"] = fps_rate
+        env["BB_LIVE_FPS"] = "1" if live_fps else "0"
         env["BB_MODS_ENABLED"] = "1" if cfg["mods"] else "0"
 
         aa_mode = cfg.get("anti_aliasing", "Native FXAA (PS4 Default)")
@@ -1662,7 +1732,11 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         frames_ahead = str(cfg.get("frames_ahead", "")).strip()
         env["BB_FRAMES_AHEAD"] = frames_ahead or "2"
         vblank = str(cfg.get("vblank_hz", "")).strip()
-        if vblank:
+        if live_fps:
+            # The live clock owns the frame rate; the presenter loop must not be capped by a
+            # static vblank. 0 selects the 480 Hz live base in run.bat and emulator_settings.
+            env["BB_VBLANK_HZ"] = "0"
+        elif vblank:
             env["BB_VBLANK_HZ"] = vblank
         else:
             env.pop("BB_VBLANK_HZ", None)
@@ -1706,6 +1780,8 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 env.pop(env_key, None)
 
         active_patches = list(cfg["enabled_patches"])
+        if live_fps:
+            active_patches = [p for p in active_patches if p not in LIVE_FPS_CONFLICTING_PATCHES]
         if ("Disable" in aa_mode or "TAA" in aa_mode) and "Disable AA" not in active_patches:
             active_patches.append("Disable AA")
 
