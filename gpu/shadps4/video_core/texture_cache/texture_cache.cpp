@@ -74,10 +74,80 @@ TextureCache::~TextureCache() = default;
 
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
+    if (download_images.empty()) {
+        return;
+    }
+
+    struct PendingDownload {
+        Vulkan::StagingBufferRef download;
+        u64 image_addr;
+        u32 copy_size;
+    };
+    boost::container::small_vector<PendingDownload, 16> pending;
+    pending.reserve(download_images.size());
+
     for (const ImageId image_id : download_images) {
-        DownloadImageMemory(image_id, true);
+        if (!slot_images.is_allocated(image_id)) {
+            continue;
+        }
+        Image& image = slot_images[image_id];
+        if (False(image.flags & ImageFlagBits::GpuModified)) {
+            continue;
+        }
+        const auto image_addr = image.info.guest_address;
+        const auto image_mips = image.info.resources.levels;
+        u32 copy_size = 0;
+        boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
+        for (u32 mip = 0; mip < image_mips; ++mip) {
+            const u32 width = std::max(image.info.size.width >> mip, 1u);
+            const u32 height = std::max(image.info.size.height >> mip, 1u);
+            const u32 depth =
+                image.info.props.is_volume ? std::max(image.info.size.depth >> mip, 1u) : 1u;
+            const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[mip];
+            const u32 extent_width = mip_pitch ? std::min<u32>(mip_pitch, width) : width;
+            const u32 extent_height = mip_height ? std::min<u32>(mip_height, height) : height;
+            buffer_copies.push_back(vk::BufferImageCopy{
+                .bufferOffset = mip_offset,
+                .bufferRowLength = mip_pitch,
+                .bufferImageHeight = mip_height,
+                .imageSubresource =
+                    {
+                        .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                        .mipLevel = mip,
+                        .baseArrayLayer = 0,
+                        .layerCount = image.info.resources.layers,
+                    },
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {extent_width, extent_height, depth},
+            });
+            copy_size += mip_size;
+        }
+        if (buffer_copies.empty()) {
+            continue;
+        }
+        ASSERT(copy_size <= image.info.guest_size);
+
+        const u32 request_size = image.info.props.is_tiled
+                                     ? std::max(copy_size, static_cast<u32>(image.info.guest_size))
+                                     : copy_size;
+        const auto download =
+            runtime.GetStagingPool().Request(request_size, MemoryType::HostCached, 16, false);
+
+        auto copies_for_tile = buffer_copies;
+        tile_manager.TileImage(image, copies_for_tile, download.buffer, download.offset);
+        pending.push_back({download, image_addr, copy_size});
     }
     download_images.clear();
+
+    if (!pending.empty()) {
+        runtime.FlushBarriers();
+        scheduler.Finish();
+        for (const auto& item : pending) {
+            item.download.Invalidate();
+            Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(item.image_addr),
+                                                      item.download.mapped, item.copy_size);
+        }
+    }
 }
 
 static bool CanTileImage(const Image& image) {
@@ -173,6 +243,9 @@ static void LogUnsupportedTiledImageOnce(const Image& image) {
 }
 
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
+    if (!slot_images.is_allocated(image_id)) {
+        return;
+    }
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
@@ -732,6 +805,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
     // Check for a perfect match first
     for (const auto& cache_id : image_ids) {
+        if (!slot_images.is_allocated(cache_id)) {
+            continue;
+        }
         auto& cache_image = slot_images[cache_id];
         if (cache_image.info.guest_address != info.guest_address) {
             continue;
@@ -757,6 +833,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     int view_slice{-1};
     if (!image_id) {
         for (const auto& cache_id : image_ids) {
+            if (!slot_images.is_allocated(cache_id)) {
+                continue;
+            }
             view_mip = -1;
             view_slice = -1;
 
@@ -834,6 +913,9 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     }
     if (!image_ids.empty()) {
         for (s32 i = 0; i < image_ids.size(); ++i) {
+            if (!slot_images.is_allocated(image_ids[i])) {
+                continue;
+            }
             Image& image = slot_images[image_ids[i]];
             if (image.info.guest_size == size) {
                 return image_ids[i];

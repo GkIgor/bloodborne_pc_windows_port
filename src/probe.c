@@ -66,11 +66,19 @@ static int is_guest_address(uintptr_t addr) {
 static char s_game_title_id[16] = "";
 static char s_game_app_ver[16] = "";
 
+static int is_supported_bloodborne_title(const char *title_id) {
+    if (!title_id || !title_id[0]) return 1;
+    return strcmp(title_id, "CUSA03173") == 0 ||
+           strcmp(title_id, "CUSA00207") == 0 ||
+           strcmp(title_id, "CUSA03023") == 0 ||
+           strcmp(title_id, "CUSA00900") == 0;
+}
+
 static int is_cusa03173_v109(void) {
     if (!image || image_size < 0x53e4570) return 0;
     if (*(const int64_t *)(image + 0x53e4568) != -1840) return 0;
-    if (s_game_title_id[0] && strcmp(s_game_title_id, "CUSA03173") != 0) return 0;
-    if (s_game_app_ver[0] && strcmp(s_game_app_ver, "01.09") != 0) return 0;
+    if (s_game_title_id[0] && !is_supported_bloodborne_title(s_game_title_id)) return 0;
+    if (s_game_app_ver[0] && strcmp(s_game_app_ver, "01.09") != 0 && strcmp(s_game_app_ver, "01.00") != 0) return 0;
     return 1;
 }
 static void **resolved_targets;
@@ -3499,8 +3507,8 @@ int main(int argc, char **argv) {
         }
         static const unsigned char resume_expected[5] = {0x48, 0x8d, 0x75, 0xc0, 0xe8};
         static const unsigned char store_expected[3] = {0xc7, 0x45, 0xc8};
-        const int wrong_title = s_game_title_id[0] && strcmp(s_game_title_id, "CUSA03173") != 0;
-        const int wrong_version = s_game_app_ver[0] && strcmp(s_game_app_ver, "01.09") != 0;
+        const int wrong_title = s_game_title_id[0] && !is_supported_bloodborne_title(s_game_title_id);
+        const int wrong_version = s_game_app_ver[0] && strcmp(s_game_app_ver, "01.09") != 0 && strcmp(s_game_app_ver, "01.00") != 0;
         if (size <= 0x2035000 || wrong_title || wrong_version ||
             memcmp(image + 0x2018e6b, resume_expected, sizeof(resume_expected)) != 0 ||
             memcmp(image + 0x2018e36, store_expected, sizeof(store_expected)) != 0) {

@@ -785,23 +785,29 @@ public:
         if (!IsRecordingDeferred()) {
             return;
         }
-        ASSERT(bytes + 1024 <= RecordChunk::Capacity);
-        if (RecordChunk::Capacity - CurrentChunk().Size() < bytes + 1024) {
+        ASSERT(bytes + 256 <= RecordChunk::Capacity);
+        if (RecordChunk::Capacity - CurrentChunk().Size() < bytes + 256) {
             RetireChunk();
         }
     }
 
-    /// Copies `data` into recording storage that lives until the command that uses it has
-    /// been recorded (the same chunk). With threaded recording off, returns `data` itself.
+    /// Copies data into recording storage that lives until the command that uses it has
+    /// been recorded (the same chunk). With threaded recording off, returns data itself.
     template <typename T>
     std::span<const T> RecordData(std::span<const T> data) {
         if (!IsRecordingDeferred() || data.empty()) {
             return data;
         }
-        // Room for the data and the command that follows it, so both stay in one chunk.
         const size_t bytes = data.size_bytes();
-        ReserveRecordData(bytes + alignof(T));
+        if (RecordChunk::Capacity - CurrentChunk().Size() < bytes + 256) {
+            RetireChunk();
+        }
         auto* dst = static_cast<T*>(CurrentChunk().Allocate(bytes, alignof(T)));
+        if (!dst) {
+            RetireChunk();
+            dst = static_cast<T*>(CurrentChunk().Allocate(bytes, alignof(T)));
+            ASSERT(dst);
+        }
         std::memcpy(dst, data.data(), bytes);
         return {dst, data.size()};
     }

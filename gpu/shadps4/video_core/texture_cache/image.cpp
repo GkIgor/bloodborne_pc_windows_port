@@ -170,15 +170,26 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
     constexpr auto tiling = vk::ImageTiling::eOptimal;
     const auto supported_format = instance.GetSupportedFormat(info.pixel_format, format_features);
-    const vk::PhysicalDeviceImageFormatInfo2 format_info{
+    vk::PhysicalDeviceImageFormatInfo2 format_info{
         .format = supported_format,
         .type = ConvertImageType(info.type),
         .tiling = tiling,
         .usage = usage_flags,
         .flags = flags,
     };
-    const auto image_format_properties =
+    auto image_format_properties =
         instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
+    if (image_format_properties.result == vk::Result::eErrorFormatNotSupported &&
+        (usage_flags & vk::ImageUsageFlagBits::eStorage)) {
+        auto fallback_format_info = format_info;
+        fallback_format_info.usage &= ~vk::ImageUsageFlagBits::eStorage;
+        const auto fallback_properties =
+            instance.GetPhysicalDevice().getImageFormatProperties2(fallback_format_info);
+        if (fallback_properties.result == vk::Result::eSuccess) {
+            usage_flags = fallback_format_info.usage;
+            image_format_properties = fallback_properties;
+        }
+    }
     if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
         LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
                   vk::to_string(supported_format), vk::to_string(format_info.type),
